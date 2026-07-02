@@ -90,6 +90,7 @@ On a non-Kitty terminal (notably **macOS Terminal.app**), those specific chords 
 - **A diff tab opened *before* its file is open in an editor won't reflect that editor's later unsaved edits** — the live-Document subscription only attaches if the Document already exists when the diff opens. Edits to an already-open file, and external `git` changes, are reflected via the shared watcher.
 - **The SCM commit message box doesn't regain focus after an overlay closes** — overlay-close focus restore targets the editor, so click/`i`/`Tab` back into the box.
 - **A very fast mouse flick can miss the 1-cell divider** on the arming mousedown, so the resize gesture won't start — land on the sash a little more deliberately.
+- **Shift+drag** (as opposed to a plain shift+click, which extends the selection exactly) is taken over by the renderer's character-wise drag gesture anchored at the click point, so the original anchor migrates once you start dragging with Shift held.
 
 ## Architecture
 

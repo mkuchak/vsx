@@ -1,6 +1,7 @@
 import {
   getTreeSitterClient,
   SyntaxStyle,
+  type MouseEvent as CoreMouseEvent,
   type ScrollBoxRenderable,
   type TextareaAction,
   type TextareaRenderable,
@@ -382,13 +383,29 @@ function EditorTextarea({ doc, groupId, focused, height, onCursorChange }: Edito
     }
   }, [scheduleHighlight, groupId])
 
+  /**
+   * The caret and selection as of the LAST report — read by shift+click, which
+   * needs the state from BEFORE this mousedown: the renderer's selection bridge
+   * has already moved the caret to the clicked cell AND reset the buffer
+   * selection to an empty range there by the time the (bubbled) mousedown
+   * reaches the app handler. The native cursor-changed echo of that move
+   * arrives asynchronously, after the synchronous mouse dispatch, so these refs
+   * still hold the pre-click state inside handleMouseDown.
+   */
+  const lastCaretRef = useRef<{ row: number; col: number } | null>(null)
+  const lastSelectionRef = useRef<{ start: number; end: number } | null>(null)
+
   // Status-bar hookup: report the 1-based line/column on every content- or
-  // cursor-change. `editorView.getCursor()` is 0-based logical row/col.
+  // cursor-change. `editorView.getCursor()` is 0-based logical row/col. Always
+  // records into the pre-click refs, even with no onCursorChange consumer.
   const reportCursor = useCallback(() => {
-    if (!onCursorChange) return
-    const cursor = taRef.current?.editorView.getCursor()
-    if (!cursor) return
-    onCursorChange({ line: cursor.row + 1, column: cursor.col + 1 })
+    const ta = taRef.current
+    const cursor = ta?.editorView.getCursor()
+    if (!ta || !cursor) return
+    lastCaretRef.current = { row: cursor.row, col: cursor.col }
+    const sel = ta.getSelection()
+    lastSelectionRef.current = sel && sel.end > sel.start ? { start: sel.start, end: sel.end } : null
+    onCursorChange?.({ line: cursor.row + 1, column: cursor.col + 1 })
   }, [onCursorChange])
 
   // Lets the effects/handlers that must re-report (nav keys, inbound clamp, the
@@ -533,10 +550,22 @@ function EditorTextarea({ doc, groupId, focused, height, onCursorChange }: Edito
   // otherwise it restarts at 1. 4+ clicks cycle back to 1.
   const clickTracker = useRef({ row: -1, col: -1, count: 0, time: 0 })
 
+  /**
+   * Active multi-click drag gesture: after a double(word)/triple(line) click,
+   * dragging extends the selection in whole word/line units from the clicked
+   * anchor unit (VSCode behavior). Armed on the multi-click mousedown, disarmed
+   * on drag-end or the next plain mousedown.
+   */
+  const multiClickGesture = useRef<
+    | { mode: "word"; anchorStart: number; anchorEnd: number }
+    | { mode: "line"; anchorRow: number }
+    | null
+  >(null)
+
   // Mouse cursor positioning + word/line selection. The textarea's built-in
   // onMouseEvent only handles scroll; single-click caret placement and multi-click
   // selection are entirely app-level.
-  const handleMouseDown = useCallback(() => {
+  const handleMouseDown = useCallback((event: CoreMouseEvent) => {
     const ta = taRef.current
     if (!ta) return
     // The renderer's selection machinery services this same mousedown BEFORE this
@@ -544,6 +573,35 @@ function EditorTextarea({ doc, groupId, focused, height, onCursorChange }: Edito
     // (wrap-aware) hit-testing. Read that position instead of re-deriving
     // screen→content coordinates, which would be wrong under wrapMode "word".
     const { row, col } = ta.editBuffer.getCursorPosition()
+
+    // Shift+click extends the selection from the pre-click caret (or the far end
+    // of an existing selection) to the clicked cell — VSCode semantics. Never
+    // participates in multi-click counting. Known deviation: a shift+DRAG after
+    // this is taken over by the renderer's char-wise gesture anchored at the
+    // click point (the gesture starts before this handler and can't be stopped
+    // from userland), so the anchor migrates — plain shift+click is exact.
+    if (event.modifiers.shift) {
+      multiClickGesture.current = null
+      clickTracker.current = { row, col, count: 1, time: Date.now() }
+      const focusOffset = ta.editBuffer.positionToOffset(row, col)
+      // The live buffer selection was already reset by the renderer's bridge on
+      // this same mousedown — the pre-click selection lives in lastSelectionRef.
+      const selection = lastSelectionRef.current
+      let anchorOffset: number
+      if (selection && selection.end > selection.start) {
+        // Keep whichever end of the existing selection is farther from the click.
+        anchorOffset =
+          Math.abs(focusOffset - selection.start) >= Math.abs(focusOffset - selection.end)
+            ? selection.start
+            : selection.end
+      } else {
+        const prevCaret = lastCaretRef.current ?? { row, col }
+        anchorOffset = ta.editBuffer.positionToOffset(prevCaret.row, prevCaret.col)
+      }
+      if (anchorOffset !== focusOffset) ta.setSelection(anchorOffset, focusOffset)
+      reportCursorRef.current()
+      return
+    }
 
     const now = Date.now()
     const prev = clickTracker.current
@@ -556,12 +614,15 @@ function EditorTextarea({ doc, groupId, focused, height, onCursorChange }: Edito
     if (count === 2) {
       const { start, end } = wordRangeAt(lines[row] ?? "", col)
       if (end > start) {
-        ta.setSelection(
-          ta.editBuffer.positionToOffset(row, start),
-          ta.editBuffer.positionToOffset(row, end),
-        )
+        const anchorStart = ta.editBuffer.positionToOffset(row, start)
+        const anchorEnd = ta.editBuffer.positionToOffset(row, end)
+        multiClickGesture.current = { mode: "word", anchorStart, anchorEnd }
+        ta.setSelection(anchorStart, anchorEnd)
       } else {
-        ta.clearSelection()
+        // Same rationale as the single-click branch below: buffer-only reset,
+        // never `clearSelection()` (it aborts the renderer's live drag gesture).
+        multiClickGesture.current = null
+        ta.editorView.resetSelection()
         ta.setCursor(row, col)
       }
     } else if (count === 3) {
@@ -572,16 +633,84 @@ function EditorTextarea({ doc, groupId, focused, height, onCursorChange }: Edito
         row + 1 < ta.lineCount
           ? ta.editBuffer.positionToOffset(row + 1, 0)
           : ta.editBuffer.positionToOffset(row, (lines[row] ?? "").length)
-      if (endOffset > startOffset) ta.setSelection(startOffset, endOffset)
-      else ta.setCursor(row, col)
+      if (endOffset > startOffset) {
+        multiClickGesture.current = { mode: "line", anchorRow: row }
+        ta.setSelection(startOffset, endOffset)
+      } else {
+        multiClickGesture.current = null
+        ta.setCursor(row, col)
+      }
     } else {
       // Single click. The renderer's mousedown clears only the *local* (drag)
       // selection, not the buffer selection, so a prior word/line selection would
-      // linger — clear it explicitly, then place the caret.
-      ta.clearSelection()
+      // linger — reset the BUFFER selection only, then place the caret.
+      //
+      // Deliberately NOT `ta.clearSelection()`: that also invokes the renderer's
+      // own clearSelection (via the render context), aborting the drag-selection
+      // gesture the renderer armed on this very mousedown — which killed all
+      // mouse drag-selection. `editorView.resetSelection()` clears just the
+      // buffer selection and leaves the in-flight gesture alive.
+      multiClickGesture.current = null
+      ta.editorView.resetSelection()
       ta.setCursor(row, col)
     }
     reportCursorRef.current()
+  }, [])
+
+  /**
+   * Word-/line-wise drag extension for an active multi-click gesture. On every
+   * drag event the renderer's selection bridge FIRST re-applies a char-wise
+   * selection anchored at the last mousedown, THEN dispatches the drag to this
+   * renderable (same-event ordering, verified in the 0.4.2 dispatch) — so the
+   * unit-snapped setSelection here always wins the frame. Selection is the hull
+   * of the anchor unit and the unit under the pointer, recomputed per event, so
+   * it grows AND shrinks as the pointer moves (VSCode behavior). Plain char-wise
+   * drags (no multi-click gesture) are left entirely to the renderer.
+   */
+  const handleMouseDrag = useCallback((event: CoreMouseEvent) => {
+    const gesture = multiClickGesture.current
+    const ta = taRef.current
+    if (!gesture || !ta) return
+    const viewport = ta.editorView.getViewport()
+    const lines = ta.plainText.split("\n")
+    const row = Math.max(
+      0,
+      Math.min(event.y - ta.y + viewport.offsetY, ta.lineCount - 1),
+    )
+    const lineText = lines[row] ?? ""
+    const col = Math.max(0, Math.min(event.x - ta.x + viewport.offsetX, lineText.length))
+
+    if (gesture.mode === "word") {
+      const focusWord = wordRangeAt(lineText, col)
+      // On whitespace/punctuation (empty word range) the pointer cell itself is
+      // the focus unit, so the selection still reaches the pointer.
+      const focusStart = ta.editBuffer.positionToOffset(
+        row,
+        focusWord.end > focusWord.start ? focusWord.start : col,
+      )
+      const focusEnd = ta.editBuffer.positionToOffset(
+        row,
+        focusWord.end > focusWord.start ? focusWord.end : col,
+      )
+      ta.setSelection(
+        Math.min(gesture.anchorStart, focusStart),
+        Math.max(gesture.anchorEnd, focusEnd),
+      )
+    } else {
+      const startRow = Math.min(gesture.anchorRow, row)
+      const endRow = Math.max(gesture.anchorRow, row)
+      const startOffset = ta.editBuffer.positionToOffset(startRow, 0)
+      const endOffset =
+        endRow + 1 < ta.lineCount
+          ? ta.editBuffer.positionToOffset(endRow + 1, 0)
+          : ta.editBuffer.positionToOffset(endRow, lines[endRow]?.length ?? 0)
+      ta.setSelection(startOffset, endOffset)
+    }
+    reportCursorRef.current()
+  }, [])
+
+  const handleMouseDragEnd = useCallback(() => {
+    multiClickGesture.current = null
   }, [])
 
   return (
@@ -595,6 +724,8 @@ function EditorTextarea({ doc, groupId, focused, height, onCursorChange }: Edito
         onContentChange={handleContentChange}
         onCursorChange={handleCursorChange}
         onMouseDown={handleMouseDown}
+        onMouseDrag={handleMouseDrag}
+        onMouseDragEnd={handleMouseDragEnd}
         flexGrow={1}
         textColor={theme.foreground}
         backgroundColor={theme.background}

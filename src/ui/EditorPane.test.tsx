@@ -866,6 +866,225 @@ test("click positions the caret in a split's non-focused pane", async () => {
   expect(ta2.editorView.getCursor()).toEqual({ row: 1, col: 5 })
 })
 
+/**
+ * REGRESSION (drag-selection): these tests drive the FULL renderer mouse pipeline
+ * (down → drag(s) → up through processSingleMouseEvent), which is the only path
+ * where the renderer's selection gesture exists. The multi-click handler's
+ * single-click branch used to call `ta.clearSelection()`, whose internal
+ * `_ctx.clearSelection()` aborted the gesture the renderer had just armed on the
+ * same mousedown — killing ALL mouse drag-selection while direct-dispatch tests
+ * stayed green. Dispatching straight at the textarea would not catch this class.
+ */
+test("mouse drag selects across multiple lines (buffer selection, not just highlight)", async () => {
+  const file = join(dir, "drag-select.ts")
+  await writeFile(file, "alpha one\nbravo two\ncharlie three\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("charlie three")
+
+  const ta = getTextarea()
+  // Drag from line 1 col 2 down to line 3 col 7 (mockMouse emits down,
+  // intermediate drags, and up — the renderer arms/updates/finishes the gesture).
+  await testSetup.mockMouse.drag(ta.x + 2, ta.y + 0, ta.x + 7, ta.y + 2)
+  await testSetup.flush()
+
+  expect(ta.hasSelection()).toBe(true)
+  const selected = ta.getSelectedText()
+  expect(selected).toContain("pha one\n")
+  expect(selected).toContain("bravo two\n")
+  expect(selected).toContain("charlie")
+  expect(selected.split("\n").length).toBe(3)
+})
+
+test("typing replaces a mouse-dragged selection", async () => {
+  const file = join(dir, "drag-type.ts")
+  await writeFile(file, "abcdef\nghijkl\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("ghijkl")
+
+  const ta = getTextarea()
+  // Select from line 1 col 2 through line 2 col 3 ("cdef\nghi").
+  await testSetup.mockMouse.drag(ta.x + 2, ta.y + 0, ta.x + 3, ta.y + 1)
+  await testSetup.flush()
+  expect(ta.hasSelection()).toBe(true)
+
+  await testSetup.mockInput.typeText("X")
+  await testSetup.flush()
+  expect(documentRegistry.get(file)!.getText()).toBe("abXjkl\n")
+})
+
+test("Ctrl+C copies a mouse-dragged selection", async () => {
+  const writeSpy = spyClipboardWrite()
+  const file = join(dir, "drag-copy.ts")
+  await writeFile(file, "one two\nthree four\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("three four")
+
+  const ta = getTextarea()
+  await testSetup.mockMouse.drag(ta.x + 4, ta.y + 0, ta.x + 5, ta.y + 1)
+  await testSetup.flush()
+  const selected = ta.getSelectedText()
+  expect(selected.length).toBeGreaterThan(0)
+
+  testSetup.mockInput.pressKey("c", { ctrl: true })
+  await testSetup.flush()
+  expect(writeSpy).toHaveBeenCalled()
+  expect(String(writeSpy.mock.calls.at(-1)?.[0])).toBe(selected)
+})
+
+test("a plain single click after a drag selection collapses it and moves the caret", async () => {
+  const file = join(dir, "drag-then-click.ts")
+  await writeFile(file, "hello world\nsecond line\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("second line")
+
+  const ta = getTextarea()
+  await testSetup.mockMouse.drag(ta.x + 0, ta.y + 0, ta.x + 5, ta.y + 1)
+  await testSetup.flush()
+  expect(ta.hasSelection()).toBe(true)
+
+  await clickCell(3, 1)
+  expect(ta.hasSelection()).toBe(false)
+  expect(ta.editorView.getCursor()).toEqual({ row: 1, col: 3 })
+})
+
+test("shift+click extends the selection from the current caret", async () => {
+  const file = join(dir, "shift-click.ts")
+  await writeFile(file, "hello world\nsecond line\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("second line")
+
+  const ta = getTextarea()
+  // Place the caret at line 1 col 2, then shift+click at line 2 col 6.
+  await clickCell(2, 0)
+  await testSetup.mockMouse.click(ta.x + 6, ta.y + 1, 0, { modifiers: { shift: true } })
+  await testSetup.flush()
+
+  // Selection spans caret → shift-clicked cell: "llo world\nsecond".
+  expect(ta.hasSelection()).toBe(true)
+  expect(ta.getSelectedText()).toBe("llo world\nsecond")
+})
+
+test("shift+click with an existing selection keeps the far anchor", async () => {
+  const file = join(dir, "shift-anchor.ts")
+  await writeFile(file, "alpha bravo charlie\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("alpha bravo charlie")
+
+  const ta = getTextarea()
+  await clickCell(8, 0, 2) // double-click "bravo" → selection [6,11)
+  expect(ta.getSelectedText()).toBe("bravo")
+
+  // Shift+click far to the RIGHT: the selection's left end (6) is the far
+  // anchor, so the result runs from "bravo"'s start to the clicked cell.
+  await testSetup.mockMouse.click(ta.x + 17, ta.y + 0, 0, { modifiers: { shift: true } })
+  await testSetup.flush()
+  expect(ta.getSelectedText()).toBe("bravo charl")
+})
+
+test("double-click then drag extends the selection word-wise", async () => {
+  const file = join(dir, "dbl-drag.ts")
+  await writeFile(file, "alpha bravo charlie delta\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("alpha bravo charlie")
+
+  const ta = getTextarea()
+  const mm = testSetup.mockMouse
+  // Real double-click-drag: click, then press-and-hold (2nd down arms the word
+  // gesture on "bravo"), drag into the middle of "charlie", release.
+  await mm.click(ta.x + 8, ta.y + 0)
+  await mm.pressDown(ta.x + 8, ta.y + 0)
+  await mm.emitMouseEvent("drag", ta.x + 15, ta.y + 0)
+  await mm.release(ta.x + 15, ta.y + 0)
+  await testSetup.flush()
+
+  // Whole words: anchor word "bravo" through focus word "charlie".
+  expect(ta.getSelectedText()).toBe("bravo charlie")
+})
+
+test("double-click drag shrinks back to the anchor word when the pointer returns", async () => {
+  const file = join(dir, "dbl-drag-shrink.ts")
+  await writeFile(file, "alpha bravo charlie delta\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("alpha bravo charlie")
+
+  const ta = getTextarea()
+  const mm = testSetup.mockMouse
+  await mm.click(ta.x + 8, ta.y + 0)
+  await mm.pressDown(ta.x + 8, ta.y + 0)
+  await mm.emitMouseEvent("drag", ta.x + 15, ta.y + 0) // out to "charlie"
+  await mm.emitMouseEvent("drag", ta.x + 8, ta.y + 0) // back inside "bravo"
+  await mm.release(ta.x + 8, ta.y + 0)
+  await testSetup.flush()
+
+  expect(ta.getSelectedText()).toBe("bravo")
+})
+
+test("triple-click then drag extends the selection line-wise", async () => {
+  const file = join(dir, "tri-drag.ts")
+  await writeFile(file, "one\ntwo\nthree\nfour\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("three")
+
+  const ta = getTextarea()
+  const mm = testSetup.mockMouse
+  // click, click, press-and-hold (3rd down arms the line gesture on line 2), drag down.
+  await mm.click(ta.x + 1, ta.y + 1)
+  await mm.click(ta.x + 1, ta.y + 1)
+  await mm.pressDown(ta.x + 1, ta.y + 1)
+  await mm.emitMouseEvent("drag", ta.x + 2, ta.y + 2)
+  await mm.release(ta.x + 2, ta.y + 2)
+  await testSetup.flush()
+
+  // Whole lines 2-3 including their trailing newlines.
+  expect(ta.getSelectedText()).toBe("two\nthree\n")
+})
+
+test("drag-selecting at the bottom edge auto-scrolls the viewport", async () => {
+  const file = join(dir, "autoscroll.ts")
+  const body = Array.from({ length: 30 }, (_, i) => `line ${String(i + 1).padStart(2, "0")}`).join("\n")
+  await writeFile(file, `${body}\n`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("line 01")
+
+  const ta = getTextarea()
+  const mm = testSetup.mockMouse
+  const bottomY = ta.y + ta.height - 1
+
+  await mm.pressDown(ta.x + 2, ta.y + 1)
+  // Park the pointer on the bottom edge until the auto-scroll velocity has
+  // demonstrably moved the viewport (bounded poll — tolerant of load-dependent
+  // frame pacing in a full-suite run).
+  for (let i = 0; i < 40 && ta.editorView.getViewport().offsetY === 0; i++) {
+    await mm.emitMouseEvent("drag", ta.x + 2, bottomY)
+    await Bun.sleep(25)
+    await testSetup.flush()
+  }
+  await mm.release(ta.x + 2, bottomY)
+  await testSetup.flush()
+
+  expect(ta.editorView.getViewport().offsetY).toBeGreaterThan(0)
+})
+
 test("switching the active tab releases the previous document's refcount", async () => {
   const a = join(dir, "switch-a.ts")
   const b = join(dir, "switch-b.ts")

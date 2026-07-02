@@ -1,0 +1,29 @@
+// Bun Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`App renders the 3-region workbench shell 1`] = `
+"                             │                                                  
+ EXPLORER                    │ vsx — press Ctrl+Q to quit                       
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+ vsx                                                                            
+"
+`;

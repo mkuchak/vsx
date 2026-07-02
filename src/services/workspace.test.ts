@@ -114,25 +114,32 @@ describe("watch", () => {
   test("emits created, changed and deleted (debounced)", async () => {
     const batches: FileChange[][] = []
     const dispose = watch(root, (changes) => batches.push(changes))
+    const target = join(root, "a.txt")
+    const typesSeen = () =>
+      batches.flat().filter((c) => c.path === target).map((c) => c.type)
+    // Bounded poll instead of fixed sleeps: FSEvents delivery latency varies
+    // wildly under full-suite load (this test flaked at 500ms/step), and waiting
+    // for each event before the next mutation also stops the OS from coalescing
+    // create+modify into a single event.
+    const waitFor = async (type: FileChange["type"]) => {
+      const deadline = Date.now() + 3000
+      while (!typesSeen().includes(type) && Date.now() < deadline) {
+        await Bun.sleep(50)
+      }
+    }
 
-    // create
-    await writeFile(join(root, "a.txt"), "hello")
-    await Bun.sleep(500)
+    await writeFile(target, "hello")
+    await waitFor("created")
 
-    // modify
-    await writeFile(join(root, "a.txt"), "hello world")
-    await Bun.sleep(500)
+    await writeFile(target, "hello world")
+    await waitFor("changed")
 
-    // delete
-    await rm(join(root, "a.txt"))
-    await Bun.sleep(500)
+    await rm(target)
+    await waitFor("deleted")
 
     dispose()
 
-    const all = batches.flat()
-    const target = join(root, "a.txt")
-    const types = all.filter((c) => c.path === target).map((c) => c.type)
-
+    const types = typesSeen()
     expect(types).toContain("created")
     expect(types).toContain("changed")
     expect(types).toContain("deleted")

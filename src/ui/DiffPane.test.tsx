@@ -1,5 +1,6 @@
 import { testRender } from "@opentui/react/test-utils"
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
+import { parsePatch } from "diff"
 import { realpathSync } from "node:fs"
 import { mkdtemp, rm, unlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -10,7 +11,15 @@ import { GitService } from "../services/git"
 import { CommandsProvider } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
 import { WatchersProvider } from "../workbench/watchers"
-import { DiffPane, pickHunkTarget, resolveDiff, resolveDiffContent } from "./DiffPane"
+import {
+  buildDiffPatch,
+  computeChangeBlockOffsets,
+  DiffPane,
+  FULL_CONTEXT_MAX_LINES,
+  pickHunkTarget,
+  resolveDiff,
+  resolveDiffContent,
+} from "./DiffPane"
 
 let root: string
 let git: GitService
@@ -101,6 +110,31 @@ async function renderActiveDiffWithWatchers(dims = { width: 80, height: 12 }) {
     dims,
   )
   return testSetup
+}
+
+/** The DiffPane's scroll container, for reading scrollTop after n/p navigation. */
+function scrollbox(): { scrollTop: number } {
+  const out: { scrollTop: number }[] = []
+  const walk = (node: { getChildren(): unknown[]; constructor: { name: string } }) => {
+    if (node.constructor.name === "ScrollBoxRenderable") out.push(node as never)
+    for (const child of node.getChildren()) walk(child as never)
+  }
+  walk(testSetup!.renderer.root as never)
+  if (out.length !== 1) throw new Error(`expected exactly one scrollbox, found ${out.length}`)
+  return out[0]
+}
+
+/** Toggle the diff view until it matches `want` (initial view depends on session state). */
+async function ensureView(want: "split" | "unified") {
+  const label = want === "split" ? "Split" : "Unified"
+  for (let i = 0; i < 2; i++) {
+    await testSetup!.flush()
+    if (testSetup!.captureCharFrame().includes(label)) return
+    testSetup!.mockInput.pressKey("v")
+    for (let j = 0; j < 6; j++) await testSetup!.flush()
+    await Bun.sleep(20)
+  }
+  await waitForText(label)
 }
 
 async function waitForText(text: string, timeoutMs = 4000) {
@@ -314,6 +348,82 @@ describe("pickHunkTarget", () => {
   })
 })
 
+describe("buildDiffPatch", () => {
+  test("full context: keeps every unchanged line between and around changes", () => {
+    const lines = Array.from({ length: 30 }, (_, i) => `line ${i}`)
+    const old = lines.join("\n") + "\n"
+    const next = [...lines]
+    next[2] = "CHANGE_A"
+    next[27] = "CHANGE_B"
+    const { patch, fullContext } = buildDiffPatch(old, next.join("\n") + "\n", "f.txt")
+    expect(fullContext).toBe(true)
+    // A 3-line-context patch would drop the far-apart unchanged middle lines; full
+    // context must retain them (context rows carry a leading space).
+    expect(patch).toContain(" line 14")
+    expect(patch).toContain(" line 0")
+    expect(patch).toContain(" line 29")
+    expect(patch).toContain("+CHANGE_A")
+    expect(patch).toContain("+CHANGE_B")
+    // The whole file collapses into a single hunk under infinite context.
+    const parsed = parsePatch(patch)
+    expect(parsed[0].hunks.length).toBe(1)
+  })
+
+  test("over the guard threshold: falls back to a compact hunked patch", () => {
+    const big = Array.from({ length: FULL_CONTEXT_MAX_LINES + 10 }, (_, i) => `l${i}`)
+    const old = big.join("\n") + "\n"
+    const next = [...big]
+    next[0] = "CHANGED_TOP"
+    next[next.length - 1] = "CHANGED_BOTTOM"
+    const { patch, fullContext } = buildDiffPatch(old, next.join("\n") + "\n", "big.txt")
+    expect(fullContext).toBe(false)
+    // Two separated changes in a large file must remain two hunks (3-line context),
+    // not one giant full-file hunk.
+    expect(parsePatch(patch)[0].hunks.length).toBe(2)
+    // A far-away unchanged middle line is dropped by the compact view.
+    expect(patch).not.toContain(" l2500")
+  })
+})
+
+describe("computeChangeBlockOffsets", () => {
+  // 30-line file with two separated single-line edits, full-file context.
+  const lines = Array.from({ length: 30 }, (_, i) => `line ${i}`)
+  const next = [...lines]
+  next[5] = "C5"
+  next[25] = "C25"
+  const { patch } = buildDiffPatch(lines.join("\n") + "\n", next.join("\n") + "\n", "f.txt")
+
+  test("unified: a target at the first row of each change run", () => {
+    // rows 0-4 context, row 5 `-line 5`, row 6 `+C5`, rows 7-25 context (lines 6-24),
+    // row 26 `-line 25`. Two blocks, at rows 5 and 26.
+    expect(computeChangeBlockOffsets(patch, "unified")).toEqual([5, 26])
+  })
+
+  test("split: change runs collapse to one row (removed/added side by side)", () => {
+    // Each single-line change occupies one visual row per side, so the second block
+    // lands 20 rows earlier than in unified.
+    expect(computeChangeBlockOffsets(patch, "split")).toEqual([5, 25])
+  })
+
+  test("no changes yields no targets", () => {
+    const same = "a\nb\nc\n"
+    const { patch: p } = buildDiffPatch(same, same, "f.txt")
+    expect(computeChangeBlockOffsets(p, "unified")).toEqual([])
+    expect(computeChangeBlockOffsets(p, "split")).toEqual([])
+  })
+
+  test("no-trailing-newline change stays one visual block in both views", () => {
+    // old lacks a trailing newline, new adds one: the hunk is
+    // [" a", "-b", "\\ No newline at end of file", "+c"]. buildSplitView skips the
+    // "\\" marker and renders the remove/add as adjacent rows = ONE visual block,
+    // so split must yield a SINGLE offset (not two) — otherwise n stops twice
+    // inside one change. Unified likewise treats the marker as run-preserving.
+    const { patch } = buildDiffPatch("a\nb", "a\nc\n", "f.txt")
+    expect(computeChangeBlockOffsets(patch, "split")).toEqual([1])
+    expect(computeChangeBlockOffsets(patch, "unified")).toEqual([1])
+  })
+})
+
 describe("DiffPane rendering + interaction", () => {
   test("shows a placeholder when no diff tab is active", async () => {
     await renderActiveDiff()
@@ -405,4 +515,47 @@ describe("DiffPane rendering + interaction", () => {
 
     expect(after).not.toBe(before) // scroll position moved
   })
+
+  for (const view of ["split", "unified"] as const) {
+    test(`n/p navigate every change block and wrap under full-file context (${view})`, async () => {
+      // A tall file with two well-separated single-line edits: under full context
+      // the whole file is one hunk, so navigation must come from our own
+      // change-block offsets rather than the renderable's single hunk start.
+      const lines = Array.from({ length: 80 }, (_, i) => `line ${i}`)
+      const oldText = lines.join("\n") + "\n"
+      await write("big.txt", oldText)
+      await sh(["add", "big.txt"])
+      await sh(["commit", "-qm", "init"])
+      lines[5] = "EDIT_TOP"
+      lines[40] = "EDIT_BOTTOM"
+      const newText = lines.join("\n") + "\n"
+      await write("big.txt", newText)
+
+      workbenchStore.openDiff(join(root, "big.txt"), "unstaged", root, { preview: false })
+      await renderActiveDiff({ width: 80, height: 8 })
+      await waitForText("EDIT_TOP")
+      await ensureView(view)
+
+      const { patch } = buildDiffPatch(oldText, newText, "big.txt")
+      const offsets = computeChangeBlockOffsets(patch, view)
+      expect(offsets.length).toBe(2) // two change blocks
+      const sb = scrollbox()
+
+      const pressAndRead = async (k: "n" | "p") => {
+        testSetup!.mockInput.pressKey(k)
+        for (let i = 0; i < 6; i++) await testSetup!.flush()
+        await Bun.sleep(20)
+        await testSetup!.flush()
+        return sb.scrollTop
+      }
+
+      // From the top, n visits block 1, then block 2, then wraps back to block 1.
+      expect(await pressAndRead("n")).toBe(offsets[0])
+      expect(await pressAndRead("n")).toBe(offsets[1])
+      expect(await pressAndRead("n")).toBe(offsets[0]) // wrap forward
+      // p walks back: from block 1 it wraps to the last block.
+      expect(await pressAndRead("p")).toBe(offsets[1]) // wrap backward
+      expect(await pressAndRead("p")).toBe(offsets[0])
+    })
+  }
 })

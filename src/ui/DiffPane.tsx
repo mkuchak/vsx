@@ -1,13 +1,12 @@
 import {
   SyntaxStyle,
-  type DiffRenderable,
   type ScrollBoxRenderable,
   type ThemeTokenStyle,
 } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
-import { createTwoFilesPatch } from "diff"
+import { createTwoFilesPatch, parsePatch } from "diff"
 import { relative } from "node:path"
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { detectLanguage, documentRegistry } from "../model/documents"
 import type { CommitDiffTab, DiffTab } from "../model/workbench"
 import { GitService } from "../services/git"
@@ -64,6 +63,107 @@ export function pickHunkTarget(
   }
   const prior = offsets.filter((o) => o < current - EPS)
   return prior.length > 0 ? prior[prior.length - 1] : offsets[offsets.length - 1]
+}
+
+/**
+ * Files at or under this line count render with full-file context so every
+ * unchanged line shows (VSCode's diff-editor look). The `<diff>` is a single
+ * full-height child inside the scrollbox, so nothing gets culled and the
+ * per-frame gutter/shading loops run over the WHOLE file — larger files fall
+ * back to a compact 3-line-context view to bound that work.
+ */
+export const FULL_CONTEXT_MAX_LINES = 5000
+
+/** Line count as a trailing-newline-terminated file reports it (no phantom last line). */
+function lineCount(text: string): number {
+  if (text === "") return 0
+  const n = text.split("\n").length
+  return text.endsWith("\n") ? n - 1 : n
+}
+
+/**
+ * Build the unified patch fed to `<diff>`. Under the size guard it uses
+ * effectively infinite context (the `diff` package merges everything into one
+ * hunk carrying all unchanged lines); over it, the today's 3-line-context view.
+ * Returns whether full context was used. Exported as a pure, testable unit.
+ */
+export function buildDiffPatch(
+  oldCode: string,
+  newCode: string,
+  name: string,
+): { patch: string; fullContext: boolean } {
+  const fullContext =
+    Math.max(lineCount(oldCode), lineCount(newCode)) <= FULL_CONTEXT_MAX_LINES
+  const patch = createTwoFilesPatch(name, name, oldCode, newCode, undefined, undefined, {
+    context: fullContext ? Number.MAX_SAFE_INTEGER : 3,
+  })
+  return { patch, fullContext }
+}
+
+/**
+ * Row offsets (0-based, in the diff's own scroll space) of the first visual row
+ * of every contiguous added/removed run, for n/p change navigation. Under full
+ * context the patch is ONE hunk, so the renderable's getHunkRowOffsets() gives a
+ * single target and n/p stalls; we instead reproduce @opentui/core's row layout
+ * (buildUnifiedView / buildSplitView) to place a target at each change block.
+ *
+ * Assumes wrap is off (the `<diff>`'s default wrapMode), so logical lines map
+ * 1:1 to visual rows and split-view change runs occupy max(removed, added) rows.
+ */
+export function computeChangeBlockOffsets(patch: string, view: DiffView): number[] {
+  const lines: string[] = []
+  for (const file of parsePatch(patch)) {
+    for (const hunk of file.hunks) lines.push(...hunk.lines)
+  }
+  const offsets: number[] = []
+  if (view === "unified") {
+    let row = 0
+    let inRun = false
+    for (const line of lines) {
+      const c = line[0]
+      if (c === "\\") continue // "\ No newline at end of file" — not a rendered row
+      if (c === "+" || c === "-") {
+        if (!inRun) {
+          offsets.push(row)
+          inRun = true
+        }
+      } else {
+        inRun = false
+      }
+      row++
+    }
+    return offsets
+  }
+  // Split view: context lines take one row; a change run takes max(removed, added)
+  // rows (the shorter side is padded with empty filler), matching buildSplitView.
+  // A "\ No newline" marker between a remove and an add ends buildSplitView's
+  // inner max()-grouping but NOT the visual block — the rows on either side render
+  // adjacent, so the whole "\"-separated region is one navigation stop.
+  let row = 0
+  let i = 0
+  while (i < lines.length) {
+    const c = lines[i][0]
+    if (c === " ") {
+      row++
+      i++
+    } else if (c === "\\") {
+      i++
+    } else {
+      offsets.push(row)
+      while (i < lines.length && lines[i][0] !== " ") {
+        let removes = 0
+        let adds = 0
+        while (i < lines.length && (lines[i][0] === "-" || lines[i][0] === "+")) {
+          if (lines[i][0] === "-") removes++
+          else adds++
+          i++
+        }
+        row += Math.max(removes, adds)
+        while (i < lines.length && lines[i][0] === "\\") i++
+      }
+    }
+  }
+  return offsets
 }
 
 /** The working-tree file text, or "" if the file is gone (a deletion). */
@@ -152,7 +252,6 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
   const [view, setView] = useState<DiffView>(lastView)
   const [reloadVersion, setReloadVersion] = useState(0)
   const sbRef = useRef<ScrollBoxRenderable | null>(null)
-  const diffRef = useRef<DiffRenderable | null>(null)
 
   // The diff scrollbox loses native focus to an overlay's input; restore it on
   // overlay close when this pane is the focused one.
@@ -205,6 +304,23 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
     })
   }, [sharedWatchers, repoRoot])
 
+  // Build the patch and both views' change-block offsets once per content change,
+  // so a render (the `<diff>` prop) and every n/p keypress reuse them instead of
+  // re-running a whole-file Myers diff — costly near the full-context threshold.
+  const readyOld = load.kind === "ready" ? load.oldCode : null
+  const readyNew = load.kind === "ready" ? load.newCode : null
+  const diffData = useMemo(() => {
+    if (readyOld === null || readyNew === null || !filePath) return null
+    const { patch } = buildDiffPatch(readyOld, readyNew, basename(filePath))
+    return {
+      patch,
+      offsets: {
+        unified: computeChangeBlockOffsets(patch, "unified"),
+        split: computeChangeBlockOffsets(patch, "split"),
+      },
+    }
+  }, [readyOld, readyNew, filePath])
+
   const toggleView = () => {
     setView((v) => {
       const next: DiffView = v === "split" ? "unified" : "split"
@@ -214,10 +330,9 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
   }
 
   const jumpHunk = (dir: 1 | -1) => {
-    const d = diffRef.current
     const sb = sbRef.current
-    if (!d || !sb) return
-    const target = pickHunkTarget(d.getHunkRowOffsets(), sb.scrollTop, dir)
+    if (!sb || !diffData) return
+    const target = pickHunkTarget(diffData.offsets[view], sb.scrollTop, dir)
     if (target !== null) sb.scrollTop = target
   }
 
@@ -263,9 +378,7 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
       ? tab.label
       : `${name} — ${tab.diffKind === "staged" ? "HEAD ↔ Index" : "Index ↔ Working Tree"}`
   const hasChanges = load.oldCode !== load.newCode
-  const patch = createTwoFilesPatch(name, name, load.oldCode, load.newCode, undefined, undefined, {
-    context: 3,
-  })
+  const patch = diffData?.patch ?? ""
 
   return (
     <box flexDirection="column" height={height}>
@@ -279,13 +392,12 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
         <text fg={theme.foreground}>{headerLabel}</text>
         <box flexGrow={1} />
         <text fg={theme.dimForeground}>
-          {view === "split" ? "Split" : "Unified"} · n/p hunk · v toggle
+          {view === "split" ? "Split" : "Unified"} · n/p change · v toggle
         </text>
       </box>
       {hasChanges ? (
         <scrollbox ref={sbRef} focused={focused} flexGrow={1}>
           <diff
-            ref={diffRef}
             diff={patch}
             view={view}
             showLineNumbers
@@ -294,6 +406,11 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
             syntaxStyle={getSyntaxStyle()}
             addedBg={theme.diffAddedBackground}
             removedBg={theme.diffRemovedBackground}
+            addedLineNumberBg={theme.diffAddedGutterBackground}
+            removedLineNumberBg={theme.diffRemovedGutterBackground}
+            addedSignColor={theme.diffAddedSign}
+            removedSignColor={theme.diffRemovedSign}
+            lineNumberFg={theme.diffLineNumberForeground}
           />
         </scrollbox>
       ) : (

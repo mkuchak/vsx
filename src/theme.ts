@@ -19,6 +19,11 @@ export const theme = {
   selectionBackground: "#264f78",
   hoverBackground: "#2a2d2e",
 
+  // Editor scrollbars — VSCode keeps the track near-invisible and the thumb a dim
+  // translucent gray; approximated here with flat hex tuned to the dark background.
+  scrollbarTrack: "#1e1e1e",
+  scrollbarThumb: "#424242",
+
   // Git / SCM status colors (VSCode gitDecoration.* theme colors)
   gitModified: "#e2c08d",
   gitAdded: "#73c991",
@@ -34,9 +39,15 @@ export const theme = {
   info: "#3794ff",
   hint: "#8c8c8c",
 
-  // Diff
+  // Diff — line backgrounds plus VSCode-style gutter tints, ± sign colors, and
+  // a dim line-number foreground for the diff editor's gutter.
   diffAddedBackground: "#373d29",
   diffRemovedBackground: "#4b1818",
+  diffAddedGutterBackground: "#2a3418",
+  diffRemovedGutterBackground: "#3a1414",
+  diffAddedSign: "#73c991",
+  diffRemovedSign: "#f14c4c",
+  diffLineNumberForeground: "#858585",
 } as const
 
 export type Theme = typeof theme

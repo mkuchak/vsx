@@ -1,0 +1,140 @@
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
+import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { testRender } from "@opentui/react/test-utils"
+import * as workspace from "../services/workspace"
+import { FileTree } from "./FileTree"
+
+let testSetup: Awaited<ReturnType<typeof testRender>>
+let dir: string
+let listDirSpy: ReturnType<typeof spyOn<typeof workspace, "listDir">>
+
+beforeEach(async () => {
+  dir = await mkdtemp(join(tmpdir(), "vsx-filetree-"))
+  await mkdir(join(dir, "src"))
+  await writeFile(join(dir, "src", "index.ts"), "export {}\n")
+  await writeFile(join(dir, "src", "util.ts"), "export {}\n")
+  await writeFile(join(dir, "package.json"), "{}\n")
+  await writeFile(join(dir, "README.md"), "# hi\n")
+  listDirSpy = spyOn(workspace, "listDir")
+})
+
+afterEach(async () => {
+  listDirSpy.mockRestore()
+  if (testSetup) testSetup.renderer.destroy()
+  await rm(dir, { recursive: true, force: true })
+})
+
+function render(props?: Partial<Parameters<typeof FileTree>[0]>) {
+  const onOpenFile = props?.onOpenFile ?? (() => {})
+  return testRender(
+    <box width={40} height={12}>
+      <FileTree root={dir} focused onOpenFile={onOpenFile} {...props} />
+    </box>,
+    { width: 40, height: 12 },
+  )
+}
+
+async function waitForText(text: string, timeoutMs = 3000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    await testSetup.flush()
+    if (testSetup.captureCharFrame().includes(text)) return
+    await Bun.sleep(30)
+  }
+  throw new Error(`timed out waiting for "${text}"\n${testSetup.captureCharFrame()}`)
+}
+
+// Lets React commit state AND run passive effects (which refresh useKeyboard's
+// handler ref) between simulated keypresses; a bare flush() does not run them.
+async function settle() {
+  for (let i = 0; i < 5; i++) {
+    await testSetup.flush()
+    await Bun.sleep(10)
+  }
+}
+
+function callsFor(path: string) {
+  return listDirSpy.mock.calls.filter((c) => c[0] === path).length
+}
+
+test("renders root children collapsed", async () => {
+  testSetup = await render()
+  await waitForText("package.json")
+
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("src")
+  expect(frame).toContain("package.json")
+  expect(frame).toContain("README.md")
+  // src is a collapsed directory, its children must not be visible
+  expect(frame).not.toContain("index.ts")
+  expect(frame).toContain("▸")
+  expect(frame).toMatchSnapshot()
+})
+
+test("expands a directory and lazily loads its children exactly once", async () => {
+  testSetup = await render()
+  await waitForText("src")
+
+  const srcPath = join(dir, "src")
+  expect(callsFor(srcPath)).toBe(0)
+
+  // src is selected (index 0); Right expands it.
+  testSetup.mockInput.pressArrow("right")
+  await waitForText("index.ts")
+
+  expect(testSetup.captureCharFrame()).toContain("util.ts")
+  expect(testSetup.captureCharFrame()).toContain("▾")
+  expect(callsFor(srcPath)).toBe(1)
+
+  // Collapse then re-expand: children must not be re-fetched.
+  testSetup.mockInput.pressArrow("left")
+  await settle()
+  expect(testSetup.captureCharFrame()).not.toContain("index.ts")
+
+  testSetup.mockInput.pressArrow("right")
+  await waitForText("index.ts")
+  expect(callsFor(srcPath)).toBe(1)
+
+  expect(testSetup.captureCharFrame()).toMatchSnapshot()
+})
+
+test("arrow navigation + Enter opens the selected file with preview", async () => {
+  const opened: Array<{ path: string; opts: { preview: boolean } }> = []
+  testSetup = await render({
+    onOpenFile: (path, opts) => opened.push({ path, opts }),
+  })
+  await waitForText("package.json")
+
+  // rows: [src(dir), package.json, README.md]. Move to package.json.
+  testSetup.mockInput.pressArrow("down")
+  await settle()
+  testSetup.mockInput.pressEnter()
+  await settle()
+
+  expect(opened).toEqual([
+    { path: join(dir, "package.json"), opts: { preview: true } },
+  ])
+})
+
+test("Enter on a collapsed directory expands it", async () => {
+  testSetup = await render()
+  await waitForText("src")
+
+  testSetup.mockInput.pressEnter()
+  await waitForText("index.ts")
+
+  expect(testSetup.captureCharFrame()).toContain("index.ts")
+})
+
+test("watcher refresh picks up a file created under the root", async () => {
+  testSetup = await render()
+  await waitForText("package.json")
+  expect(testSetup.captureCharFrame()).not.toContain("fresh.ts")
+
+  await writeFile(join(dir, "fresh.ts"), "export {}\n")
+
+  await waitForText("fresh.ts")
+  expect(testSetup.captureCharFrame()).toContain("fresh.ts")
+})

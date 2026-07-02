@@ -1,0 +1,33 @@
+// Bun Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`renders root children collapsed 1`] = `
+"▸ src                                   
+  package.json                          
+  README.md                             
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+"
+`;
+
+exports[`expands a directory and lazily loads its children exactly once 1`] = `
+"▾ src                                   
+    index.ts                            
+    util.ts                             
+  package.json                          
+  README.md                             
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+                                        
+"
+`;

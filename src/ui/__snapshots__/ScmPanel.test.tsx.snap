@@ -1,0 +1,25 @@
+// Bun Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`groups merge, staged, changes, and untracked files with counts 1`] = `
+" SOURCE CONTROL                             
+Message (Enter to commit)                   
+[Enter] Commit                              
+ Merge Changes                          (1) 
+  conflict.txt                            ! 
+ Staged Changes                         (1) 
+  added.txt                               A 
+ Changes                                (1) 
+  tracked.txt                             M 
+ Untracked Changes                      (1) 
+  untracked.txt                           U 
+                                            
+                                            
+                                            
+                                            
+                                            
+                                            
+                                            
+                                            
+                                            
+"
+`;

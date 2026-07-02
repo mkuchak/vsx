@@ -1,0 +1,604 @@
+import {
+  getTreeSitterClient,
+  SyntaxStyle,
+  type ScrollBoxRenderable,
+  type TextareaAction,
+  type TextareaRenderable,
+  type ThemeTokenStyle,
+} from "@opentui/core"
+import { useKeyboard, useRenderer } from "@opentui/react"
+import { useCallback, useEffect, useReducer, useRef, useState } from "react"
+import {
+  documentRegistry,
+  FileTooLargeError,
+  type Document,
+} from "../model/documents"
+import { workbenchStore } from "../model/workbench"
+import * as clipboard from "../services/clipboard"
+import { theme } from "../theme"
+import { registerEditorControls } from "../workbench/editorControls"
+import { useOverlay, useOverlayFocusRestore } from "../workbench/OverlayProvider"
+import { getLastRendererSelection } from "../workbench/rendererSelection"
+import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
+
+export type CursorPosition = { line: number; column: number }
+
+export type EditorPaneProps = {
+  focused: boolean
+  height?: number | `${number}%` | "auto"
+  /** Render a specific group's content; defaults to the globally active group. */
+  groupId?: string
+  /** Fires with a 1-based line/column whenever the cursor moves. Status-bar hookup. */
+  onCursorChange?: (pos: CursorPosition) => void
+}
+
+/** Bytes of an oversized file to show as a plain-text preview. */
+const PREVIEW_BYTES = 100 * 1024
+
+/**
+ * VSCode "Dark+"-ish tree-sitter token colors. `<code>`/`<line-number>` require a
+ * SyntaxStyle even for the unhighlighted fallback, so one shared instance backs both.
+ */
+const SYNTAX_THEME: ThemeTokenStyle[] = [
+  { scope: ["keyword", "keyword.control", "conditional", "repeat"], style: { foreground: "#c586c0" } },
+  { scope: ["string", "string.special"], style: { foreground: "#ce9178" } },
+  { scope: ["comment"], style: { foreground: "#6a9955", italic: true } },
+  { scope: ["function", "function.call", "function.method"], style: { foreground: "#dcdcaa" } },
+  { scope: ["type", "type.builtin", "constructor"], style: { foreground: "#4ec9b0" } },
+  { scope: ["number", "constant", "constant.builtin", "boolean"], style: { foreground: "#b5cea8" } },
+  { scope: ["variable", "variable.parameter"], style: { foreground: "#9cdcfe" } },
+  { scope: ["property"], style: { foreground: "#9cdcfe" } },
+  { scope: ["operator", "punctuation", "punctuation.delimiter", "punctuation.bracket"], style: { foreground: "#d4d4d4" } },
+  { scope: ["tag"], style: { foreground: "#569cd6" } },
+  { scope: ["attribute"], style: { foreground: "#9cdcfe" } },
+]
+
+let sharedSyntaxStyle: SyntaxStyle | undefined
+function getSyntaxStyle(): SyntaxStyle {
+  if (!sharedSyntaxStyle) sharedSyntaxStyle = SyntaxStyle.fromTheme(SYNTAX_THEME)
+  return sharedSyntaxStyle
+}
+
+/** Tag shared by every highlight span we push, so a whole pass clears in one call. */
+const HIGHLIGHT_REF = 1
+/** Debounce window between an edit settling and the re-parse it triggers. */
+const HIGHLIGHT_DEBOUNCE_MS = 160
+
+/**
+ * tree-sitter capture names are dotted/hierarchical (e.g. `"function.call"`) but
+ * SYNTAX_THEME only registers coarse roots (`"function"`). Try the exact name,
+ * then fall back to its first dot-segment; unregistered names yield `null` (skip).
+ */
+function resolveStyleId(syntaxStyle: SyntaxStyle, scopeName: string): number | null {
+  const direct = syntaxStyle.getStyleId(scopeName)
+  if (direct !== null) return direct
+  const dot = scopeName.indexOf(".")
+  if (dot > 0) return syntaxStyle.getStyleId(scopeName.slice(0, dot))
+  return null
+}
+
+/**
+ * The textarea's built-in undo/redo default to Ctrl+- / Ctrl+. (and super+z on
+ * mac); add the familiar Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z. Merged over the
+ * upstream defaults, so all built-in selection/word-nav bindings still apply.
+ */
+const EXTRA_KEY_BINDINGS: {
+  name: string
+  ctrl?: boolean
+  shift?: boolean
+  action: TextareaAction
+}[] = [
+  { name: "z", ctrl: true, action: "undo" },
+  { name: "z", ctrl: true, shift: true, action: "redo" },
+  { name: "y", ctrl: true, action: "redo" },
+]
+
+/**
+ * Keys that move the caret. The native `onCursorChange` prop only fires on the
+ * edit buffer's `cursor-changed` event, and vertical navigation routes through
+ * `editorView.moveUp/DownVisual` (the view pointer) which never emits it — so the
+ * status bar's Ln/Col would stick after Up/Down/Home/End/PageUp/PageDown. A
+ * focused editor re-reads its position after any of these (modifiers included).
+ */
+const CURSOR_NAV_KEYS = new Set([
+  "up",
+  "down",
+  "left",
+  "right",
+  "home",
+  "end",
+  "pageup",
+  "pagedown",
+])
+
+/** Longest gap between mousedowns that still counts as the same multi-click gesture. */
+const MULTI_CLICK_MS = 500
+
+/** Character class used to grow a double-click into a whole word/run. */
+function charClass(ch: string): "word" | "space" | "other" {
+  if (/\s/.test(ch)) return "space"
+  if (/[A-Za-z0-9_]/.test(ch)) return "word"
+  return "other"
+}
+
+/**
+ * The [start, end) column run of same-class characters containing `col` on `line`.
+ * A click at/past end-of-line grabs the final run; an empty line yields an empty
+ * range (caller falls back to a bare caret). Keeps the punctuation/whitespace case
+ * simple — it selects the contiguous run of that class, not VSCode-exact tokens.
+ */
+function wordRangeAt(line: string, col: number): { start: number; end: number } {
+  if (line.length === 0) return { start: 0, end: 0 }
+  const probe = Math.min(col, line.length - 1)
+  const cls = charClass(line[probe])
+  let start = probe
+  let end = probe + 1
+  while (start > 0 && charClass(line[start - 1]) === cls) start--
+  while (end < line.length && charClass(line[end]) === cls) end++
+  return { start, end }
+}
+
+type LoadState =
+  | { kind: "empty" }
+  | { kind: "loading" }
+  | { kind: "ready"; doc: Document }
+  | { kind: "too-large"; text: string; size: number }
+  | { kind: "error"; message: string }
+
+async function readPreview(path: string): Promise<string> {
+  const slice = Bun.file(path).slice(0, PREVIEW_BYTES)
+  return slice.text()
+}
+
+export function EditorPane({
+  focused,
+  height = "100%",
+  groupId,
+  onCursorChange,
+}: EditorPaneProps) {
+  const state = useWorkbenchStore()
+  const resolvedGroupId = groupId ?? state.activeGroupId
+  const group = state.groups.find((g) => g.id === resolvedGroupId)
+  const path = group?.activeTabPath ?? null
+
+  const [load, setLoad] = useState<LoadState>({ kind: "empty" })
+  const [, forceUpdate] = useReducer((n: number) => n + 1, 0)
+
+  // The too-large preview is a scrollbox that also loses native focus to an
+  // overlay; restore it on overlay close when this pane is the focused one.
+  const previewScrollRef = useRef<ScrollBoxRenderable | null>(null)
+  useOverlayFocusRestore(previewScrollRef, focused && load.kind === "too-large")
+
+  useEffect(() => {
+    if (path === null) {
+      setLoad({ kind: "empty" })
+      return
+    }
+
+    let cancelled = false
+    let acquired = false
+    setLoad({ kind: "loading" })
+
+    documentRegistry
+      .openDocument(path)
+      .then((doc) => {
+        acquired = true
+        // Unmounted before the open resolved: release the refcount we just took
+        // instead of leaking it (cleanup already ran and skipped the release).
+        if (cancelled) {
+          acquired = false
+          documentRegistry.releaseDocument(path)
+          return
+        }
+        setLoad({ kind: "ready", doc })
+      })
+      .catch(async (err) => {
+        if (cancelled) return
+        if (err instanceof FileTooLargeError) {
+          try {
+            const text = await readPreview(path)
+            if (!cancelled) setLoad({ kind: "too-large", text, size: err.size })
+          } catch {
+            if (!cancelled) setLoad({ kind: "error", message: "Could not read file" })
+          }
+          return
+        }
+        setLoad({ kind: "error", message: err instanceof Error ? err.message : String(err) })
+      })
+
+    return () => {
+      cancelled = true
+      // Only release a refcount we actually acquired; if the open hasn't resolved
+      // yet, its resolution handler releases (see the `cancelled` check above).
+      if (acquired) {
+        acquired = false
+        documentRegistry.releaseDocument(path)
+      }
+    }
+  }, [path])
+
+  useEffect(() => {
+    if (load.kind !== "ready") return
+    return load.doc.onDidChange(() => forceUpdate())
+  }, [load])
+
+  if (path === null || load.kind === "empty") {
+    return (
+      <box height={height} alignItems="center" justifyContent="center">
+        <text fg={theme.dimForeground}>No file open</text>
+      </box>
+    )
+  }
+
+  if (load.kind === "loading") {
+    return (
+      <box height={height} alignItems="center" justifyContent="center">
+        <text fg={theme.dimForeground}>Loading…</text>
+      </box>
+    )
+  }
+
+  if (load.kind === "error") {
+    return (
+      <box height={height} alignItems="center" justifyContent="center">
+        <text fg={theme.error}>{load.message}</text>
+      </box>
+    )
+  }
+
+  if (load.kind === "too-large") {
+    return (
+      <box flexDirection="column" height={height}>
+        <box height={1} paddingLeft={1} backgroundColor={theme.sidebarBackground}>
+          <text fg={theme.warning}>File too large — showing a truncated preview</text>
+        </box>
+        <scrollbox ref={previewScrollRef} focused={focused} flexGrow={1}>
+          <code content={load.text} syntaxStyle={getSyntaxStyle()} />
+        </scrollbox>
+      </box>
+    )
+  }
+
+  // Keyed by uri so switching files remounts with fresh `initialValue`.
+  return (
+    <EditorTextarea
+      key={load.doc.uri}
+      doc={load.doc}
+      groupId={resolvedGroupId}
+      focused={focused}
+      height={height}
+      onCursorChange={onCursorChange}
+    />
+  )
+}
+
+type EditorTextareaProps = {
+  doc: Document
+  /** Group this pane renders, so a user edit promotes the tab in THIS group. */
+  groupId: string
+  focused: boolean
+  height: number | `${number}%` | "auto"
+  onCursorChange?: (pos: CursorPosition) => void
+}
+
+/**
+ * The editable view over a Document. The `<textarea>` is uncontrolled — it owns a
+ * native rope buffer seeded once from `initialValue` — so we bridge it to the
+ * shared Document model by hand: user edits flow textarea → Document via
+ * `onContentChange`, and external changes (disk/save) flow Document → textarea by
+ * pushing text into the buffer on non-'edit' change events.
+ */
+function EditorTextarea({ doc, groupId, focused, height, onCursorChange }: EditorTextareaProps) {
+  const renderer = useRenderer()
+  const { isOverlayOpen } = useOverlay()
+  const taRef = useRef<TextareaRenderable | null>(null)
+  const docRef = useRef(doc)
+  docRef.current = doc
+  // useKeyboard is a global subscription; this ref lets the handler act only
+  // when THIS editor has focus (so split groups don't all copy at once).
+  const focusedRef = useRef(focused)
+  focusedRef.current = focused
+
+  // OpenTUI focus is singular: an overlay's <input focused> steals the native
+  // focus away from this textarea, and closing it leaves focus null because this
+  // pane's `focused` prop never changed. Re-focus imperatively on overlay close.
+  useOverlayFocusRestore(taRef, focused)
+
+  // Live tree-sitter highlighting for the editable buffer. OpenTUI only
+  // auto-highlights read-only components (`<code>` etc.); the editable
+  // EditBuffer has no `language` prop, so spans are pushed manually here.
+  //
+  // Uses TreeSitterClient.highlightOnce — a whole-buffer re-parse per debounce
+  // tick, not the stateful incremental createBuffer/updateBuffer API. It is far
+  // simpler to get correct and sufficient for the MVP; revisit with the
+  // incremental API if large-file typing latency becomes a real problem.
+  const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Monotonic id stamped when a request FIRES; a resolved request only applies
+  // if it is still the latest, so a slow parse can't clobber a newer edit.
+  const highlightReqId = useRef(0)
+
+  const scheduleHighlight = useCallback(() => {
+    // No known grammar (e.g. `.txt`/extensionless): leave it unhighlighted.
+    const language = docRef.current.language
+    if (language === undefined) return
+    if (highlightTimer.current) clearTimeout(highlightTimer.current)
+    highlightTimer.current = setTimeout(() => {
+      highlightTimer.current = null
+      const ta = taRef.current
+      if (!ta) return
+      const text = ta.plainText
+      const reqId = ++highlightReqId.current
+      // Fire-and-forget: never block input, never throw out of a parse failure.
+      getTreeSitterClient()
+        .highlightOnce(text, language)
+        .then((result) => {
+          if (reqId !== highlightReqId.current) return // a newer edit won
+          const editBuffer = taRef.current?.editBuffer
+          if (!editBuffer) return
+          const syntaxStyle = getSyntaxStyle()
+          editBuffer.removeHighlightsByRef(HIGHLIGHT_REF)
+          for (const [start, end, scopeName] of result.highlights ?? []) {
+            const styleId = resolveStyleId(syntaxStyle, scopeName)
+            if (styleId === null) continue
+            editBuffer.addHighlightByCharRange({ start, end, styleId, hlRef: HIGHLIGHT_REF })
+          }
+        })
+        .catch(() => {
+          // Best-effort: a failed parse just skips this round's highlights.
+        })
+    }, HIGHLIGHT_DEBOUNCE_MS)
+  }, [])
+
+  // Seed the buffer's SyntaxStyle (so pushed styleIds resolve to the same colors
+  // as the read-only preview) and highlight the initial contents on mount.
+  useEffect(() => {
+    taRef.current?.editBuffer.setSyntaxStyle(getSyntaxStyle())
+    scheduleHighlight()
+    return () => {
+      if (highlightTimer.current) {
+        clearTimeout(highlightTimer.current)
+        highlightTimer.current = null
+      }
+      taRef.current?.editBuffer.removeHighlightsByRef(HIGHLIGHT_REF)
+    }
+  }, [scheduleHighlight])
+
+  // Mirror the buffer into the Document. Wired to BOTH content- and
+  // cursor-change: the native buffer's undo/redo repositions the cursor without
+  // emitting a content-change event, so cursor-change is the only signal that
+  // catches those reverts. The string compare makes redundant calls a no-op.
+  const syncFromBuffer = useCallback(() => {
+    const ta = taRef.current
+    if (!ta) return
+    const text = ta.plainText
+    if (text !== docRef.current.getText()) {
+      docRef.current.setText(text, "edit")
+      // This branch is a genuine LOCAL edit: inbound disk/save sync writes the
+      // buffer to already match the Document, so it fails this compare and never
+      // reaches here — meaning promotion fires only on real typing/paste/cut,
+      // exactly as VSCode promotes a preview tab the moment you edit it.
+      workbenchStore.promoteTabInGroup(groupId, docRef.current.uri)
+      scheduleHighlight()
+    }
+  }, [scheduleHighlight, groupId])
+
+  // Status-bar hookup: report the 1-based line/column on every content- or
+  // cursor-change. `editorView.getCursor()` is 0-based logical row/col.
+  const reportCursor = useCallback(() => {
+    if (!onCursorChange) return
+    const cursor = taRef.current?.editorView.getCursor()
+    if (!cursor) return
+    onCursorChange({ line: cursor.row + 1, column: cursor.col + 1 })
+  }, [onCursorChange])
+
+  // Lets the effects/handlers that must re-report (nav keys, inbound clamp, the
+  // go-to-line control) always call the LATEST reportCursor without listing it as
+  // a dep — so they never re-subscribe / re-register just because it changed.
+  const reportCursorRef = useRef(reportCursor)
+  reportCursorRef.current = reportCursor
+
+  const handleContentChange = useCallback(() => {
+    syncFromBuffer()
+    reportCursor()
+  }, [syncFromBuffer, reportCursor])
+
+  const handleCursorChange = useCallback(() => {
+    syncFromBuffer()
+    reportCursor()
+  }, [syncFromBuffer, reportCursor])
+
+  useEffect(() => {
+    if (focused) reportCursor()
+  }, [focused, reportCursor])
+
+  useEffect(() => {
+    return doc.onDidChange((e) => {
+      // The focused pane owns the live edit; skipping its own 'edit' events keeps
+      // the native cursor from resetting mid-type. An UNfocused pane viewing the
+      // same Document (split view) must still apply edits so both panes stay in
+      // sync. Disk/save changes always apply regardless of focus.
+      if (e.source === "edit" && focusedRef.current) return
+      const ta = taRef.current
+      const nextText = doc.getText()
+      if (!ta || ta.plainText === nextText) return
+      // The change originates elsewhere (another split pane or disk/save), so
+      // preserve THIS pane's view: `replaceText` keeps the buffer's undo history
+      // (`setText` would wipe it — see EditBufferRenderable), and the cursor/scroll
+      // are captured and restored so an external edit never yanks us to home.
+      const cursor = ta.editorView.getCursor()
+      const viewport = ta.editorView.getViewport()
+      ta.replaceText(nextText)
+      // Content may have shifted; clamp the restored cursor to the new bounds.
+      const lines = nextText.split("\n")
+      const row = Math.min(cursor.row, Math.max(0, lines.length - 1))
+      const col = Math.min(cursor.col, lines[row]?.length ?? 0)
+      ta.setCursor(row, col)
+      ta.editorView.setViewport(viewport.offsetX, viewport.offsetY, viewport.width, viewport.height, false)
+      // An external edit can shift/clamp the restored cursor; report the (possibly
+      // new) position so the status bar reflects the clamp rather than going stale.
+      reportCursorRef.current()
+      scheduleHighlight()
+    })
+  }, [doc, scheduleHighlight])
+
+  // Reads the clipboard (pbpaste) and inserts at the cursor, replacing any
+  // active selection. Async so the pbpaste spawn never blocks the render loop.
+  const pasteFromClipboard = useCallback(async () => {
+    const text = await clipboard.read()
+    if (!text) return
+    const ta = taRef.current
+    if (!ta) return
+    if (ta.hasSelection()) ta.deleteSelection()
+    ta.insertText(text)
+    // The native mutation emits onContentChange, but sync explicitly too so the
+    // Document (and re-highlight) update deterministically, not just via the event.
+    syncFromBuffer()
+  }, [syncFromBuffer])
+
+  // TextareaAction is a closed union with no copy/cut/paste verbs, so these
+  // can't be expressed as textarea keyBindings — intercept the keys directly.
+  // Ctrl+C copies the selection (no-op without one), Ctrl+X copies then deletes
+  // it, Ctrl+V pastes from our clipboard service. Ctrl+C only acts as copy
+  // because main.tsx disables exitOnCtrlC; workbench.quit (Ctrl+Q) is the exit.
+  useKeyboard((key) => {
+    // An open overlay owns the keyboard; don't let clipboard keys leak into the
+    // still-mounted (nominally focused) editor underneath it.
+    if (isOverlayOpen) return
+    if (!focusedRef.current || !key.ctrl || key.shift) return
+    const ta = taRef.current
+    if (!ta) return
+    switch (key.name) {
+      case "c":
+        // Prefer the focused buffer's own selection; otherwise fall back to the
+        // last renderer-level selection (a drag over a diff/preview/panel that
+        // never lands in an edit buffer). Copy-on-select usually already wrote
+        // that text — this re-copy is harmless and idempotent.
+        if (ta.hasSelection()) {
+          void clipboard.write(ta.getSelectedText(), renderer)
+        } else {
+          const rendererSelection = getLastRendererSelection()
+          if (rendererSelection) void clipboard.write(rendererSelection, renderer)
+        }
+        break
+      case "x":
+        if (ta.hasSelection()) {
+          void clipboard.write(ta.getSelectedText(), renderer)
+          ta.deleteSelection()
+          syncFromBuffer()
+        }
+        break
+      case "v":
+        void pasteFromClipboard()
+        break
+    }
+  })
+
+  // Belt-and-suspenders cursor reporting for keys the native onCursorChange path
+  // misses (vertical/page/home-end navigation, and undo/redo which reposition the
+  // caret). queueMicrotask defers past the synchronous key dispatch so the
+  // textarea has already moved the caret before we read it. Report-only — this
+  // never resyncs the buffer — so the extra call on top of the native path is cheap.
+  useKeyboard((key) => {
+    if (isOverlayOpen) return
+    if (!focusedRef.current) return
+    const isNav = CURSOR_NAV_KEYS.has(key.name)
+    const isUndoRedo =
+      ((key.ctrl || key.super) && (key.name === "z" || key.name === "y")) ||
+      (key.ctrl && (key.name === "-" || key.name === "."))
+    if (!isNav && !isUndoRedo) return
+    queueMicrotask(() => reportCursorRef.current())
+  })
+
+  // Expose this pane's cursor to the workbench chrome (Quick Open go-to-line).
+  // Native focus/scroll follow is handled on render; overlay-close focus-restore
+  // returns keyboard focus to this textarea, so gotoLine only positions the cursor.
+  useEffect(() => {
+    return registerEditorControls(groupId, {
+      gotoLine: (line, column) => {
+        const ta = taRef.current
+        if (!ta) return
+        const targetRow = Math.min(Math.max(0, line - 1), Math.max(0, ta.lineCount - 1))
+        const lineText = ta.plainText.split("\n")[targetRow] ?? ""
+        const targetCol = column === undefined ? 0 : Math.min(Math.max(0, column - 1), lineText.length)
+        ta.setCursor(targetRow, targetCol)
+        // setCursor on the view pointer doesn't emit the buffer's cursor-changed
+        // event, so report explicitly to keep the status bar's Ln/Col in step.
+        reportCursorRef.current()
+      },
+    })
+  }, [groupId])
+
+  // Distinguishes single/double/triple clicks. A gesture continues only when the
+  // pointer lands on the same cell (row exact, col within ±1) within MULTI_CLICK_MS;
+  // otherwise it restarts at 1. 4+ clicks cycle back to 1.
+  const clickTracker = useRef({ row: -1, col: -1, count: 0, time: 0 })
+
+  // Mouse cursor positioning + word/line selection. The textarea's built-in
+  // onMouseEvent only handles scroll; single-click caret placement and multi-click
+  // selection are entirely app-level.
+  const handleMouseDown = useCallback(() => {
+    const ta = taRef.current
+    if (!ta) return
+    // The renderer's selection machinery services this same mousedown BEFORE this
+    // handler and has already moved the buffer cursor to the clicked cell via native
+    // (wrap-aware) hit-testing. Read that position instead of re-deriving
+    // screen→content coordinates, which would be wrong under wrapMode "word".
+    const { row, col } = ta.editBuffer.getCursorPosition()
+
+    const now = Date.now()
+    const prev = clickTracker.current
+    const sameSpot = row === prev.row && Math.abs(col - prev.col) <= 1
+    const count =
+      sameSpot && now - prev.time <= MULTI_CLICK_MS ? (prev.count % 3) + 1 : 1
+    clickTracker.current = { row, col, count, time: now }
+
+    const lines = ta.plainText.split("\n")
+    if (count === 2) {
+      const { start, end } = wordRangeAt(lines[row] ?? "", col)
+      if (end > start) {
+        ta.setSelection(
+          ta.editBuffer.positionToOffset(row, start),
+          ta.editBuffer.positionToOffset(row, end),
+        )
+      } else {
+        ta.clearSelection()
+        ta.setCursor(row, col)
+      }
+    } else if (count === 3) {
+      // Whole line INCLUDING its trailing newline; the last line (no newline) ends
+      // at end-of-line instead.
+      const startOffset = ta.editBuffer.positionToOffset(row, 0)
+      const endOffset =
+        row + 1 < ta.lineCount
+          ? ta.editBuffer.positionToOffset(row + 1, 0)
+          : ta.editBuffer.positionToOffset(row, (lines[row] ?? "").length)
+      if (endOffset > startOffset) ta.setSelection(startOffset, endOffset)
+      else ta.setCursor(row, col)
+    } else {
+      // Single click. The renderer's mousedown clears only the *local* (drag)
+      // selection, not the buffer selection, so a prior word/line selection would
+      // linger — clear it explicitly, then place the caret.
+      ta.clearSelection()
+      ta.setCursor(row, col)
+    }
+    reportCursorRef.current()
+  }, [])
+
+  return (
+    <box flexDirection="column" height={height}>
+      <textarea
+        id="editor-textarea"
+        ref={taRef}
+        focused={focused}
+        initialValue={doc.getText()}
+        keyBindings={EXTRA_KEY_BINDINGS}
+        onContentChange={handleContentChange}
+        onCursorChange={handleCursorChange}
+        onMouseDown={handleMouseDown}
+        flexGrow={1}
+        textColor={theme.foreground}
+        backgroundColor={theme.background}
+      />
+    </box>
+  )
+}

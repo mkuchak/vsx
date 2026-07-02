@@ -1,0 +1,17 @@
+// Bun Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`splitGroup renders two panes side by side 1`] = `
+" a.ts ─────────────────────────────────│  a.ts ✕ ──────────────────────────────│
+const answer = 42                      │ const answer = 42                      
+                                       │                                        
+                                       │                                        
+                                       │                                        
+                                       │                                        
+                                       │                                        
+                                       │                                        
+                                       │                                        
+                                       │                                        
+                                       │                                        
+                                       │                                        
+"
+`;

@@ -43,11 +43,15 @@ bun run typecheck  # tsc --noEmit
 | `Ctrl+Shift+E` | Show Explorer (file tree) |
 | `Ctrl+Shift+G` | Show Source Control |
 | `Ctrl+Shift+H` | Show History (commit log) |
+| `Ctrl+B` | Toggle the sidebar (collapse / expand) |
 | `Esc` (in sidebar) | Focus the editor |
 | `Ctrl+S` | Save the active file |
 | `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` | Undo / Redo |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy / Cut / Paste |
+| `Alt+Up` / `Alt+Down` | Move the current line (or the whole selected block) up / down — one undo step |
+| `Alt+Z` | Toggle word wrap for every editor pane (on by default) |
 | `Shift+Arrow`, `Ctrl+Arrow`, etc. | Selection and word-wise movement (built into OpenTUI's textarea) |
+| `Home` / `End` | Jump to the top / bottom of the document (OpenTUI textarea default; `Shift` extends the selection there) |
 | `Ctrl+W` | Close the active tab |
 | `Ctrl+PageUp` / `Ctrl+PageDown` | Previous / next tab (positional) |
 | `Ctrl+\` | Split the editor into another pane (bounded by a 20-cell minimum pane width) |
@@ -56,12 +60,12 @@ bun run typecheck  # tsc --noEmit
 
 Within the Source Control panel: `↑`/`↓` navigate, `Enter` opens the file, `Space`/`+` stages, `-` unstages, `x` discards (with a confirmation dialog), `o` opens a diff, `i`/`Tab` focuses the commit message box.
 
-Within a diff tab: `v` toggles split/unified view, `n`/`p` jump to the next/previous hunk.
+Within a diff tab: `v` toggles split/unified view, `n`/`p` jump to the next/previous change block.
 
 ## Mouse & selection
 
 - **Click** positions the cursor in the editor; **double-click** selects a word; **triple-click** selects a line.
-- **Copy-on-select**: any mouse selection — in the editor, diff view, commit log, or the too-large-file preview — is copied to the clipboard the moment the drag ends. `Ctrl+C` also copies the current selection explicitly as a fallback.
+- **Selection never auto-copies.** Make a selection with the mouse (or keyboard), then press **`Ctrl+C`** to copy it. This works in the editor *and* in the read-only surfaces — the diff view, commit log, Source Control panel, and the too-large-file preview — via a renderer-level selection fallback (`Ctrl+X`/`Ctrl+V` stay editor-only). A plain **`Shift+click`** extends the selection exactly; **`Shift+drag`** is terminal-dependent — in terminals that forward shift+mouse to the app, the renderer's char-wise drag gesture takes over and the anchor migrates (see [Known limitations](#known-limitations)), while tmux/terminal setups that intercept `Shift+drag` first hand the selection off natively, outside the app.
 - **Drag a divider** to resize the sidebar or a split pane; **double-click a divider** to reset it to its default size.
 - The sidebar's **activity tabs** (Explorer / SCM / Commits) are clickable with the mouse, mirroring the `Ctrl+Shift+E`/`G`/`H` keybindings.
 - **Click a pane** (or press `Ctrl+1`…`Ctrl+9`) to focus an editor group; the focused pane shows an accent border.
@@ -70,7 +74,12 @@ Within a diff tab: `v` toggles split/unified view, `n`/`p` jump to the next/prev
 
 - **Splits** grow as far as the editor area allows — a new pane is admitted only while every pane stays at or above a 20-cell minimum width, so there is no fixed group cap.
 - **`Ctrl+S` saves the focused file**, even in a split showing several different files.
+- **Sidebar toggle**: `Ctrl+B` collapses/expands the sidebar. You can also click the `◂ Hide Sidebar` footer row inside the sidebar to collapse it, and the always-visible `☰` cell at the left of the status bar to bring it back.
+- **Word wrap**: enabled by default (matching VSCode's default); `Alt+Z` toggles wrapping for every editor pane at once. A thin scrollbar tracks the buffer — vertical is always present; the horizontal one appears only while wrap is *off* (with wrap on there's nothing to scroll horizontally). Both bars are draggable.
+- **Move lines**: `Alt+Up`/`Alt+Down` shifts the caret's line — or the entire selected block of lines — up or down. The whole move is a single undo point, so one `Ctrl+Z` reverts it. (macOS needs Option forwarded as Alt — see [macOS keys](#macos-keys).)
+- **Full-file diff**: a diff tab shows the *entire* file with additions/deletions highlighted in place (VSCode-style), not just the changed hunks in isolation. `n`/`p` jump between change blocks; `v` toggles split/unified. Files longer than 5000 lines fall back to a standard 3-line-context view (jumping straight to each hunk) to stay responsive.
 - **Go to line** from Quick Open: type `:42` (or `:42:10`) to jump the cursor to that line/column and scroll it into view.
+- **Open a file by path** from Quick Open (`Ctrl+P`): start the query with `/` (absolute) or `~` (home) to browse the filesystem. The parent directory is listed live and filtered as you type; `Enter` on a directory (shown with a trailing `/`) descends into it, and `Enter` on a file opens it. Files outside the workspace open fine, but they aren't covered by the workspace watcher or Source Control (no live external-reload / SCM integration).
 - The status bar's **Ln/Col updates live** on every cursor move — arrows, page, home/end, undo/redo, and go-to-line — and is hidden (not left stale) while a diff tab is active.
 - **Overlays are mutually exclusive**: while any overlay (Quick Open, command palette, confirm dialog) is open, command keybindings are gated, so closing a dialog can't double-fire a command.
 
@@ -80,6 +89,41 @@ Most of the above works in any terminal via legacy xterm escape sequences — Sh
 
 On a non-Kitty terminal (notably **macOS Terminal.app**), those specific chords won't register — use `F1` (always works) for the command palette, and the equivalent commands are still reachable through the palette itself.
 
+## macOS keys
+
+macOS folds a lot of editing onto `Cmd` and `Option`, and terminals sit between those keys and the app. Here's what works out of the box and what needs a one-line config.
+
+**`Cmd`-based editor shortcuts.** The editor's textarea already binds the familiar mac chords through the `super` modifier (these come from OpenTUI's textarea defaults, not custom code):
+
+| Chord | Action |
+|---|---|
+| `Cmd+Up` / `Cmd+Down` | Document top / bottom |
+| `Cmd+Shift+Up` / `Cmd+Shift+Down` | Select to document top / bottom |
+| `Cmd+Left` / `Cmd+Right` | Line start / end (visual) |
+| `Cmd+A` | Select all |
+| `Cmd+Z` / `Cmd+Shift+Z` | Undo / Redo |
+
+These only fire **if the terminal forwards `Cmd`** under the Kitty keyboard protocol — and every mainstream macOS terminal consumes `Cmd` itself by default. To pass it through:
+
+- **kitty** — unmap the combo so it's forwarded as `super`, e.g. `map cmd+up` (an empty action) in `kitty.conf`.
+- **Ghostty** — supports `super`, but its defaults consume `cmd+c`/`cmd+v` (copy/paste). Forward specific encodings with `keybind = unconsumed:cmd+up=...`-style bindings.
+- **iTerm2** — speaks the Kitty protocol, but `Cmd` combos need a per-key **Send Escape Sequence** mapping in the profile (Profiles → Keys).
+- **WezTerm** — a known issue means `Cmd` combos aren't passed through even with `enable_kitty_keyboard = true` ([wezterm#4589](https://github.com/wez/wezterm/issues/4589)); use `SendKey` remaps as a workaround.
+- **Alacritty** — no Kitty-keyboard support at all; only manual per-combo byte bindings in `alacritty.toml`.
+- **Terminal.app** — no Kitty protocol (see [Terminal support](#terminal-support) above); `Cmd` combos won't forward. Fall back to `Home`/`End` (document top/bottom) and `Ctrl+A`-style navigation.
+
+**Paste and copy.** `Cmd+V` works everywhere already — the terminal turns it into a bracketed paste and the editor's built-in paste handling inserts it (no keybinding involved). `Cmd+C` is generally swallowed by the terminal; use **`Ctrl+C`** as the reliable copy chord (it copies the current selection in the editor and in the read-only panes).
+
+**`Option` as Alt.** The `Alt+Z` (word wrap) and `Alt+Up`/`Alt+Down` (move line) bindings need Option delivered as Alt:
+
+- **Ghostty** — `macos-option-as-alt = true`
+- **kitty** — `macos_option_as_alt yes`
+- **iTerm2** — Profiles → Keys → **Left Option key: Esc+**
+- **Alacritty** — `option_as_alt = "OnlyLeft"` (or `"Both"`)
+- **WezTerm** — the left Option key is Alt by default
+
+**tmux.** Kitty-protocol keys (the `Ctrl+Shift` chords and forwarded `Cmd`/`Option` combos) need tmux's `extended-keys` support enabled. Clipboard writes go through `pbcopy` locally, so copying works regardless of your OSC 52 setup.
+
 ## Known limitations
 
 - **No multi-cursor, LSP, or IME/CJK input composition.**
@@ -87,6 +131,7 @@ On a non-Kitty terminal (notably **macOS Terminal.app**), those specific chords 
 - **Syntax-highlight grammars are bundled offline only for TypeScript/JavaScript (incl. TSX/JSX) and Markdown.** Other file types are still detected but render without highlighting unless their grammar is available.
 - **Editable-buffer syntax highlighting** re-parses the whole buffer on a 160ms debounce (`TreeSitterClient.highlightOnce`), not an incremental re-parse — fine at normal file sizes, may lag on very large files.
 - **Commit log is linear** (no graph/rail rendering) — a deliberate MVP scope cut; VSCode-style branch graphs are a well-known, multi-week yak-shave (see gitui/lazygit's own histories).
+- **The diff view highlights whole changed lines, not word-level intra-line differences, and doesn't render shaded filler rows** on the shorter side of a split-view change. OpenTUI's `<diff>` component exposes no hook for either; a word-level/filler renderer would need a custom split view (deliberately deferred).
 - **A diff tab opened *before* its file is open in an editor won't reflect that editor's later unsaved edits** — the live-Document subscription only attaches if the Document already exists when the diff opens. Edits to an already-open file, and external `git` changes, are reflected via the shared watcher.
 - **The SCM commit message box doesn't regain focus after an overlay closes** — overlay-close focus restore targets the editor, so click/`i`/`Tab` back into the box.
 - **A very fast mouse flick can miss the 1-cell divider** on the arming mousedown, so the resize gesture won't start — land on the sash a little more deliberately.

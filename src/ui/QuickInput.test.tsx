@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -7,10 +7,53 @@ import { testRender } from "@opentui/react/test-utils"
 import { CommandsProvider } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
 import { workbenchStore } from "../model/workbench"
-import { QuickInput } from "./QuickInput"
+import * as workspace from "../services/workspace"
+import type { DirEntry } from "../services/workspace"
+import { QuickInput, splitPathQuery } from "./QuickInput"
+
+const HOME = "/home/tester"
+
+describe("splitPathQuery", () => {
+  test("splits an absolute path at the last slash", () => {
+    expect(splitPathQuery("/foo/ba", HOME)).toEqual({ dir: "/foo", fragment: "ba" })
+    expect(splitPathQuery("/foo/bar/baz", HOME)).toEqual({ dir: "/foo/bar", fragment: "baz" })
+  })
+
+  test("a trailing slash lists the directory itself with an empty fragment", () => {
+    expect(splitPathQuery("/foo/bar/", HOME)).toEqual({ dir: "/foo/bar", fragment: "" })
+  })
+
+  test("multiple trailing slashes split at the last one (dir keeps the inner slash)", () => {
+    expect(splitPathQuery("/foo//", HOME)).toEqual({ dir: "/foo/", fragment: "" })
+  })
+
+  test("a fragment may contain spaces", () => {
+    expect(splitPathQuery("/foo/ba r", HOME)).toEqual({ dir: "/foo", fragment: "ba r" })
+  })
+
+  test("a slash at the root keeps `/` as the directory", () => {
+    expect(splitPathQuery("/foo", HOME)).toEqual({ dir: "/", fragment: "foo" })
+    expect(splitPathQuery("/", HOME)).toEqual({ dir: "/", fragment: "" })
+  })
+
+  test("bare `~` expands to the home directory's parent + basename fragment", () => {
+    expect(splitPathQuery("~", HOME)).toEqual({ dir: "/home", fragment: "tester" })
+  })
+
+  test("`~/` lists the home directory itself", () => {
+    expect(splitPathQuery("~/", HOME)).toEqual({ dir: HOME, fragment: "" })
+  })
+
+  test("`~/frag` expands home and splits the fragment", () => {
+    expect(splitPathQuery("~/src", HOME)).toEqual({ dir: HOME, fragment: "src" })
+    expect(splitPathQuery("~/src/in", HOME)).toEqual({ dir: `${HOME}/src`, fragment: "in" })
+  })
+})
 
 let testSetup: Awaited<ReturnType<typeof testRender>>
 let dir: string
+// Fixture directory created OUTSIDE the workspace root for path-browse tests.
+let browseDir: string | undefined
 
 beforeEach(async () => {
   workbenchStore.reset()
@@ -26,16 +69,24 @@ afterEach(async () => {
   if (testSetup) testSetup.renderer.destroy()
   workbenchStore.reset()
   await rm(dir, { recursive: true, force: true })
+  if (browseDir) {
+    await rm(browseDir, { recursive: true, force: true })
+    browseDir = undefined
+  }
 })
 
 let gotoCalls: Array<[number, number | undefined]>
 
-function render() {
+function render(homeDir?: string) {
   gotoCalls = []
   return testRender(
     <OverlayProvider>
       <CommandsProvider>
-        <QuickInput workspaceRoot={dir} onGotoLine={(line, column) => gotoCalls.push([line, column])} />
+        <QuickInput
+          workspaceRoot={dir}
+          homeDir={homeDir}
+          onGotoLine={(line, column) => gotoCalls.push([line, column])}
+        />
       </CommandsProvider>
     </OverlayProvider>,
     // kittyKeyboard lets the mock emit disambiguated Ctrl+Shift+letter and F1
@@ -292,4 +343,165 @@ test("reopening with an empty query shows the recently-opened list", async () =>
   const frame = testSetup.captureCharFrame()
   expect(frame).toContain("Go to file")
   expect(frame).toContain("index.ts")
+})
+
+// Builds a fixture tree OUTSIDE the workspace root: two dirs + two files, plus a
+// file nested inside one dir to verify descent.
+async function makeBrowseFixture(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "vsx-browse-"))
+  await mkdir(join(root, "Alpha"))
+  await mkdir(join(root, "zeta"))
+  await writeFile(join(root, "Apple.txt"), "x")
+  await writeFile(join(root, "banana.txt"), "x")
+  await writeFile(join(root, "Alpha", "nested.txt"), "x")
+  return root
+}
+
+test("an absolute path with a trailing slash lists entries dirs-first", async () => {
+  browseDir = await makeBrowseFixture()
+  testSetup = await render()
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText(`${browseDir}/`)
+  await settle()
+
+  const frame = testSetup.captureCharFrame()
+  // Directories are suffixed with `/` and sorted ahead of files.
+  expect(frame).toContain("Alpha/")
+  expect(frame).toContain("zeta/")
+  expect(frame).toContain("Apple.txt")
+  expect(frame).toContain("banana.txt")
+  expect(frame.indexOf("Alpha/")).toBeLessThan(frame.indexOf("zeta/"))
+  expect(frame.indexOf("zeta/")).toBeLessThan(frame.indexOf("Apple.txt"))
+})
+
+test("a trailing fragment filters the directory listing", async () => {
+  browseDir = await makeBrowseFixture()
+  testSetup = await render()
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText(`${browseDir}/ban`)
+  await settle()
+
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("banana.txt")
+  expect(frame).not.toContain("Apple.txt")
+  expect(frame).not.toContain("zeta/")
+})
+
+test("Enter on a directory descends into it and keeps the overlay open", async () => {
+  browseDir = await makeBrowseFixture()
+  testSetup = await render()
+  await settle()
+  await open()
+
+  // First result is the "Alpha" directory (dirs-first).
+  await testSetup.mockInput.typeText(`${browseDir}/`)
+  await settle()
+  testSetup.mockInput.pressEnter()
+  await settle()
+
+  const frame = testSetup.captureCharFrame()
+  // The overlay stayed open and now lists Alpha's contents (proving descent).
+  expect(frame).toContain("nested.txt")
+  // Nothing was opened.
+  expect(activePath()).toBeNull()
+})
+
+test("Enter on a file opens its absolute path outside the workspace root", async () => {
+  browseDir = await makeBrowseFixture()
+  testSetup = await render()
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText(`${browseDir}/banana.txt`)
+  await settle()
+  testSetup.mockInput.pressEnter()
+  await settle()
+
+  expect(activePath()).toBe(join(browseDir, "banana.txt"))
+  expect(activeTab()?.preview).toBe(true)
+  expect(testSetup.captureCharFrame()).not.toContain("Go to file")
+})
+
+test("a non-existent path shows empty results without crashing", async () => {
+  testSetup = await render()
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText("/no/such/vsx-path/xyz")
+  await settle()
+
+  const frame = testSetup.captureCharFrame()
+  // The overlay is still alive (renders the typed query, no crash) with no
+  // results, and nothing was opened.
+  expect(frame).toContain("/no/such/vsx-path/xyz")
+  expect(activePath()).toBeNull()
+})
+
+test("`~/` maps to the injected home directory", async () => {
+  // Hermetic: point `~` at a fixture instead of the CI machine's real $HOME.
+  browseDir = await makeBrowseFixture()
+  testSetup = await render(browseDir)
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText("~/")
+  await settle()
+
+  // `~` expanded to the fixture home, so its entries are listed.
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("Alpha/")
+  expect(frame).toContain("banana.txt")
+})
+
+// Regression for a cancelled-load cache-poisoning bug: React cancels the
+// in-flight `listDir` on every keystroke (the effect's cleanup flips a
+// `cancelled` flag), so when a fragment keystroke lands in the SAME directory as
+// a slow load already in flight, the dedupe must still re-fire the load rather
+// than treat the directory as already resolved. With the old optimistic
+// `requestedDirRef` dedupe the replacement load never fired and the listing
+// stayed empty forever; deduping on the COMMITTED listing fixes it.
+test("a fragment keystroke that cancels an in-flight directory load still lists entries", async () => {
+  browseDir = await makeBrowseFixture()
+  testSetup = await render()
+  await settle()
+  await open()
+
+  const realListDir = workspace.listDir
+  // Hold every listDir call open until we manually resolve it, so the first load
+  // is guaranteed still in flight when the fragment keystroke cancels it.
+  const deferred: Array<() => void> = []
+  const spy = spyOn(workspace, "listDir").mockImplementation(
+    (path: string) =>
+      new Promise<DirEntry[]>((resolve) => {
+        deferred.push(() => {
+          void realListDir(path).then(resolve)
+        })
+      }),
+  )
+  try {
+    // One commit takes the query straight to the trailing-slash form, firing a
+    // (deferred, unresolved) load for browseDir.
+    await testSetup.mockInput.typeText(`${browseDir}/`)
+    await settle()
+
+    // A separate commit appends a fragment char in the SAME directory. This
+    // cancels the in-flight load; the fix must fire a replacement.
+    testSetup.mockInput.pressKey("b")
+    await settle()
+
+    // Resolve every load. Only the live (non-cancelled) one commits.
+    for (const resolve of deferred) resolve()
+
+    const deadline = Date.now() + 3000
+    while (!testSetup.captureCharFrame().includes("banana.txt") && Date.now() < deadline) {
+      await settle()
+    }
+    expect(testSetup.captureCharFrame()).toContain("banana.txt")
+  } finally {
+    spy.mockRestore()
+  }
 })

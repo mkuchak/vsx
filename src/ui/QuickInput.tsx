@@ -1,13 +1,14 @@
 import type { KeyEvent, Renderable, ScrollBoxRenderable } from "@opentui/core"
 import type { Binding, Command, KeyLike } from "@opentui/keymap"
 import { useKeyboard } from "@opentui/react"
+import { homedir } from "node:os"
 import { join, relative } from "node:path"
 import type { ReactNode } from "react"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { workbenchStore } from "../model/workbench"
 import type { CommandInfo } from "../services/commands"
 import { scoreAndSort, type MatchRange } from "../services/fuzzy"
-import { enumerateFiles } from "../services/workspace"
+import { enumerateFiles, listDir, type DirEntry } from "../services/workspace"
 import { theme } from "../theme"
 import { useCommands } from "../workbench/CommandsProvider"
 import { useOverlay } from "../workbench/OverlayProvider"
@@ -22,6 +23,26 @@ function basename(path: string): string {
 
 function capitalize(part: string): string {
   return part.length === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1)
+}
+
+/**
+ * Split a filesystem path query into the parent directory to list and the
+ * trailing fragment to match against its entries. A leading `~` (or `~/`) is
+ * expanded to the home directory first — nothing else in the app expands `~`.
+ *
+ * Splits at the LAST `/`: `"/foo/bar/"` → list `/foo/bar` (fragment ""),
+ * `"/foo/ba"` → list `/foo` (fragment "ba"). A slash at index 0 keeps the root
+ * as the directory (`"/foo"` → dir "/", fragment "foo").
+ */
+export function splitPathQuery(query: string, home: string): { dir: string; fragment: string } {
+  let expanded: string
+  if (query === "~") expanded = home
+  else if (query.startsWith("~/")) expanded = home + query.slice(1)
+  else expanded = query
+  const lastSlash = expanded.lastIndexOf("/")
+  const dir = lastSlash <= 0 ? "/" : expanded.slice(0, lastSlash)
+  const fragment = expanded.slice(lastSlash + 1)
+  return { dir, fragment }
 }
 
 // Render a keybinding for display. `KeyLike` is either a chord string like
@@ -71,9 +92,13 @@ function highlight(text: string, ranges: MatchRange[]): ReactNode {
 export function QuickInput({
   workspaceRoot,
   onGotoLine,
+  homeDir,
 }: {
   workspaceRoot: string
   onGotoLine?: (line: number, column?: number) => void
+  // Overridable home for `~` expansion; defaults to the OS home. Injectable so
+  // path-browse tests stay hermetic instead of reading the CI machine's $HOME.
+  homeDir?: string
 }) {
   const commands = useCommands()
   const { setOverlayOpen } = useOverlay()
@@ -82,6 +107,20 @@ export function QuickInput({
   const [query, setQuery] = useState("")
   const [files, setFiles] = useState<string[]>([])
   const [selectedIndex, setSelectedIndex] = useState(0)
+
+  const home = useMemo(() => homeDir ?? homedir(), [homeDir])
+
+  // Live filesystem listing for absolute/`~` path queries. Cached by the parent
+  // directory so keystrokes that only change the trailing fragment re-filter the
+  // held entries in-memory instead of re-hitting the disk. `dir` guards the memo
+  // so a stale directory's entries are never shown while a new load is in flight,
+  // AND dedupes the load effect: it only re-lists once a directory differs from
+  // the last COMMITTED listing, so a load cancelled mid-flight (by a fragment
+  // keystroke) still re-fires rather than leaving the listing permanently empty.
+  const [dirListing, setDirListing] = useState<{ dir: string; entries: DirEntry[] }>({
+    dir: "",
+    entries: [],
+  })
 
   // Self-contained "recently opened" MRU standing in for a real global one,
   // which does not exist yet. A future workbench-level MRU can replace this.
@@ -154,6 +193,27 @@ export function QuickInput({
       cancelled = true
     }
   }, [visible, workspaceRoot])
+
+  // Load the parent directory of a path query whenever that directory changes.
+  // `listDir` has no internal error handling, so wrap it: a half-typed or
+  // unreadable path (ENOENT/EACCES) resolves to an empty listing, never a crash.
+  useEffect(() => {
+    if (!visible) return
+    if (!(query.startsWith("/") || query.startsWith("~"))) return
+    const { dir } = splitPathQuery(query, home)
+    if (dir === dirListing.dir) return
+    let cancelled = false
+    void listDir(dir)
+      .then((entries) => {
+        if (!cancelled) setDirListing({ dir, entries })
+      })
+      .catch(() => {
+        if (!cancelled) setDirListing({ dir, entries: [] })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [visible, query, home, dirListing.dir])
 
   // Modal keymap layer, live for the whole time the overlay is open. It (a)
   // shadows base bindings such as ctrl+q quit so they can't fire mid-query, and
@@ -255,6 +315,36 @@ export function QuickInput({
       ]
     }
 
+    // Path browse mode: an absolute (`/…`) or home (`~…`) query lists the parent
+    // directory live and matches the trailing fragment against its entries.
+    if (query.startsWith("/") || query.startsWith("~")) {
+      const { dir, fragment } = splitPathQuery(query, home)
+      // Ignore entries still belonging to a previous directory (load in flight).
+      const entries = dirListing.dir === dir ? dirListing.entries : []
+      const rows =
+        fragment === ""
+          ? entries.map((entry) => ({ entry, labelMatches: [] as MatchRange[] }))
+          : scoreAndSort(fragment, entries, (e) => ({ label: e.name })).map((r) => ({
+              entry: r.item,
+              labelMatches: r.labelMatches,
+            }))
+      return rows.slice(0, MAX_RESULTS).map(({ entry, labelMatches }) => ({
+        // Append `/` to directories so they read as descendable, VSCode-style.
+        label: entry.isDir ? `${entry.name}/` : entry.name,
+        description: entry.path,
+        labelMatches,
+        descriptionMatches: [],
+        // `entry.path` is already absolute — open it directly, never joined to
+        // the workspace root. A directory descends by rewriting the query.
+        onAccept: entry.isDir
+          ? () => {
+              setQuery(`${entry.path}/`)
+              setSelectedIndex(0)
+            }
+          : () => accept(entry.path),
+      }))
+    }
+
     if (query === "") {
       return mruRef.current.map((absPath) => ({
         label: basename(absPath),
@@ -276,7 +366,7 @@ export function QuickInput({
         onAccept: () => accept(join(workspaceRoot, r.item)),
       }))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, query, files, commands, onGotoLine, workspaceRoot])
+  }, [visible, query, files, commands, onGotoLine, workspaceRoot, home, dirListing])
 
   useEffect(() => {
     setSelectedIndex((i) => {

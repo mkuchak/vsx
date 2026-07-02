@@ -72,6 +72,61 @@ test("shows a transient message when provided", async () => {
   expect(testSetup.captureCharFrame()).toContain("Saved")
 })
 
+test("renders a clickable ☰ affordance that fires onToggleSidebar", async () => {
+  let toggled = 0
+  testSetup = await testRender(
+    <StatusBar workspaceRoot={root} cursor={null} onToggleSidebar={() => toggled++} />,
+    { width: 80, height: 3 },
+  )
+  await testSetup.renderOnce()
+  expect(testSetup.captureCharFrame()).toContain("☰")
+
+  let cell: { x: number; y: number } | null = null
+  const walk = (node: { id?: string; x?: number; y?: number; getChildren: () => unknown[] }) => {
+    if (node.id === "statusbar-sidebar-toggle") cell = node as { x: number; y: number }
+    for (const child of node.getChildren()) walk(child as typeof node)
+  }
+  walk(testSetup.renderer.root as unknown as { getChildren: () => unknown[] })
+  expect(cell).not.toBeNull()
+
+  await testSetup.mockMouse.click(cell!.x, cell!.y)
+  expect(toggled).toBe(1)
+})
+
+test("does not fire onToggleSidebar when the ☰ cell is clicked while an overlay is open", async () => {
+  let toggled = 0
+  testSetup = await testRender(
+    <StatusBar
+      workspaceRoot={root}
+      cursor={null}
+      onToggleSidebar={() => toggled++}
+      overlayOpen
+    />,
+    { width: 80, height: 3 },
+  )
+  await testSetup.renderOnce()
+
+  let cell: { x: number; y: number } | null = null
+  const walk = (node: { id?: string; x?: number; y?: number; getChildren: () => unknown[] }) => {
+    if (node.id === "statusbar-sidebar-toggle") cell = node as { x: number; y: number }
+    for (const child of node.getChildren()) walk(child as typeof node)
+  }
+  walk(testSetup.renderer.root as unknown as { getChildren: () => unknown[] })
+  expect(cell).not.toBeNull()
+
+  await testSetup.mockMouse.click(cell!.x, cell!.y)
+  expect(toggled).toBe(0)
+})
+
+test("omits the ☰ affordance when no onToggleSidebar handler is provided", async () => {
+  testSetup = await testRender(<StatusBar workspaceRoot={root} cursor={null} />, {
+    width: 80,
+    height: 3,
+  })
+  await testSetup.renderOnce()
+  expect(testSetup.captureCharFrame()).not.toContain("☰")
+})
+
 test("shows 'no repository' when the workspace has no git repo", async () => {
   const bare = await mkdtemp(join(tmpdir(), "vsx-statusbar-norepo-"))
   try {

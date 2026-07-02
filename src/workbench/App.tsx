@@ -2,7 +2,8 @@ import { CliRenderEvents, type Selection } from "@opentui/core"
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useCallback, useEffect, useRef, useState } from "react"
 import { workbenchStore } from "../model/workbench"
-import { handleRendererSelection } from "./rendererSelection"
+import * as clipboard from "../services/clipboard"
+import { getLastRendererSelection, handleRendererSelection } from "./rendererSelection"
 import { activeRepoFor, discoverRepositories, type RepoInfo } from "../services/repos"
 import { theme } from "../theme"
 import { CommandsProvider, useCommands } from "./CommandsProvider"
@@ -19,6 +20,7 @@ import type { CursorPosition } from "../ui/EditorPane"
 import { FileTree } from "../ui/FileTree"
 import { QuickInput } from "../ui/QuickInput"
 import { ScmPanel } from "../ui/ScmPanel"
+import { SidebarFooter } from "../ui/SidebarFooter"
 import { SidebarTabs, type SidebarView } from "../ui/SidebarTabs"
 import { applyArmedDrag, disarmDrag, endArmedDrag } from "../ui/dragManager"
 import { SplitDivider } from "../ui/SplitDivider"
@@ -43,6 +45,22 @@ export function App({ workspaceRoot = process.cwd() }: { workspaceRoot?: string 
   )
 }
 
+/** The renderable id EditorPane gives its editable textarea (see EditorPane.tsx). */
+const EDITOR_TEXTAREA_ID = "editor-textarea"
+
+/**
+ * True when a focused editor textarea is the renderable that will handle Ctrl+C,
+ * so the global fallback must stand down to avoid a double-copy. We ask the
+ * renderer for the natively-focused renderable rather than inferring it from the
+ * store: an editable file mounts the textarea, but a too-large file renders a
+ * read-only preview scrollbox under the SAME "file" tab — that preview has no
+ * Ctrl+C of its own, so the global handler MUST copy for it. Keying off the
+ * focused renderable's id draws the line exactly where the textarea handler runs.
+ */
+function editorTextareaOwnsClipboard(renderer: { currentFocusedRenderable: { id?: string } | null }): boolean {
+  return renderer.currentFocusedRenderable?.id === EDITOR_TEXTAREA_ID
+}
+
 function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
   const renderer = useRenderer()
   const commands = useCommands()
@@ -65,6 +83,11 @@ function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
   const [cursor, setCursor] = useState<CursorPosition | null>(null)
   const [repos, setRepos] = useState<RepoInfo[]>([])
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  // Mirror of sidebarCollapsed for the stable toggle callback so it can read the
+  // live value without re-registering the Ctrl+B command on every collapse.
+  const collapsedRef = useRef(sidebarCollapsed)
+  collapsedRef.current = sidebarCollapsed
 
   // Width captured at the start of a drag; deltas are measured against it so the
   // continuously-updated live width doesn't compound with each drag event.
@@ -87,9 +110,32 @@ function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
   // Shared verbatim by the Ctrl+Shift+E/G/H commands and the SidebarTabs click
   // path so both input methods drive identical state (setters are stable, so the
   // callback identity is too — keeps the command-registration effect from re-running).
+  // Also un-collapses: revealing a hidden view re-shows the sidebar, matching how
+  // VSCode's Ctrl+Shift+E reveals a hidden Explorer.
   const focusView = useCallback((view: SidebarView) => {
     setSidebarView(view)
+    setSidebarCollapsed(false)
     workbenchStore.setFocusArea("sidebar")
+  }, [])
+
+  // Collapse the sidebar and, if it currently owns keyboard focus, hand focus
+  // back to the editor — its subtree is about to unmount, so keys must not keep
+  // landing on the tree (mirrors the Esc sidebar→editor handler).
+  const collapseSidebar = useCallback(() => {
+    setSidebarCollapsed(true)
+    if (workbenchStore.getState().focusArea === "sidebar") {
+      workbenchStore.setFocusArea("editor")
+    }
+  }, [])
+
+  // Toggle for Ctrl+B and the status-bar ☰ cell: hide when shown, reveal when
+  // hidden. Collapsing performs the same focus handoff as collapseSidebar.
+  const toggleSidebar = useCallback(() => {
+    const next = !collapsedRef.current
+    setSidebarCollapsed(next)
+    if (next && workbenchStore.getState().focusArea === "sidebar") {
+      workbenchStore.setFocusArea("editor")
+    }
   }, [])
 
   const overlayOpenRef = useRef(isOverlayOpen)
@@ -122,6 +168,21 @@ function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
       renderer.off(CliRenderEvents.SELECTION, onSelection)
     }
   }, [renderer])
+
+  // Global Ctrl+C copy for the buffer-less surfaces: diff/commitDiff panes, the
+  // sidebar panels, and the too-large-file preview. With copy-on-select off, this
+  // is their ONLY copy path. EditorPane's own Ctrl+C already copies the focused
+  // textarea (falling back to the same cache), so this fires ONLY when that
+  // textarea is NOT the focused renderable — see editorTextareaOwnsClipboard.
+  // Skips Shift+Ctrl+C and never fires under an overlay (both matching the editor
+  // handler's guards) so the two paths can't double-copy.
+  useKeyboard((key) => {
+    if (overlayOpenRef.current) return
+    if (!key.ctrl || key.shift || key.name !== "c") return
+    if (editorTextareaOwnsClipboard(renderer)) return
+    const text = getLastRendererSelection()
+    if (text) void clipboard.write(text, renderer)
+  })
 
   // Resolved once for the workspace; used to attach a repoRoot to ScmPanel's
   // (path, kind)-only onOpenDiff callback via the deepest containing repo.
@@ -164,11 +225,18 @@ function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
         keybinding: "ctrl+shift+h",
         run: () => focusView("history"),
       }),
+      commands.registerCommand({
+        id: "workbench.toggleSidebar",
+        title: "Toggle Sidebar Visibility",
+        category: "View",
+        keybinding: "ctrl+b",
+        run: toggleSidebar,
+      }),
     ]
     return () => {
       for (const dispose of disposers) dispose()
     }
-  }, [commands, focusView])
+  }, [commands, focusView, toggleSidebar])
 
   // Esc moves focus from the sidebar into the editor's active tab (opening a
   // file/diff does the same); the editor→sidebar direction is driven by the
@@ -225,47 +293,57 @@ function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
           onMouseDragEnd={() => endArmedDrag("sidebar")}
           onMouseUp={() => disarmDrag()}
         >
-          <box
-            id="sidebar"
-            width={sidebarWidth}
-            flexShrink={0}
-            height="100%"
-            flexDirection="column"
-            backgroundColor={theme.sidebarBackground}
-          >
-            <SidebarTabs active={sidebarView} onSelect={focusView} />
-            <box flexGrow={1} flexShrink={1} width="100%">
-              {sidebarView === "explorer" ? (
-                <FileTree root={workspaceRoot} focused={sidebarFocused} onOpenFile={openFile} />
-              ) : sidebarView === "scm" ? (
-                <ScmPanel
-                  workspaceRoot={workspaceRoot}
-                  focused={sidebarFocused}
-                  onOpenFile={(path) => openFile(path, { preview: true })}
-                  onOpenDiff={openDiff}
-                />
-              ) : (
-                <CommitLog workspaceRoot={workspaceRoot} focused={sidebarFocused} />
-              )}
-            </box>
-          </box>
-          <SplitDivider
-            kind="sidebar"
-            onDelta={handleSidebarDelta}
-            onCommit={handleSidebarCommit}
-            onReset={handleSidebarReset}
-          />
+          {/* Collapsed: unmount the sidebar AND its sash entirely (not width 0,
+              which would leave a phantom draggable sash and keep panels mounted).
+              The status bar's ☰ cell re-expands it. */}
+          {!sidebarCollapsed && (
+            <>
+              <box
+                id="sidebar"
+                width={sidebarWidth}
+                flexShrink={0}
+                height="100%"
+                flexDirection="column"
+                backgroundColor={theme.sidebarBackground}
+              >
+                <SidebarTabs active={sidebarView} onSelect={focusView} />
+                <box flexGrow={1} flexShrink={1} width="100%">
+                  {sidebarView === "explorer" ? (
+                    <FileTree root={workspaceRoot} focused={sidebarFocused} onOpenFile={openFile} />
+                  ) : sidebarView === "scm" ? (
+                    <ScmPanel
+                      workspaceRoot={workspaceRoot}
+                      focused={sidebarFocused}
+                      onOpenFile={(path) => openFile(path, { preview: true })}
+                      onOpenDiff={openDiff}
+                    />
+                  ) : (
+                    <CommitLog workspaceRoot={workspaceRoot} focused={sidebarFocused} />
+                  )}
+                </box>
+                <SidebarFooter onCollapse={collapseSidebar} overlayOpen={isOverlayOpen} />
+              </box>
+              <SplitDivider
+                kind="sidebar"
+                onDelta={handleSidebarDelta}
+                onCommit={handleSidebarCommit}
+                onReset={handleSidebarReset}
+              />
+            </>
+          )}
           <box flexDirection="column" flexGrow={1} height="100%">
             <EditorGroups
               editorFocused={editorFocused}
               onCursorChange={editorFocused ? setCursor : undefined}
-              containerWidth={Math.max(1, termWidth - sidebarWidth - 1)}
+              containerWidth={sidebarCollapsed ? termWidth : Math.max(1, termWidth - sidebarWidth - 1)}
             />
           </box>
         </box>
         <StatusBar
           workspaceRoot={workspaceRoot}
           cursor={editorFocused && activeTabIsFile ? cursor : null}
+          onToggleSidebar={toggleSidebar}
+          overlayOpen={isOverlayOpen}
         />
         <QuickInput workspaceRoot={workspaceRoot} onGotoLine={gotoLine} />
       </ModalProvider>

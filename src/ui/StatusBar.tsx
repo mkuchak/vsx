@@ -12,6 +12,10 @@ export type StatusBarProps = {
   cursor: CursorPosition | null
   /** Transient message slot (e.g. "Saved", surfaced git errors). Auto-clears after ~2s. */
   message?: string | null
+  /** Toggles sidebar visibility; renders an always-visible ☰ cell when provided. */
+  onToggleSidebar?: () => void
+  /** When an overlay owns the screen, the ☰ click is inert (mirrors Ctrl+B's dispatch gate). */
+  overlayOpen?: boolean
 }
 
 /**
@@ -21,7 +25,13 @@ export type StatusBarProps = {
  * cursor position + active document's language + a transient message on the
  * right. Git state refreshes on the same debounced watcher other panels use.
  */
-export function StatusBar({ workspaceRoot, cursor, message }: StatusBarProps) {
+export function StatusBar({
+  workspaceRoot,
+  cursor,
+  message,
+  onToggleSidebar,
+  overlayOpen,
+}: StatusBarProps) {
   const state = useWorkbenchStore()
   const group = state.groups.find((g) => g.id === state.activeGroupId)
   const activeTab = group?.tabs.find((t) => t.path === group.activeTabPath)
@@ -96,6 +106,13 @@ export function StatusBar({ workspaceRoot, cursor, message }: StatusBarProps) {
       ? "no repository"
       : ""
 
+  const handleToggle = () => {
+    // A click landing under an open overlay must not restructure the workbench —
+    // mirrors Ctrl+B, which the command dispatch gate blocks while one is open.
+    if (overlayOpen) return
+    onToggleSidebar?.()
+  }
+
   return (
     <box
       height={1}
@@ -105,6 +122,16 @@ export function StatusBar({ workspaceRoot, cursor, message }: StatusBarProps) {
       paddingLeft={1}
       paddingRight={1}
     >
+      {onToggleSidebar ? (
+        <box id="statusbar-sidebar-toggle" paddingRight={1} onMouseDown={handleToggle}>
+          {/* Non-selectable: a bare click would otherwise start a renderer text
+              selection whose empty mouse-up wipes the Ctrl+C copy cache
+              (rendererSelection.ts) — the same cache global Ctrl+C copies from. */}
+          <text fg={theme.statusBarForeground} selectable={false}>
+            ☰
+          </text>
+        </box>
+      ) : null}
       <text fg={theme.statusBarForeground}>
         {branchLabel ? ` ${branchLabel}` : ""}
         {dirtyCount > 0 ? ` (${dirtyCount})` : ""}

@@ -7,6 +7,7 @@ import { documentRegistry } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
 import { App } from "./App"
+import { getLastRendererSelection, handleRendererSelection } from "./rendererSelection"
 
 let root: string
 let testSetup: Awaited<ReturnType<typeof testRender>>
@@ -66,6 +67,9 @@ beforeEach(async () => {
 
 afterEach(async () => {
   if (testSetup) testSetup.renderer.destroy()
+  // Clear the module-level renderer-selection cache so it can't leak into the
+  // next test's Ctrl+C fallback (an empty selection resets it).
+  handleRendererSelection({ getSelectedText: () => "" })
   await rm(root, { recursive: true, force: true })
 })
 
@@ -515,4 +519,243 @@ test("clicking a sidebar tab does not leak focus into the editor", async () => {
   await testSetup.mockMouse.pressDown(headerLabelX("SCM"), 0)
   await waitForText("SOURCE CONTROL")
   expect(statusShowsCursor()).toBe(false)
+})
+
+// --- Global Ctrl+C copy for buffer-less surfaces ---
+
+// Prime the module-level renderer-selection cache exactly as a mouse drag over a
+// buffer-less surface (diff pane / sidebar panel) would, without auto-copying —
+// copy-on-select is off, so this stands in for the drag whose text Ctrl+C copies.
+function primeRendererSelection(text: string) {
+  handleRendererSelection({ getSelectedText: () => text })
+  expect(getLastRendererSelection()).toBe(text)
+}
+
+test("with the sidebar focused, Ctrl+C copies the cached renderer selection once", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  await settle(testSetup)
+  // Boot focuses the Explorer (sidebar) with no editor textarea mounted.
+
+  const writeSpy = spyOn(clipboard, "write").mockResolvedValue(undefined)
+  try {
+    primeRendererSelection("selected panel text")
+    testSetup.mockInput.pressKey("c", { ctrl: true })
+    await settle(testSetup, 100)
+
+    expect(writeSpy).toHaveBeenCalledTimes(1)
+    expect(writeSpy.mock.calls[0][0]).toBe("selected panel text")
+  } finally {
+    writeSpy.mockRestore()
+  }
+})
+
+test("with a diff tab active in the editor, Ctrl+C copies the cached renderer selection once", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  await settle(testSetup)
+
+  // A diff tab mounts DiffPane (no textarea) yet takes editor focus, so the global
+  // handler — not EditorPane's — is the only Ctrl+C copy path for it.
+  workbenchStore.openDiff(join(root, "hello.ts"), "unstaged", root, { preview: true })
+  await settle(testSetup)
+  expect(workbenchStore.getState().focusArea).toBe("editor")
+
+  const writeSpy = spyOn(clipboard, "write").mockResolvedValue(undefined)
+  try {
+    primeRendererSelection("selected diff text")
+    testSetup.mockInput.pressKey("c", { ctrl: true })
+    await settle(testSetup, 100)
+
+    expect(writeSpy).toHaveBeenCalledTimes(1)
+    expect(writeSpy.mock.calls[0][0]).toBe("selected diff text")
+  } finally {
+    writeSpy.mockRestore()
+  }
+})
+
+test("with a file editor focused, Ctrl+C copies once (global handler stands down, no double-copy)", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  await settle(testSetup)
+  await openHelloFromTree() // file tab focused → EditorPane owns Ctrl+C
+
+  const writeSpy = spyOn(clipboard, "write").mockResolvedValue(undefined)
+  try {
+    // No buffer selection: EditorPane's own handler falls back to the SAME cache.
+    // If the global handler also fired we'd see two writes; it must stand down.
+    primeRendererSelection("cached from an earlier drag")
+    testSetup.mockInput.pressKey("HOME")
+    testSetup.mockInput.pressKey("c", { ctrl: true })
+    await settle(testSetup, 100)
+
+    expect(writeSpy).toHaveBeenCalledTimes(1)
+    expect(writeSpy.mock.calls[0][0]).toBe("cached from an earlier drag")
+  } finally {
+    writeSpy.mockRestore()
+  }
+})
+
+// --- Sidebar collapse / expand ---
+
+/** Find a renderable by id anywhere in the tree; null when unmounted. */
+function findById(id: string): { x: number; y: number; width: number } | null {
+  let found: { x: number; y: number; width: number } | null = null
+  const walk = (node: { id?: string; getChildren: () => unknown[] }) => {
+    if (node.id === id) found = node as unknown as { x: number; y: number; width: number }
+    for (const child of node.getChildren()) walk(child as typeof node)
+  }
+  walk(testSetup.renderer.root as unknown as { getChildren: () => unknown[] })
+  return found
+}
+
+/** The sole editor group's rendered width (its pane fills the whole editor area). */
+function soleEditorGroupWidth(): number {
+  const state = workbenchStore.getState()
+  const box = findById(`editor-group-${state.activeGroupId}`)
+  if (!box) throw new Error("no editor group mounted")
+  return box.width
+}
+
+test("Ctrl+B collapses the sidebar and grows the editor to full width, then re-expands", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  await settle(testSetup)
+  await waitForText("hello.ts")
+
+  // Expanded: 32-col sidebar + its 1-col sash leave the editor area at 100-32-1=67.
+  expect(findById("sidebar")).not.toBeNull()
+  expect(soleEditorGroupWidth()).toBe(67)
+
+  testSetup.mockInput.pressKey("b", { ctrl: true })
+  await settle(testSetup, 100)
+
+  // Collapsed: sidebar box AND its sash unmount; the editor spans the full 100 cols.
+  expect(findById("sidebar")).toBeNull()
+  expect(testSetup.captureCharFrame()).not.toContain("Explorer")
+  expect(testSetup.captureCharFrame()).not.toContain("Hide Sidebar")
+  expect(soleEditorGroupWidth()).toBe(100)
+
+  testSetup.mockInput.pressKey("b", { ctrl: true })
+  await settle(testSetup, 100)
+
+  expect(findById("sidebar")).not.toBeNull()
+  expect(soleEditorGroupWidth()).toBe(67)
+  await waitForText("Explorer")
+})
+
+test("Ctrl+Shift+E while the sidebar is collapsed re-opens it with the Explorer focused", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, {
+    width: 100,
+    height: 30,
+    kittyKeyboard: true,
+  })
+  await settle(testSetup)
+
+  // Switch to SCM, then collapse; revealing via Ctrl+Shift+E must show the Explorer.
+  testSetup.mockInput.pressKey("g", { ctrl: true, shift: true })
+  await waitForText("SOURCE CONTROL")
+  testSetup.mockInput.pressKey("b", { ctrl: true })
+  await settle(testSetup, 100)
+  expect(findById("sidebar")).toBeNull()
+
+  testSetup.mockInput.pressKey("e", { ctrl: true, shift: true })
+  await settle(testSetup, 100)
+
+  expect(findById("sidebar")).not.toBeNull()
+  await waitForText("hello.ts")
+  expect(headerLabelRed("Explorer")).toBeGreaterThan(200)
+  expect(workbenchStore.getState().focusArea).toBe("sidebar")
+})
+
+test("collapsing while the sidebar is focused hands keyboard focus to the editor", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  await settle(testSetup)
+  // Boot focuses the Explorer (sidebar).
+  expect(workbenchStore.getState().focusArea).toBe("sidebar")
+
+  testSetup.mockInput.pressKey("b", { ctrl: true })
+  await settle(testSetup, 100)
+
+  expect(findById("sidebar")).toBeNull()
+  expect(workbenchStore.getState().focusArea).toBe("editor")
+})
+
+test("clicking the sidebar footer collapses the sidebar", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  await settle(testSetup)
+  await waitForText("Hide Sidebar")
+
+  // Click the footer label at its live coordinates (last row of the sidebar box).
+  const line = testSetup
+    .captureCharFrame()
+    .split("\n")
+    .findIndex((l) => l.includes("Hide Sidebar"))
+  const col = testSetup.captureCharFrame().split("\n")[line].indexOf("Hide Sidebar")
+  await testSetup.mockMouse.click(col + 1, line)
+  await settle(testSetup, 100)
+
+  expect(findById("sidebar")).toBeNull()
+  expect(testSetup.captureCharFrame()).not.toContain("Hide Sidebar")
+})
+
+test("clicking the status-bar ☰ affordance toggles the sidebar both ways", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  await settle(testSetup)
+  await waitForText("hello.ts")
+
+  const toggle = findById("statusbar-sidebar-toggle")!
+  expect(toggle).not.toBeNull()
+
+  // First click collapses.
+  await testSetup.mockMouse.click(toggle.x, toggle.y)
+  await settle(testSetup, 100)
+  expect(findById("sidebar")).toBeNull()
+
+  // The affordance stays visible while collapsed; a second click re-expands.
+  const toggleAgain = findById("statusbar-sidebar-toggle")!
+  await testSetup.mockMouse.click(toggleAgain.x, toggleAgain.y)
+  await settle(testSetup, 100)
+  expect(findById("sidebar")).not.toBeNull()
+  await waitForText("Explorer")
+})
+
+test("clicking the status-bar ☰ affordance while an overlay is open does not toggle the sidebar", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  await settle(testSetup)
+  await waitForText("hello.ts")
+  expect(findById("sidebar")).not.toBeNull()
+
+  // Quick Open owns the screen; the ☰ click lands "under" it and must be inert —
+  // mirroring how Ctrl+B is blocked by the command dispatch gate.
+  testSetup.mockInput.pressKey("p", { ctrl: true })
+  await waitForText("Go to file")
+
+  const toggle = findById("statusbar-sidebar-toggle")!
+  await testSetup.mockMouse.click(toggle.x, toggle.y)
+  await settle(testSetup, 100)
+
+  expect(findById("sidebar")).not.toBeNull()
+})
+
+test("clicking the status-bar ☰ affordance preserves the cached renderer selection for Ctrl+C", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  await settle(testSetup)
+  await waitForText("hello.ts")
+
+  const toggle = findById("statusbar-sidebar-toggle")!
+
+  const writeSpy = spyOn(clipboard, "write").mockResolvedValue(undefined)
+  try {
+    // Prime the cache as a drag over a buffer-less surface would. The click's
+    // preventDefault must stop the renderer starting a selection gesture whose
+    // empty mouse-up would otherwise wipe this cached text before Ctrl+C copies it.
+    primeRendererSelection("selection to keep")
+    await testSetup.mockMouse.click(toggle.x, toggle.y)
+    await settle(testSetup, 100)
+
+    testSetup.mockInput.pressKey("c", { ctrl: true })
+    await settle(testSetup, 100)
+
+    expect(writeSpy).toHaveBeenCalledTimes(1)
+    expect(writeSpy.mock.calls[0][0]).toBe("selection to keep")
+  } finally {
+    writeSpy.mockRestore()
+  }
 })

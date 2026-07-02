@@ -880,11 +880,12 @@ test("Unified focus: opening a file via Quick Open from the sidebar ends with ed
   expect(documentRegistry.get(HELLO())?.getText()).toContain("QQQ")
 })
 
-// ── 11. Copy-on-select: renderer selections reach the clipboard ─────────────
+// ── 11. Renderer selections are copied by Ctrl+C, not on select ─────────────
 // The renderer's mouse-selection system covers non-textarea surfaces (here the
-// too-large-file preview). App subscribes to its `selection` event and, on
-// mouse-up, copies the finished selection — the only way these surfaces can be
-// copied at all (they have no edit buffer for the Ctrl+C path to read).
+// too-large-file preview and a diff pane). Copy-on-select is OFF: a drag only
+// CACHES the finished selection (App subscribes to the `selection` event); a
+// subsequent Ctrl+C is what copies it — the only way these buffer-less surfaces
+// can be copied at all (they have no edit buffer for EditorPane's Ctrl+C path).
 
 const HUGE = () => join(root, "huge.ts")
 
@@ -908,26 +909,31 @@ function locate(marker: string): { x: number; y: number } {
   return { x: lines[y].indexOf(marker), y }
 }
 
-test("Copy-on-select: dragging over the too-large-file preview copies the selection", async () => {
+test("too-large-file preview: dragging caches the selection, then Ctrl+C copies it", async () => {
   const writeSpy = spyOn(clipboard, "write").mockResolvedValue(undefined)
   try {
     await boot()
     await openHugePreview()
 
     // Drag across the distinctive first preview line; mouse-up fires the
-    // renderer's `selection` event, which App copies to the clipboard.
+    // renderer's `selection` event, which App now only CACHES (copy-on-select off).
     const { x, y } = locate("SELECTME_TOKEN")
     await testSetup.mockMouse.drag(x, y, x + "SELECTME_TOKEN".length, y)
     await settle(120)
+    expect(writeSpy).not.toHaveBeenCalled()
 
-    expect(writeSpy).toHaveBeenCalled()
-    expect(writeSpy.mock.calls.some((c) => String(c[0]).includes("SELECT"))).toBe(true)
+    // The preview scrollbox (not an editor textarea) holds focus, so the global
+    // Ctrl+C handler — not EditorPane's — copies the cached selection.
+    testSetup.mockInput.pressKey("c", { ctrl: true })
+    await settle(120)
+    expect(writeSpy).toHaveBeenCalledTimes(1)
+    expect(String(writeSpy.mock.calls[0][0])).toContain("SELECT")
   } finally {
     writeSpy.mockRestore()
   }
 })
 
-test("Copy-on-select: dragging over a diff pane's content copies the selection", async () => {
+test("diff pane: dragging caches the selection, then Ctrl+C copies it", async () => {
   const writeSpy = spyOn(clipboard, "write").mockResolvedValue(undefined)
   try {
     await writeFile(HELLO(), "const greeting = 'changed'\n")
@@ -941,9 +947,14 @@ test("Copy-on-select: dragging over a diff pane's content copies the selection",
     const { x, y } = locate("greeting")
     await testSetup.mockMouse.drag(x, y, x + "greeting".length, y)
     await settle(120)
+    expect(writeSpy).not.toHaveBeenCalled()
 
-    expect(writeSpy).toHaveBeenCalled()
-    expect(writeSpy.mock.calls.some((c) => String(c[0]).length > 0)).toBe(true)
+    // A diff tab mounts DiffPane, not a textarea, so the global Ctrl+C handler
+    // copies the cached selection.
+    testSetup.mockInput.pressKey("c", { ctrl: true })
+    await settle(120)
+    expect(writeSpy).toHaveBeenCalledTimes(1)
+    expect(String(writeSpy.mock.calls[0][0]).length).toBeGreaterThan(0)
   } finally {
     writeSpy.mockRestore()
   }

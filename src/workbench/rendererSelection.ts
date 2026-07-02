@@ -3,16 +3,18 @@
  * emits a `selection` event on mouse-up carrying the finished selection; this
  * covers surfaces with no edit buffer of their own — the diff pane, commit log,
  * SCM panel, and the too-large-file preview — which the textarea copy path can't
- * reach. Two behaviors hang off that event: copy-on-select (the terminal
- * convention of copying a selection the moment the drag ends) and caching the
- * last selection so Ctrl+C can fall back to it (see EditorPane's copy handler).
+ * reach. The event caches the last selection so Ctrl+C can copy it (see
+ * EditorPane's copy handler for focused buffers, and App's global handler for
+ * these buffer-less surfaces). Copy-on-select is the terminal convention of
+ * copying the moment the drag ends; it is off here because the user wants copying
+ * to happen ONLY via Ctrl+C, but the switch is kept in code to toggle it back.
  */
 
 import type { Osc52Writer } from "../services/clipboard"
 import * as clipboard from "../services/clipboard"
 
 /** Copy a finished mouse selection to the clipboard on mouse-up. Configurable. */
-export const COPY_ON_SELECT = true
+export const COPY_ON_SELECT = false
 
 /**
  * Text of the most recent NON-empty renderer selection, kept so a later Ctrl+C

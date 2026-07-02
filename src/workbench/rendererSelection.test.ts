@@ -16,29 +16,17 @@ afterEach(() => {
   handleRendererSelection(selectionOf(""))
 })
 
-test("copy-on-select is enabled by default", () => {
-  expect(COPY_ON_SELECT).toBe(true)
+test("copy-on-select is disabled — copying is Ctrl+C only", () => {
+  expect(COPY_ON_SELECT).toBe(false)
 })
 
-test("a non-empty selection is copied to the clipboard and cached", () => {
+test("a non-empty selection is cached but NOT auto-copied to the clipboard", () => {
   const writeSpy = spyOn(clipboard, "write").mockResolvedValue(undefined)
   try {
     handleRendererSelection(selectionOf("diff line text"))
 
-    expect(writeSpy).toHaveBeenCalledTimes(1)
-    expect(writeSpy.mock.calls[0][0]).toBe("diff line text")
+    expect(writeSpy).not.toHaveBeenCalled()
     expect(getLastRendererSelection()).toBe("diff line text")
-  } finally {
-    writeSpy.mockRestore()
-  }
-})
-
-test("the renderer is forwarded to clipboard.write for the OSC 52 path", () => {
-  const writeSpy = spyOn(clipboard, "write").mockResolvedValue(undefined)
-  const renderer = { copyToClipboardOSC52: () => true, isOsc52Supported: () => true }
-  try {
-    handleRendererSelection(selectionOf("x"), renderer)
-    expect(writeSpy.mock.calls[0][1]).toBe(renderer)
   } finally {
     writeSpy.mockRestore()
   }

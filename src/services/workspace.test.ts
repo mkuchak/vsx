@@ -118,21 +118,25 @@ describe("watch", () => {
     const typesSeen = () =>
       batches.flat().filter((c) => c.path === target).map((c) => c.type)
     // Bounded poll instead of fixed sleeps: FSEvents delivery latency varies
-    // wildly under full-suite load (this test flaked at 500ms/step), and waiting
-    // for each event before the next mutation also stops the OS from coalescing
-    // create+modify into a single event.
-    const waitFor = async (type: FileChange["type"]) => {
-      const deadline = Date.now() + 3000
+    // wildly under full-suite load (this test flaked at 500ms/step). The event
+    // may take several seconds to arrive, so the deadline is generous; the poll
+    // still returns the instant the event lands, so the happy path stays fast.
+    const waitFor = async (type: FileChange["type"], reTouch?: () => Promise<void>) => {
+      const deadline = Date.now() + 6000
       while (!typesSeen().includes(type) && Date.now() < deadline) {
-        await Bun.sleep(50)
+        // Under heavy load FSEvents coalesces the first modify into the create's
+        // delivery, so a lone write may never surface as its own event. Re-touch
+        // each poll: once the create is known, any later event maps to "changed".
+        if (reTouch) await reTouch()
+        await Bun.sleep(100)
       }
     }
 
     await writeFile(target, "hello")
     await waitFor("created")
 
-    await writeFile(target, "hello world")
-    await waitFor("changed")
+    let n = 0
+    await waitFor("changed", () => writeFile(target, `hello world ${n++}`))
 
     await rm(target)
     await waitFor("deleted")
@@ -143,7 +147,10 @@ describe("watch", () => {
     expect(types).toContain("created")
     expect(types).toContain("changed")
     expect(types).toContain("deleted")
-  })
+    // Three sequential bounded polls can legitimately wait up to 3×6000ms under
+    // FSEvents latency, exceeding bun:test's default 5s per-test timeout. Give
+    // the poll budget explicit headroom so the test fails only on a real miss.
+  }, 20000)
 
   test("disposer stops emitting", async () => {
     const batches: FileChange[][] = []

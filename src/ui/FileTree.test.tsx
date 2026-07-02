@@ -9,6 +9,7 @@ import { FileTree } from "./FileTree"
 let testSetup: Awaited<ReturnType<typeof testRender>>
 let dir: string
 let listDirSpy: ReturnType<typeof spyOn<typeof workspace, "listDir">>
+let watchSpy: ReturnType<typeof spyOn<typeof workspace, "watch">> | undefined
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), "vsx-filetree-"))
@@ -18,10 +19,12 @@ beforeEach(async () => {
   await writeFile(join(dir, "package.json"), "{}\n")
   await writeFile(join(dir, "README.md"), "# hi\n")
   listDirSpy = spyOn(workspace, "listDir")
+  watchSpy = undefined
 })
 
 afterEach(async () => {
   listDirSpy.mockRestore()
+  watchSpy?.mockRestore()
   if (testSetup) testSetup.renderer.destroy()
   await rm(dir, { recursive: true, force: true })
 })
@@ -74,6 +77,13 @@ test("renders root children collapsed", async () => {
 })
 
 test("expands a directory and lazily loads its children exactly once", async () => {
+  // Stub the filesystem watcher: this test asserts the lazy-load count for
+  // expand/collapse/re-expand, which is orthogonal to watcher-driven refreshes.
+  // Under load, a late FSEvent for the pre-created src/* files lands after src
+  // is cached and fires refresh(srcPath), fetching a second time — making the
+  // count 2 through no fault of the lazy-load path. Real watch behavior is
+  // covered by "watcher refresh picks up a file created under the root".
+  watchSpy = spyOn(workspace, "watch").mockReturnValue(() => {})
   testSetup = await render()
   await waitForText("src")
 

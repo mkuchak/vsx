@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   getTreeSitterClient,
+  type ScrollBarRenderable,
   type SimpleHighlight,
   type TextareaRenderable,
 } from "@opentui/core"
@@ -15,6 +16,7 @@ import * as clipboard from "../services/clipboard"
 import { CommandsProvider, useCommands } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
 import { handleRendererSelection } from "../workbench/rendererSelection"
+import { getEditorControls } from "../workbench/editorControls"
 import type { CommandRegistry } from "../services/commands"
 import { EditorPane } from "./EditorPane"
 
@@ -64,6 +66,12 @@ function getTextarea() {
   return testSetup.renderer.root.findDescendantById(
     "editor-textarea",
   ) as unknown as TextareaRenderable
+}
+
+/** A scrollbar by its stable id, or null when it isn't in the tree (e.g. the
+ * horizontal bar while wrap is on). */
+function getScrollbar(id: string): ScrollBarRenderable | null {
+  return (testSetup.renderer.root.findDescendantById(id) as unknown as ScrollBarRenderable) ?? null
 }
 
 /**
@@ -1102,6 +1110,466 @@ test("switching the active tab releases the previous document's refcount", async
   expect(documentRegistry.get(b)).toBeDefined()
   // The pane held the ONLY refcount on A, so switching away disposes it.
   expect(documentRegistry.get(a)).toBeUndefined()
+})
+
+/** Alt+Up/Down (Option on macOS): CSI 1;3A/B → parser sets key.option. */
+function pressAltArrow(direction: "up" | "down") {
+  testSetup.mockInput.pressArrow(direction, { meta: true })
+}
+
+test("Alt+Down moves the current line down and follows it with the caret", async () => {
+  const file = join(dir, "move-down.ts")
+  await writeFile(file, "one\ntwo\nthree\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("three")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  ta.setCursor(0, 2) // on "one"
+  await testSetup.flush()
+
+  pressAltArrow("down")
+  await testSetup.flush()
+
+  expect(doc.getText()).toBe("two\none\nthree\n")
+  // Caret follows the moved line (row 0 → row 1), column preserved.
+  expect(ta.editorView.getCursor()).toEqual({ row: 1, col: 2 })
+})
+
+test("Alt+Up moves the current line up and follows it with the caret", async () => {
+  const file = join(dir, "move-up.ts")
+  await writeFile(file, "one\ntwo\nthree\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("three")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  ta.setCursor(2, 1) // on "three"
+  await testSetup.flush()
+
+  pressAltArrow("up")
+  await testSetup.flush()
+
+  expect(doc.getText()).toBe("one\nthree\ntwo\n")
+  expect(ta.editorView.getCursor()).toEqual({ row: 1, col: 1 })
+})
+
+test("Alt+Up on the first line is a no-op", async () => {
+  const file = join(dir, "move-up-edge.ts")
+  await writeFile(file, "one\ntwo\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("two")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  ta.setCursor(0, 1)
+  await testSetup.flush()
+
+  pressAltArrow("up")
+  await testSetup.flush()
+
+  expect(doc.getText()).toBe("one\ntwo\n")
+  expect(ta.editorView.getCursor()).toEqual({ row: 0, col: 1 })
+})
+
+test("Alt+Down on the last line is a no-op", async () => {
+  const file = join(dir, "move-down-edge.ts")
+  // No trailing newline, so "two" is the true last line.
+  await writeFile(file, "one\ntwo")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("two")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  ta.setCursor(1, 1)
+  await testSetup.flush()
+
+  pressAltArrow("down")
+  await testSetup.flush()
+
+  expect(doc.getText()).toBe("one\ntwo")
+  expect(ta.editorView.getCursor()).toEqual({ row: 1, col: 1 })
+})
+
+// A trailing newline leaves a phantom empty final line in plainText.split("\n").
+// VSCode's getLineCount() counts that phantom line too, so its down-guard fires on
+// the phantom line — not the last text line. These pin that parity: the last TEXT
+// line still moves (swapping below the phantom line), and the phantom line is what
+// no-ops. See the move handler's guard in EditorPane.tsx.
+test("Alt+Down on the last text line of a newline-terminated file swaps it below the phantom line", async () => {
+  const file = join(dir, "move-down-trailing.ts")
+  await writeFile(file, "one\ntwo\nthree\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("three")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  ta.setCursor(2, 1) // on "three", the last text line
+  await testSetup.flush()
+
+  pressAltArrow("down")
+  await testSetup.flush()
+
+  // "three" swaps below the phantom empty final line — VSCode does the same.
+  expect(doc.getText()).toBe("one\ntwo\n\nthree")
+  // Caret follows the moved line down one row, column preserved.
+  expect(ta.editorView.getCursor()).toEqual({ row: 3, col: 1 })
+})
+
+test("Alt+Down on the phantom empty final line is a no-op", async () => {
+  const file = join(dir, "move-down-phantom.ts")
+  await writeFile(file, "one\ntwo\nthree\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("three")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  ta.setCursor(3, 0) // on the phantom empty line after the trailing newline
+  await testSetup.flush()
+
+  pressAltArrow("down")
+  await testSetup.flush()
+
+  expect(doc.getText()).toBe("one\ntwo\nthree\n")
+  expect(ta.editorView.getCursor()).toEqual({ row: 3, col: 0 })
+})
+
+test("Alt+Up on the phantom empty final line moves it above the last text line", async () => {
+  const file = join(dir, "move-up-phantom.ts")
+  await writeFile(file, "one\ntwo\nthree\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("three")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  ta.setCursor(3, 0) // on the phantom empty line
+  await testSetup.flush()
+
+  pressAltArrow("up")
+  await testSetup.flush()
+
+  // The empty line swaps above "three", producing the same text as the mirror-image
+  // Alt+Down case but with the caret on the moved (now line-3) empty line.
+  expect(doc.getText()).toBe("one\ntwo\n\nthree")
+  expect(ta.editorView.getCursor()).toEqual({ row: 2, col: 0 })
+})
+
+test("a single Ctrl+Z restores the exact text after a trailing-newline-edge move", async () => {
+  const file = join(dir, "move-trailing-undo.ts")
+  await writeFile(file, "one\ntwo\nthree\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("three")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  ta.setCursor(2, 1) // on the last text line
+  await testSetup.flush()
+
+  pressAltArrow("down")
+  await testSetup.flush()
+  expect(doc.getText()).toBe("one\ntwo\n\nthree")
+
+  testSetup.mockInput.pressKey("z", { ctrl: true })
+  await testSetup.flush()
+
+  expect(doc.getText()).toBe("one\ntwo\nthree\n")
+})
+
+test("Alt+Down keeps the caret's column on the moved line even past a shorter neighbor", async () => {
+  const file = join(dir, "move-sticky.ts")
+  await writeFile(file, "longer line here\nab\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("longer line")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  // Caret near the end of the long line; the line moves intact, so its column is
+  // preserved even though the neighbor it swaps with ("ab") is far shorter.
+  ta.setCursor(0, 12)
+  await testSetup.flush()
+
+  pressAltArrow("down")
+  await testSetup.flush()
+
+  expect(doc.getText()).toBe("ab\nlonger line here\n")
+  expect(ta.editorView.getCursor()).toEqual({ row: 1, col: 12 })
+})
+
+test("Alt+Down moves a multi-line selection block and the selection follows it", async () => {
+  const file = join(dir, "move-block.ts")
+  await writeFile(file, "one\ntwo\nthree\nfour\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("four")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  // Select "one\ntwo" (rows 0-1) via offsets, then move the block down.
+  const start = ta.editBuffer.positionToOffset(0, 0)
+  const end = ta.editBuffer.positionToOffset(1, 3)
+  ta.setSelection(start, end)
+  await testSetup.flush()
+  expect(ta.getSelectedText()).toBe("one\ntwo")
+
+  pressAltArrow("down")
+  await testSetup.flush()
+
+  expect(doc.getText()).toBe("three\none\ntwo\nfour\n")
+  // The selection tracks the moved block (now rows 1-2).
+  expect(ta.getSelectedText()).toBe("one\ntwo")
+})
+
+test("a single Ctrl+Z fully restores the text and caret after an Alt move", async () => {
+  const file = join(dir, "move-undo.ts")
+  await writeFile(file, "one\ntwo\nthree\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("three")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  ta.setCursor(0, 1)
+  await testSetup.flush()
+
+  pressAltArrow("down")
+  await testSetup.flush()
+  expect(doc.getText()).toBe("two\none\nthree\n")
+
+  testSetup.mockInput.pressKey("z", { ctrl: true })
+  await testSetup.flush()
+
+  expect(doc.getText()).toBe("one\ntwo\nthree\n")
+  expect(ta.editorView.getCursor()).toEqual({ row: 0, col: 1 })
+})
+
+test("an Alt move marks the document dirty and updates the reported Ln/Col", async () => {
+  const positions: { line: number; column: number }[] = []
+  const file = join(dir, "move-dirty.ts")
+  await writeFile(file, "one\ntwo\nthree\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render({ onCursorChange: (p) => positions.push(p) })
+  await waitForText("three")
+
+  const ta = getTextarea()
+  const doc = documentRegistry.get(file)!
+  expect(doc.isDirty).toBe(false)
+  ta.setCursor(0, 2)
+  await testSetup.flush()
+
+  pressAltArrow("down")
+  await testSetup.flush()
+
+  expect(doc.isDirty).toBe(true)
+  // Caret moved from line 1 to line 2 (1-based status-bar coordinates).
+  expect(positions.at(-1)).toEqual({ line: 2, column: 3 })
+})
+
+test("the gutter numbers the visible lines", async () => {
+  const file = join(dir, "gutter.ts")
+  await writeFile(file, "alpha\nbravo\ncharlie\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("charlie")
+
+  const frame = testSetup.captureCharFrame()
+  // A 3-wide gutter (single-digit doc): right-aligned number, one padding col, content.
+  expect(frame).toContain(" 1 alpha")
+  expect(frame).toContain(" 2 bravo")
+  expect(frame).toContain(" 3 charlie")
+})
+
+test("scrolling past the viewport updates the first visible line number", async () => {
+  const file = join(dir, "gutter-scroll.ts")
+  // 60 digit-free content lines so any digit in a frame can only be a gutter number.
+  const body = Array.from({ length: 60 }, () => "zzz").join("\n")
+  await writeFile(file, `${body}\n`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("zzz")
+
+  // At the top, the far line number is nowhere on screen.
+  expect(testSetup.captureCharFrame()).not.toContain("60")
+
+  // Reveal the last line through the same control Quick Open's go-to-line uses.
+  const groupId = workbenchStore.getState().activeGroupId
+  getEditorControls(groupId)!.gotoLine(60)
+
+  // Bounded poll: the gutter re-syncs on the next frame after scrollY changes.
+  const deadline = Date.now() + 3000
+  while (Date.now() < deadline && !testSetup.captureCharFrame().includes("60")) {
+    await testSetup.flush()
+    await Bun.sleep(30)
+  }
+  expect(testSetup.captureCharFrame()).toContain("60")
+})
+
+test("a long wrapped line is numbered only on its first visual row", async () => {
+  const file = join(dir, "gutter-wrap.ts")
+  // Middle line is far wider than the 50-col pane, so it wraps to several rows.
+  await writeFile(file, `short\n${"x".repeat(120)}\nafter`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("after")
+
+  const frame = testSetup.captureCharFrame()
+  const xLines = frame.split("\n").filter((l) => l.includes("xxx"))
+  // The long line occupies multiple visual rows...
+  expect(xLines.length).toBeGreaterThan(1)
+  // ...but only its first visual row carries a number (content has no digits, so
+  // any digit on an x-row is the gutter).
+  expect(xLines.filter((l) => /\d/.test(l)).length).toBe(1)
+  // Numbering skips wrap-continuation rows: the third logical line is still "3".
+  expect(frame).toContain("3")
+  expect(frame).not.toContain("4")
+})
+
+test("the gutter widens for a document with more than 999 lines", async () => {
+  const file = join(dir, "gutter-wide.ts")
+  const body = Array.from({ length: 1200 }, () => "zzz").join("\n")
+  await writeFile(file, `${body}\n`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("zzz")
+
+  // Four-digit line count → gutter widens to fit (digits + one pad col each side),
+  // shifting the textarea right accordingly.
+  expect(getTextarea().x).toBe(6)
+
+  const groupId = workbenchStore.getState().activeGroupId
+  getEditorControls(groupId)!.gotoLine(1200)
+  const deadline = Date.now() + 3000
+  while (Date.now() < deadline && !testSetup.captureCharFrame().includes("1200")) {
+    await testSetup.flush()
+    await Bun.sleep(30)
+  }
+  expect(testSetup.captureCharFrame()).toContain("1200")
+})
+
+test("the vertical scrollbar's position reflects the viewport after a deep goto-line jump", async () => {
+  const file = join(dir, "vbar-scroll.ts")
+  const body = Array.from({ length: 200 }, (_, i) => `line ${i + 1}`).join("\n")
+  await writeFile(file, `${body}\n`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("line 1")
+
+  // Jump deep into the document through the same control Quick Open's go-to-line
+  // uses; the viewport scrolls to reveal line 200.
+  const groupId = workbenchStore.getState().activeGroupId
+  getEditorControls(groupId)!.gotoLine(200)
+
+  const ta = getTextarea()
+  // Bounded poll: the per-frame sync mirrors the scrolled viewport onto the bar.
+  const deadline = Date.now() + 3000
+  let vbar = getScrollbar("editor-vscrollbar")
+  while (
+    Date.now() < deadline &&
+    !(vbar && vbar.scrollPosition > 0 && vbar.scrollPosition === ta.editorView.getViewport().offsetY)
+  ) {
+    await testSetup.flush()
+    await Bun.sleep(30)
+    vbar = getScrollbar("editor-vscrollbar")
+  }
+
+  const vp = ta.editorView.getViewport()
+  expect(vp.offsetY).toBeGreaterThan(0)
+  expect(vbar!.scrollPosition).toBe(vp.offsetY)
+})
+
+test("dragging the vertical scrollbar thumb scrolls the editor viewport", async () => {
+  const file = join(dir, "vbar-drag.ts")
+  const body = Array.from({ length: 200 }, (_, i) => `line ${i + 1}`).join("\n")
+  await writeFile(file, `${body}\n`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("line 1")
+
+  const ta = getTextarea()
+  ta.setCursor(0, 0)
+  await testSetup.flush()
+
+  // Let the per-frame sync size the thumb from the document extent (so the bar is
+  // draggable, not auto-hidden).
+  const vbar = getScrollbar("editor-vscrollbar")!
+  const deadline = Date.now() + 3000
+  while (Date.now() < deadline && vbar.scrollSize <= vbar.viewportSize) {
+    await testSetup.flush()
+    await Bun.sleep(30)
+  }
+  expect(vbar.scrollSize).toBeGreaterThan(vbar.viewportSize)
+
+  const mm = testSetup.mockMouse
+  // Grab the thumb near the top of the track and drag it toward the bottom.
+  await mm.pressDown(vbar.x, vbar.y)
+  await mm.emitMouseEvent("drag", vbar.x, vbar.y + vbar.height - 1)
+  await mm.release(vbar.x, vbar.y + vbar.height - 1)
+  // Settle a couple of frames so the poll applies the thumb position.
+  await testSetup.flush()
+  await testSetup.flush()
+
+  // The viewport scrolled down. (This edit buffer ties the viewport to the caret —
+  // its own wheel scroll moves the caret too — so the scrollbar scrolls the same
+  // way; the assertion is on the viewport, which is what the bar drives.)
+  const vp = ta.editorView.getViewport()
+  expect(vp.offsetY).toBeGreaterThan(0)
+  // The bar mirrors the new offset.
+  expect(vbar.scrollPosition).toBe(vp.offsetY)
+})
+
+test("the horizontal scrollbar sizes to the document-wide width when the widest line is below the viewport", async () => {
+  const file = join(dir, "hbar-extent.ts")
+  // 40 short lines then one 120-col line: the widest line sits far below the
+  // initial viewport, so a visible-window measurement would under-report it.
+  const wide = "x".repeat(120)
+  const body = [...Array.from({ length: 40 }, () => "ab"), wide].join("\n")
+  await writeFile(file, `${body}\n`)
+  workbenchStore.openFile(file)
+
+  // Wrap off is the only mode where the horizontal bar exists / is meaningful.
+  testSetup = await render({ wordWrap: "none" })
+  await waitForText("ab")
+
+  // Bounded poll: the per-frame sync sizes the thumb from the document extent.
+  const deadline = Date.now() + 3000
+  let hbar = getScrollbar("editor-hscrollbar")
+  while (Date.now() < deadline && !(hbar && hbar.scrollSize === 120)) {
+    await testSetup.flush()
+    await Bun.sleep(30)
+    hbar = getScrollbar("editor-hscrollbar")
+  }
+
+  // Extent is the document-wide max width, not the visible window's — and at
+  // scroll-top (widest line off-screen) the bar is still scrollable, not auto-hidden.
+  expect(getTextarea().editorView.getViewport().offsetY).toBe(0)
+  expect(hbar!.scrollSize).toBe(120)
+  expect(hbar!.scrollSize).toBeGreaterThan(hbar!.viewportSize)
 })
 
 test("switching tabs before the initial open resolves does not leak a refcount", async () => {

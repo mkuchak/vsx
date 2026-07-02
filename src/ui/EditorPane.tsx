@@ -1,5 +1,6 @@
 import {
   getTreeSitterClient,
+  ScrollBarRenderable,
   SyntaxStyle,
   type MouseEvent as CoreMouseEvent,
   type ScrollBoxRenderable,
@@ -7,8 +8,8 @@ import {
   type TextareaRenderable,
   type ThemeTokenStyle,
 } from "@opentui/core"
-import { useKeyboard, useRenderer } from "@opentui/react"
-import { useCallback, useEffect, useReducer, useRef, useState } from "react"
+import { extend, useKeyboard, useRenderer } from "@opentui/react"
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react"
 import {
   documentRegistry,
   FileTooLargeError,
@@ -22,6 +23,16 @@ import { useOverlay, useOverlayFocusRestore } from "../workbench/OverlayProvider
 import { getLastRendererSelection } from "../workbench/rendererSelection"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
 
+// ScrollBarRenderable isn't in @opentui/react's default component catalogue, so
+// register it once at module load to make `<scrollbar>` a valid element. The
+// module augmentation gives it typed intrinsic props (orientation, trackOptions…).
+declare module "@opentui/react" {
+  interface OpenTUIComponents {
+    scrollbar: typeof ScrollBarRenderable
+  }
+}
+extend({ scrollbar: ScrollBarRenderable })
+
 export type CursorPosition = { line: number; column: number }
 
 export type EditorPaneProps = {
@@ -29,6 +40,8 @@ export type EditorPaneProps = {
   height?: number | `${number}%` | "auto"
   /** Render a specific group's content; defaults to the globally active group. */
   groupId?: string
+  /** Workbench-wide word-wrap mode applied to the textarea; defaults to "word". */
+  wordWrap?: "word" | "none"
   /** Fires with a 1-based line/column whenever the cursor moves. Status-bar hookup. */
   onCursorChange?: (pos: CursorPosition) => void
 }
@@ -155,6 +168,7 @@ export function EditorPane({
   focused,
   height = "100%",
   groupId,
+  wordWrap = "word",
   onCursorChange,
 }: EditorPaneProps) {
   const state = useWorkbenchStore()
@@ -268,6 +282,7 @@ export function EditorPane({
       groupId={resolvedGroupId}
       focused={focused}
       height={height}
+      wordWrap={wordWrap}
       onCursorChange={onCursorChange}
     />
   )
@@ -279,6 +294,7 @@ type EditorTextareaProps = {
   groupId: string
   focused: boolean
   height: number | `${number}%` | "auto"
+  wordWrap: "word" | "none"
   onCursorChange?: (pos: CursorPosition) => void
 }
 
@@ -289,10 +305,12 @@ type EditorTextareaProps = {
  * `onContentChange`, and external changes (disk/save) flow Document → textarea by
  * pushing text into the buffer on non-'edit' change events.
  */
-function EditorTextarea({ doc, groupId, focused, height, onCursorChange }: EditorTextareaProps) {
+function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChange }: EditorTextareaProps) {
   const renderer = useRenderer()
   const { isOverlayOpen } = useOverlay()
   const taRef = useRef<TextareaRenderable | null>(null)
+  const vScrollRef = useRef<ScrollBarRenderable | null>(null)
+  const hScrollRef = useRef<ScrollBarRenderable | null>(null)
   const docRef = useRef(doc)
   docRef.current = doc
   // useKeyboard is a global subscription; this ref lets the handler act only
@@ -510,6 +528,72 @@ function EditorTextarea({ doc, groupId, focused, height, onCursorChange }: Edito
     }
   })
 
+  // VSCode's Alt+Up / Alt+Down (Option on macOS) moves the caret's line — or the
+  // whole selected block of lines — up or down. TextareaAction has no line-swap
+  // verb, so this is userland. The entire swap is applied through `replaceText`
+  // (the buffer's only documented single-undo-point mutation, and the same
+  // primitive the external-sync path uses) so ONE Ctrl+Z reverts the whole move.
+  useKeyboard((key) => {
+    if (isOverlayOpen) return
+    if (!focusedRef.current) return
+    // Alt-arrows arrive as CSI 1;3A/B, which the parser flags as both option and
+    // meta; key on `option` and reject ctrl/shift so only a bare Alt+Up/Down fires.
+    if (!key.option || key.ctrl || key.shift) return
+    if (key.name !== "up" && key.name !== "down") return
+    const ta = taRef.current
+    if (!ta) return
+
+    const dir = key.name === "up" ? -1 : 1
+    const lines = ta.plainText.split("\n")
+    const lastRow = lines.length - 1
+
+    // Rows to move: a non-empty selection carries its whole block; otherwise just
+    // the caret's line. VSCode excludes a trailing row the selection only touches
+    // at column 0 (its newline isn't actually inside the selection).
+    const selection = ta.getSelection()
+    const hasSelection = selection !== null && selection.end > selection.start
+    const startPos = hasSelection ? ta.editBuffer.offsetToPosition(selection.start) : null
+    const endPos = hasSelection ? ta.editBuffer.offsetToPosition(selection.end) : null
+    const cursor = ta.editorView.getCursor()
+
+    let rowStart: number
+    let rowEnd: number
+    if (startPos && endPos) {
+      rowStart = startPos.row
+      rowEnd = endPos.row > startPos.row && endPos.col === 0 ? endPos.row - 1 : endPos.row
+    } else {
+      rowStart = cursor.row
+      rowEnd = cursor.row
+    }
+
+    // At the document edge there's nowhere to swap: swallow the key (no beep).
+    if (dir === -1 && rowStart === 0) return
+    if (dir === 1 && rowEnd === lastRow) return
+
+    // Splice the block out and reinsert it one row past the neighbor it swaps with.
+    const block = lines.splice(rowStart, rowEnd - rowStart + 1)
+    lines.splice(rowStart + dir, 0, ...block)
+    const nextText = lines.join("\n")
+    ta.replaceText(nextText)
+
+    if (startPos && endPos) {
+      // Both endpoints shift by the move distance; clamp to the new buffer bounds.
+      const clamp = (o: number) => Math.max(0, Math.min(o, nextText.length))
+      const newStart = clamp(ta.editBuffer.positionToOffset(startPos.row + dir, startPos.col))
+      const newEnd = clamp(ta.editBuffer.positionToOffset(endPos.row + dir, endPos.col))
+      ta.setSelection(newStart, newEnd)
+    } else {
+      // Sticky column: the caret's line moved intact (its length is unchanged), so
+      // its own column is still valid — keep it at the same column on the moved line.
+      ta.setCursor(rowStart + dir, cursor.col)
+    }
+
+    // replaceText updated the buffer; mirror it into the Document (dirty state, tab
+    // promotion, re-highlight) and refresh the status bar's Ln/Col.
+    syncFromBuffer()
+    reportCursorRef.current()
+  })
+
   // Belt-and-suspenders cursor reporting for keys the native onCursorChange path
   // misses (vertical/page/home-end navigation, and undo/redo which reposition the
   // caret). queueMicrotask defers past the synchronous key dispatch so the
@@ -713,23 +797,143 @@ function EditorTextarea({ doc, groupId, focused, height, onCursorChange }: Edito
     multiClickGesture.current = null
   }, [])
 
+  // Apply the workbench word-wrap setting to the live buffer. `wrapMode` is a
+  // runtime setter on the edit buffer (drives editorView.setWrapMode and marks
+  // layout dirty, no remount), so a toggle re-lays-out the current text in place.
+  // Runs on mount too, which just re-affirms the default "word".
+  useEffect(() => {
+    const ta = taRef.current
+    if (ta) ta.wrapMode = wordWrap
+  }, [wordWrap])
+
+  // Keep the scrollbars and the editor viewport in step. The edit buffer emits NO
+  // scroll/viewport event — wheel and caret-follow fire nothing — so, like
+  // OpenTUI's own gutter, we poll each rendered frame via setFrameCallback.
+  //
+  // We deliberately DON'T use the bar's onChange: a thumb drag updates the bar's
+  // own `scrollPosition`, and we detect that here by comparing it to both the live
+  // viewport and the value we last reflected. A user-driven divergence is applied
+  // to the viewport; otherwise we mirror the viewport onto the bar.
+  //
+  // Scroll is applied with moveCursor=TRUE. This OpenTUI edit buffer ties the
+  // viewport to the caret — its own wheel scroll uses moveCursor=true, and a
+  // moveCursor=false setViewport issued from a frame callback is undone by the
+  // ensuing render — so true is the only offset that actually sticks. The caret
+  // travels with the view exactly as it does when you wheel-scroll.
+  const lastReflected = useRef({ y: -1, x: -1 })
+  const syncScrollbars = useCallback(() => {
+    const ta = taRef.current
+    if (!ta) return
+    const view = ta.editorView
+    let vp = view.getViewport()
+
+    // Only treat a thumb move as a user drag when the bar is actually scrollable
+    // (content overflows). When it fits, ScrollBar clamps scrollPosition to a
+    // negative `scrollSize - viewportSize`, which must never be mistaken for a drag.
+    const vBar = vScrollRef.current
+    const vScrollable = vBar !== null && vBar.scrollSize > vBar.viewportSize
+    if (vScrollable && vBar!.scrollPosition !== vp.offsetY && vBar!.scrollPosition !== lastReflected.current.y) {
+      view.setViewport(vp.offsetX, vBar!.scrollPosition, vp.width, vp.height, true)
+      vp = view.getViewport()
+    }
+    const hBar = hScrollRef.current
+    const hScrollable = hBar !== null && hBar.scrollSize > hBar.viewportSize
+    if (hScrollable && hBar!.scrollPosition !== vp.offsetX && hBar!.scrollPosition !== lastReflected.current.x) {
+      view.setViewport(hBar!.scrollPosition, vp.offsetY, vp.width, vp.height, true)
+      vp = view.getViewport()
+    }
+
+    if (vBar) {
+      const total = view.getTotalVirtualLineCount()
+      if (vBar.scrollSize !== total) vBar.scrollSize = total
+      if (vBar.viewportSize !== vp.height) vBar.viewportSize = vp.height
+      if (vBar.scrollPosition !== vp.offsetY) vBar.scrollPosition = vp.offsetY
+      lastReflected.current.y = vp.offsetY
+    }
+    if (hBar) {
+      const maxCols = view.getLogicalLineInfo().lineWidthColsMax
+      if (hBar.scrollSize !== maxCols) hBar.scrollSize = maxCols
+      if (hBar.viewportSize !== vp.width) hBar.viewportSize = vp.width
+      if (hBar.scrollPosition !== vp.offsetX) hBar.scrollPosition = vp.offsetX
+      lastReflected.current.x = vp.offsetX
+    }
+  }, [])
+
+  // Per-frame poll (see above). setFrameCallback is the renderer's sanctioned
+  // frame hook; the cleanup removes it so an unmounted pane leaves nothing behind.
+  useEffect(() => {
+    const frame = async () => {
+      syncScrollbars()
+    }
+    renderer.setFrameCallback(frame)
+    return () => renderer.removeFrameCallback(frame)
+  }, [renderer, syncScrollbars])
+
+  // Gutter width. The built-in `<line-number>` sizes its width from
+  // `target.virtualLineCount`, but for an editable buffer that getter reports the
+  // *visible* line count, not the document total — so left to itself the gutter
+  // under-sizes and clips multi-digit numbers once you scroll down. `minWidth` is
+  // the only lever (there is no post-mount setter), so we floor it to the document's
+  // real digit count: digits + one padding col each side. Computed once per mounted
+  // Document (this pane is keyed by uri); a mid-session cross of a digit boundary
+  // (e.g. growing a 99-line file to 100) won't widen until reopen — a rare, cosmetic
+  // deviation not worth remounting the textarea (and losing its undo/cursor) over.
+  const gutterMinWidth = useMemo(
+    () => Math.max(3, String(doc.getText().split("\n").length).length + 2),
+    [doc],
+  )
+
   return (
     <box flexDirection="column" height={height}>
-      <textarea
-        id="editor-textarea"
-        ref={taRef}
-        focused={focused}
-        initialValue={doc.getText()}
-        keyBindings={EXTRA_KEY_BINDINGS}
-        onContentChange={handleContentChange}
-        onCursorChange={handleCursorChange}
-        onMouseDown={handleMouseDown}
-        onMouseDrag={handleMouseDrag}
-        onMouseDragEnd={handleMouseDragEnd}
-        flexGrow={1}
-        textColor={theme.foreground}
-        backgroundColor={theme.background}
-      />
+      {/* row: [ gutter+textarea column (+ horizontal bar), vertical bar ] */}
+      <box flexDirection="row" flexGrow={1}>
+        <box flexDirection="column" flexGrow={1}>
+          <line-number flexGrow={1} minWidth={gutterMinWidth} fg={theme.dimForeground} bg={theme.background}>
+            <textarea
+              id="editor-textarea"
+              ref={taRef}
+              focused={focused}
+              initialValue={doc.getText()}
+              keyBindings={EXTRA_KEY_BINDINGS}
+              onContentChange={handleContentChange}
+              onCursorChange={handleCursorChange}
+              onMouseDown={handleMouseDown}
+              onMouseDrag={handleMouseDrag}
+              onMouseDragEnd={handleMouseDragEnd}
+              flexGrow={1}
+              textColor={theme.foreground}
+              backgroundColor={theme.background}
+            />
+          </line-number>
+          {/* Horizontal wheel-scroll only works with wrap off, so the bar is
+              meaningful (and shown) only then. */}
+          {wordWrap === "none" && (
+            <scrollbar
+              id="editor-hscrollbar"
+              ref={hScrollRef}
+              orientation="horizontal"
+              height={1}
+              flexShrink={0}
+              trackOptions={{
+                backgroundColor: theme.scrollbarTrack,
+                foregroundColor: theme.scrollbarThumb,
+              }}
+            />
+          )}
+        </box>
+        <scrollbar
+          id="editor-vscrollbar"
+          ref={vScrollRef}
+          orientation="vertical"
+          width={1}
+          flexShrink={0}
+          trackOptions={{
+            width: 1,
+            backgroundColor: theme.scrollbarTrack,
+            foregroundColor: theme.scrollbarThumb,
+          }}
+        />
+      </box>
     </box>
   )
 }

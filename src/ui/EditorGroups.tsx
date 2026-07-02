@@ -1,5 +1,5 @@
 import { useTerminalDimensions } from "@opentui/react"
-import { useEffect, useRef } from "react"
+import { useEffect, useRef, useState } from "react"
 import { documentRegistry } from "../model/documents.ts"
 import { workbenchStore, type Group } from "../model/workbench.ts"
 import { theme } from "../theme"
@@ -50,6 +50,13 @@ export function EditorGroups({
   const commands = useCommands()
   const { width: termWidth } = useTerminalDimensions()
   const areaWidth = containerWidth ?? termWidth
+
+  // Workbench-wide word-wrap, applied to every editor textarea so splits stay
+  // consistent and a newly-opened pane inherits the current setting. Defaults to
+  // "word" (VSCode's default). The toggle command flips this via a functional
+  // update, so its run closure never captures a stale value and the command
+  // registration below stays one-shot.
+  const [wordWrap, setWordWrap] = useState<"word" | "none">("word")
 
   // Read live values inside command closures without re-registering commands
   // (registration must stay one-shot — see the "registers ... exactly once" test).
@@ -158,6 +165,16 @@ export function EditorGroups({
         category: "View",
         run: () => workbenchStore.resetSplitSizes(),
       }),
+      // Alt+Z (VSCode's chord) flips word wrap for EVERY editor pane. "alt" is the
+      // correct keymap token — @opentui/keymap collapses alt/option/meta to one
+      // meta flag, matching the option-carrying key event; "cmd" would throw.
+      commands.registerCommand({
+        id: "editor.toggleWordWrap",
+        title: "Toggle Word Wrap",
+        category: "View",
+        keybinding: "alt+z",
+        run: () => setWordWrap((mode) => (mode === "word" ? "none" : "word")),
+      }),
       // Ctrl+Tab is stolen by many terminals; Ctrl+PageUp/Down is the reliable pair.
       commands.registerCommand({
         id: "editor.closeActiveTab",
@@ -225,6 +242,7 @@ export function EditorGroups({
             group={group}
             grow={state.sizes[i] ?? 1}
             focused={group.id === state.activeGroupId && editorFocused}
+            wordWrap={wordWrap}
             onCursorChange={group.id === state.activeGroupId ? onCursorChange : undefined}
           />
         )
@@ -248,11 +266,13 @@ function EditorGroupPane({
   group,
   grow,
   focused,
+  wordWrap,
   onCursorChange,
 }: {
   group: Group
   grow: number
   focused: boolean
+  wordWrap: "word" | "none"
   onCursorChange?: (pos: CursorPosition) => void
 }) {
   const active = group.tabs.find((t) => t.path === group.activeTabPath)
@@ -286,6 +306,7 @@ function EditorGroupPane({
           focused={focused}
           groupId={group.id}
           height="100%"
+          wordWrap={wordWrap}
           onCursorChange={onCursorChange}
         />
       )}

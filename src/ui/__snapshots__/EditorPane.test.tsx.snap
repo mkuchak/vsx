@@ -1,11 +1,11 @@
 // Bun Snapshot v1, https://goo.gl/fbAQLP
 
 exports[`renders a recognized file's content in an editable textarea 1`] = `
-"const answer = 42                                 
-function greet() {                                
-  return "hi"                                     
-}                                                 
-                                                  
+" 1 const answer = 42                              
+ 2 function greet() {                             
+ 3   return "hi"                                  
+ 4 }                                              
+ 5                                                
                                                   
                                                   
                                                   

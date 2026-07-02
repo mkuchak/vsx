@@ -1,4 +1,4 @@
-import type { Renderable, RGBA } from "@opentui/core"
+import type { Renderable, RGBA, TextareaRenderable } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { theme } from "../theme"
@@ -106,6 +106,12 @@ function collect(root: Renderable, pred: (r: Renderable) => boolean): Renderable
 /** All editor textareas, left-to-right (both panes share the stable id). */
 function textareas(): Renderable[] {
   return collect(testSetup!.renderer.root, (r) => r.id === "editor-textarea")
+}
+
+/** First renderable with the given id, or null when it isn't mounted. */
+function byId(id: string): Renderable | null {
+  const [node] = collect(testSetup!.renderer.root, (r) => r.id === id)
+  return node ?? null
 }
 
 /** Locate a renderable by id and read its rendered geometry. */
@@ -677,6 +683,71 @@ test("registers each tab command exactly once even with two panes split", async 
   for (const id of ["editor.save", "editor.closeActiveTab", "editor.nextTab", "editor.previousTab"]) {
     expect(ids.filter((x) => x === id)).toHaveLength(1)
   }
+})
+
+test("Toggle Word Wrap flips every editor's wrap mode, re-lays-out a long line, and reveals the horizontal scrollbar when off", async () => {
+  const file = join(dir, "wrap.ts")
+  // One very long line so wrap on/off changes the visual row count.
+  await writeFile(file, `${"x".repeat(300)}\nshort\n`)
+  workbenchStore.openFile(file, { preview: false })
+
+  await render()
+  await waitForText("xxx")
+
+  const ta = textareas()[0] as unknown as TextareaRenderable
+  // Default is word wrap: the long line spans multiple visual rows and there is
+  // no horizontal scrollbar.
+  expect(ta.wrapMode).toBe("word")
+  const wrappedRows = ta.editorView.getTotalVirtualLineCount()
+  expect(byId("editor-hscrollbar")).toBeNull()
+
+  // Toggle wrap off: the long line collapses toward one visual row per logical
+  // line and the horizontal scrollbar appears.
+  expect(registry!.executeCommand("editor.toggleWordWrap")).toBe(true)
+  await testSetup!.flush()
+  const deadline = Date.now() + 2000
+  while (Date.now() < deadline && ta.wrapMode !== "none") {
+    await testSetup!.flush()
+    await Bun.sleep(20)
+  }
+
+  expect(ta.wrapMode).toBe("none")
+  expect(ta.editorView.getTotalVirtualLineCount()).toBeLessThan(wrappedRows)
+  expect(byId("editor-hscrollbar")).not.toBeNull()
+
+  // Toggle back on: wrap restored, horizontal bar gone.
+  expect(registry!.executeCommand("editor.toggleWordWrap")).toBe(true)
+  await testSetup!.flush()
+  const deadline2 = Date.now() + 2000
+  while (Date.now() < deadline2 && ta.wrapMode !== "word") {
+    await testSetup!.flush()
+    await Bun.sleep(20)
+  }
+  expect(ta.wrapMode).toBe("word")
+  expect(byId("editor-hscrollbar")).toBeNull()
+})
+
+test("Toggle Word Wrap applies to every pane in a split", async () => {
+  const file = join(dir, "wrap-split.ts")
+  await writeFile(file, `${"y".repeat(200)}\n`)
+  workbenchStore.openFile(file, { preview: false })
+  workbenchStore.splitGroup()
+
+  await render()
+  await waitForText("yyy")
+  expect(textareas()).toHaveLength(2)
+
+  const wraps = () => textareas().map((t) => (t as unknown as TextareaRenderable).wrapMode)
+  expect(wraps()).toEqual(["word", "word"])
+
+  expect(registry!.executeCommand("editor.toggleWordWrap")).toBe(true)
+  const deadline = Date.now() + 2000
+  while (Date.now() < deadline && wraps().some((w) => w !== "none")) {
+    await testSetup!.flush()
+    await Bun.sleep(20)
+  }
+  // Both panes flip together — the setting is workbench-wide.
+  expect(wraps()).toEqual(["none", "none"])
 })
 
 test("editor.save writes the ACTIVE group's file, leaving the other pane's dirty file untouched", async () => {

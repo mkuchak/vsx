@@ -1,12 +1,11 @@
 import {
   getTreeSitterClient,
   ScrollBarRenderable,
-  SyntaxStyle,
   type MouseEvent as CoreMouseEvent,
   type ScrollBoxRenderable,
+  type SyntaxStyle,
   type TextareaAction,
   type TextareaRenderable,
-  type ThemeTokenStyle,
 } from "@opentui/core"
 import { extend, useKeyboard, useRenderer } from "@opentui/react"
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react"
@@ -17,8 +16,17 @@ import {
 } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
-import { theme } from "../theme"
-import { registerEditorControls } from "../workbench/editorControls"
+import { getFindStyleIds, getSharedSyntaxStyle, theme } from "../theme"
+import {
+  consumePendingGoto,
+  FIND_CURRENT_PRIORITY,
+  FIND_CURRENT_REF,
+  FIND_MATCH_PRIORITY,
+  FIND_MATCH_REF,
+  registerEditorControls,
+  type EditorControls,
+  type FindMatch,
+} from "../workbench/editorControls"
 import { useOverlay, useOverlayFocusRestore } from "../workbench/OverlayProvider"
 import { getLastRendererSelection } from "../workbench/rendererSelection"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
@@ -49,39 +57,18 @@ export type EditorPaneProps = {
 /** Bytes of an oversized file to show as a plain-text preview. */
 const PREVIEW_BYTES = 100 * 1024
 
-/**
- * VSCode "Dark+"-ish tree-sitter token colors. `<code>`/`<line-number>` require a
- * SyntaxStyle even for the unhighlighted fallback, so one shared instance backs both.
- */
-const SYNTAX_THEME: ThemeTokenStyle[] = [
-  { scope: ["keyword", "keyword.control", "conditional", "repeat"], style: { foreground: "#c586c0" } },
-  { scope: ["string", "string.special"], style: { foreground: "#ce9178" } },
-  { scope: ["comment"], style: { foreground: "#6a9955", italic: true } },
-  { scope: ["function", "function.call", "function.method"], style: { foreground: "#dcdcaa" } },
-  { scope: ["type", "type.builtin", "constructor"], style: { foreground: "#4ec9b0" } },
-  { scope: ["number", "constant", "constant.builtin", "boolean"], style: { foreground: "#b5cea8" } },
-  { scope: ["variable", "variable.parameter"], style: { foreground: "#9cdcfe" } },
-  { scope: ["property"], style: { foreground: "#9cdcfe" } },
-  { scope: ["operator", "punctuation", "punctuation.delimiter", "punctuation.bracket"], style: { foreground: "#d4d4d4" } },
-  { scope: ["tag"], style: { foreground: "#569cd6" } },
-  { scope: ["attribute"], style: { foreground: "#9cdcfe" } },
-]
-
-let sharedSyntaxStyle: SyntaxStyle | undefined
-function getSyntaxStyle(): SyntaxStyle {
-  if (!sharedSyntaxStyle) sharedSyntaxStyle = SyntaxStyle.fromTheme(SYNTAX_THEME)
-  return sharedSyntaxStyle
-}
-
 /** Tag shared by every highlight span we push, so a whole pass clears in one call. */
 const HIGHLIGHT_REF = 1
 /** Debounce window between an edit settling and the re-parse it triggers. */
 const HIGHLIGHT_DEBOUNCE_MS = 160
 
 /**
- * tree-sitter capture names are dotted/hierarchical (e.g. `"function.call"`) but
- * SYNTAX_THEME only registers coarse roots (`"function"`). Try the exact name,
- * then fall back to its first dot-segment; unregistered names yield `null` (skip).
+ * tree-sitter capture names are dotted/hierarchical (e.g. `"function.call"`) while
+ * the shared theme (see {@link getSharedSyntaxStyle}) registers a mix of coarse
+ * roots (`"function"`) and exact leaf names (`"markup.heading.1"`). Try the exact
+ * name, then fall back to its first dot-segment; unregistered names yield `null`
+ * (skip). Note the fallback only reaches the FIRST segment, so families that need
+ * a distinct style per leaf enumerate every emitted name in SYNTAX_THEME.
  */
 function resolveStyleId(syntaxStyle: SyntaxStyle, scopeName: string): number | null {
   const direct = syntaxStyle.getStyleId(scopeName)
@@ -105,6 +92,20 @@ const EXTRA_KEY_BINDINGS: {
   { name: "z", ctrl: true, action: "undo" },
   { name: "z", ctrl: true, shift: true, action: "redo" },
   { name: "y", ctrl: true, action: "redo" },
+  // Ctrl+A / Ctrl+E → VISUAL line home / end (custom bindings merge second, so they
+  // win over OpenTUI's defaults). macOS terminals translate cmd+left → byte 0x01
+  // (= Ctrl+A) and cmd+right → 0x05 (= Ctrl+E); without the kitty protocol they are
+  // byte-identical to the ctrl chords, so these bindings ARE what cmd+left/right run
+  // there. `visual-line-home`/`visual-line-end` go to the current visual row's
+  // start/end and stay put on repeat — VSCode Home/End-under-wrap — overriding the
+  // default `line-home`/`line-end` (whose emacs at-EOL toggle jumps ctrl+e to the
+  // next line, the "cmd+right goes to the line below" complaint). Select-all is
+  // deliberately NOT on Ctrl+A (that collision is why we reverted); it stays on the
+  // built-in super+a → Cmd+A, live once the terminal forwards super (kitty protocol).
+  { name: "a", ctrl: true, action: "visual-line-home" },
+  { name: "e", ctrl: true, action: "visual-line-end" },
+  { name: "a", ctrl: true, shift: true, action: "select-visual-line-home" },
+  { name: "e", ctrl: true, shift: true, action: "select-visual-line-end" },
 ]
 
 /**
@@ -268,7 +269,7 @@ export function EditorPane({
           <text fg={theme.warning}>File too large — showing a truncated preview</text>
         </box>
         <scrollbox ref={previewScrollRef} focused={focused} flexGrow={1}>
-          <code content={load.text} syntaxStyle={getSyntaxStyle()} />
+          <code content={load.text} syntaxStyle={getSharedSyntaxStyle()} />
         </scrollbox>
       </box>
     )
@@ -354,7 +355,7 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
           if (reqId !== highlightReqId.current) return // a newer edit won
           const editBuffer = taRef.current?.editBuffer
           if (!editBuffer) return
-          const syntaxStyle = getSyntaxStyle()
+          const syntaxStyle = getSharedSyntaxStyle()
           editBuffer.removeHighlightsByRef(HIGHLIGHT_REF)
           for (const [start, end, scopeName] of result.highlights ?? []) {
             const styleId = resolveStyleId(syntaxStyle, scopeName)
@@ -371,7 +372,7 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
   // Seed the buffer's SyntaxStyle (so pushed styleIds resolve to the same colors
   // as the read-only preview) and highlight the initial contents on mount.
   useEffect(() => {
-    taRef.current?.editBuffer.setSyntaxStyle(getSyntaxStyle())
+    taRef.current?.editBuffer.setSyntaxStyle(getSharedSyntaxStyle())
     scheduleHighlight()
     return () => {
       if (highlightTimer.current) {
@@ -610,11 +611,16 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
     queueMicrotask(() => reportCursorRef.current())
   })
 
-  // Expose this pane's cursor to the workbench chrome (Quick Open go-to-line).
-  // Native focus/scroll follow is handled on render; overlay-close focus-restore
-  // returns keyboard focus to this textarea, so gotoLine only positions the cursor.
+  // Matches last painted by the find widget, so revealMatch can select the idx-th
+  // without the widget re-sending the ranges. Lives in a ref (imperative side-channel).
+  const findMatchesRef = useRef<FindMatch[]>([])
+
+  // Expose this pane's cursor + find controls to the workbench chrome (Quick Open
+  // go-to-line, the find widget). Native focus/scroll follow is handled on render;
+  // overlay-close focus-restore returns keyboard focus to this textarea, so these
+  // only position the cursor / paint highlights.
   useEffect(() => {
-    return registerEditorControls(groupId, {
+    const controls: EditorControls = {
       gotoLine: (line, column) => {
         const ta = taRef.current
         if (!ta) return
@@ -626,8 +632,89 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
         // event, so report explicitly to keep the status bar's Ln/Col in step.
         reportCursorRef.current()
       },
-    })
-  }, [groupId])
+      getText: () => taRef.current?.plainText ?? "",
+      getSelectedText: () => {
+        const ta = taRef.current
+        return ta?.hasSelection() ? ta.getSelectedText() : ""
+      },
+      setFindMatches: (matches, currentIdx) => {
+        const ta = taRef.current
+        if (!ta) return
+        const eb = ta.editBuffer
+        const { match, current } = getFindStyleIds()
+        // Repaint from scratch each call; refs 2/3 are ours alone, so this never
+        // touches the tree-sitter syntax spans (ref 1).
+        eb.removeHighlightsByRef(FIND_MATCH_REF)
+        eb.removeHighlightsByRef(FIND_CURRENT_REF)
+        findMatchesRef.current = matches
+        for (const m of matches) {
+          eb.addHighlightByCharRange({
+            start: m.start,
+            end: m.end,
+            styleId: match,
+            hlRef: FIND_MATCH_REF,
+            priority: FIND_MATCH_PRIORITY,
+          })
+        }
+        const cur = matches[currentIdx]
+        if (cur) {
+          eb.addHighlightByCharRange({
+            start: cur.start,
+            end: cur.end,
+            styleId: current,
+            hlRef: FIND_CURRENT_REF,
+            priority: FIND_CURRENT_PRIORITY,
+          })
+        }
+      },
+      revealMatch: (idx) => {
+        const ta = taRef.current
+        const m = findMatchesRef.current[idx]
+        if (!ta || !m) return
+        // Selecting the match parks the caret on it, so Esc (which restores focus
+        // here) lands the caret at the current match — VSCode's behavior.
+        ta.setSelection(m.start, m.end)
+        // The find input holds native focus, so the buffer's caret-follow won't
+        // scroll for us; nudge the viewport explicitly. The viewport (offsetY /
+        // height) and setViewport work in VISUAL/virtual rows — the same units
+        // syncScrollbars mirrors onto the scrollbars — while offsetToPosition
+        // returns a LOGICAL row (newline-split, no wrap concept). Under word wrap
+        // (the default) the two diverge, so the logical row MUST be mapped to its
+        // visual row before comparing; comparing raw logical rows scrolled the
+        // wrong direction whenever wrapped lines sat above the match.
+        const pos = ta.editBuffer.offsetToPosition(m.start)
+        if (!pos) return
+        const view = ta.editorView
+        // getLogicalLineInfo() spans the WHOLE document (it is the source
+        // syncScrollbars reads for the scrollbar sizes); lineSources[v] is the
+        // logical line of visual row v, so the first v with that source is the
+        // match's visual row. Wrap-off yields an identity mapping, so this stays
+        // correct in both wrap modes; -1 (info unavailable) falls back to logical.
+        const visualRow = view.getLogicalLineInfo().lineSources.indexOf(pos.row)
+        const targetRow = visualRow === -1 ? pos.row : visualRow
+        const vp = view.getViewport()
+        if (targetRow < vp.offsetY || targetRow >= vp.offsetY + vp.height) {
+          const maxOffset = Math.max(0, view.getTotalVirtualLineCount() - vp.height)
+          const targetY = Math.min(Math.max(0, targetRow - Math.floor(vp.height / 2)), maxOffset)
+          view.setViewport(vp.offsetX, targetY, vp.width, vp.height, false)
+        }
+      },
+      clearFind: () => {
+        findMatchesRef.current = []
+        const ta = taRef.current
+        if (!ta) return
+        ta.editBuffer.removeHighlightsByRef(FIND_MATCH_REF)
+        ta.editBuffer.removeHighlightsByRef(FIND_CURRENT_REF)
+      },
+    }
+    const dispose = registerEditorControls(groupId, controls)
+    // A file just opened by the Search view (or any async opener) stashed a
+    // reveal target keyed by this doc's path; now that the editor is mounted,
+    // drain it and jump to the match. Nothing pending → a normal open.
+    const pending = consumePendingGoto(doc.uri)
+    if (pending) controls.gotoLine(pending.line, pending.column)
+    return dispose
+  }, [groupId, doc.uri])
 
   // Distinguishes single/double/triple clicks. A gesture continues only when the
   // pointer lands on the same cell (row exact, col within ±1) within MULTI_CLICK_MS;

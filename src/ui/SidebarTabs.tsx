@@ -1,14 +1,16 @@
 import { Fragment } from "react"
 import { theme } from "../theme"
 
-export type SidebarView = "explorer" | "scm" | "history"
+export type SidebarView = "explorer" | "scm" | "search" | "history"
 
-// Concise labels so the three tabs plus separators fit the default 32-col
-// sidebar; at narrower widths the row clips rather than wrapping (height is
-// pinned to 1). "SCM"/"Commits" abbreviate "Source Control"/"History".
+// Concise labels so all FOUR tabs plus separators fit the default 32-col sidebar;
+// at narrower widths the row clips rather than wrapping (height is pinned to 1).
+// "SCM"/"Commits" abbreviate "Source Control"/"History". Only a single leading pad
+// per tab (no trailing pad) is used so the four labels + separators stay ≤ 32.
 const TABS: { view: SidebarView; label: string }[] = [
   { view: "explorer", label: "Explorer" },
   { view: "scm", label: "SCM" },
+  { view: "search", label: "Search" },
   { view: "history", label: "Commits" },
 ]
 
@@ -40,7 +42,6 @@ export function SidebarTabs({
             {i > 0 && <text fg={theme.border}>│</text>}
             <box
               paddingLeft={1}
-              paddingRight={1}
               backgroundColor={isActive ? theme.selectionBackground : theme.sidebarBackground}
               onMouseDown={() => onSelect(tab.view)}
             >

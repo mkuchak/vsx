@@ -551,6 +551,43 @@ test("applies highlights, falling back on dotted scopes and skipping unresolved 
   expect(spy.added.every((h) => h.hlRef === 1)).toBe(true)
 })
 
+test("resolves the markup and extended Dark+ scopes added for the new grammars", async () => {
+  // Scopes markdown/html/json/yaml grammars emit that the pre-centralization theme
+  // did NOT cover: enumerated markup.* (a heading level, strong, a link variant)
+  // plus variable.member / label / string.special.key. All must now resolve to a
+  // styleId; a genuinely unregistered scope must still be skipped.
+  const highlights: SimpleHighlight[] = [
+    [0, 1, "markup.heading.1"],
+    [2, 3, "markup.strong"],
+    [4, 5, "markup.link.url"],
+    [6, 7, "variable.member"],
+    [8, 9, "label"],
+    [10, 11, "string.special.key"],
+    [12, 13, "totally.unknown"], // control: root not registered → skipped
+  ]
+  mockHighlightOnce(async () => ({ highlights }))
+
+  const file = join(dir, "coverage.md")
+  await writeFile(file, "abcdefghijklmnop\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("abcdef")
+
+  const spy = spyOnHighlights()
+
+  // Trigger a fresh debounced pass and let it settle.
+  await testSetup.mockInput.typeText("x")
+  await testSetup.flush()
+  await Bun.sleep(300)
+  await testSetup.flush()
+
+  // Every newly-covered scope applied; only the unregistered control was skipped.
+  const starts = spy.added.map((h) => h.start).sort((a, b) => a - b)
+  expect(starts).toEqual([0, 2, 4, 6, 8, 10])
+  expect(spy.added.every((h) => typeof h.styleId === "number")).toBe(true)
+})
+
 test("a rapid burst of edits settles on the FINAL text, ignoring stale results", async () => {
   // Hand out manually-resolved promises so we can force out-of-order resolution:
   // an earlier (stale) request resolving AFTER a newer one must not win.
@@ -811,6 +848,82 @@ test("double-click selects the word and typing replaces it", async () => {
   await testSetup.mockInput.typeText("Z")
   await testSetup.flush()
   expect(documentRegistry.get(file)!.getText()).toBe("hello Z\n")
+})
+
+test("Ctrl+A goes to the start of the current VISUAL line (not select-all), staying put on repeat", async () => {
+  const file = join(dir, "vlh.ts")
+  // Line 0 is short (no wrap); line 1 is long enough to wrap into several visual rows.
+  await writeFile(file, `hello world\n${"word ".repeat(40).trim()}\n`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("hello world")
+
+  const ta = getTextarea()
+
+  // --- non-wrapped line: mid-line Ctrl+A → line start, no selection (not select-all) ---
+  ta.setCursor(0, 6)
+  await testSetup.flush()
+  // pressKey ctrl+a emits raw byte 0x01 — exactly what a macOS terminal translates
+  // cmd+left into, so this is the true cmd+left path (no kitty protocol).
+  testSetup.mockInput.pressKey("a", { ctrl: true })
+  await testSetup.flush()
+  expect(ta.editorView.getCursor()).toEqual({ row: 0, col: 0 })
+  expect(ta.hasSelection()).toBe(false)
+
+  // Repeat is a no-op — it stays at the visual-row start (VSCode Home-under-wrap).
+  testSetup.mockInput.pressKey("a", { ctrl: true })
+  await testSetup.flush()
+  expect(ta.editorView.getCursor()).toEqual({ row: 0, col: 0 })
+
+  // --- wrapped line: Ctrl+A → start of the CURRENT visual row, not logical col 0 ---
+  ta.setCursor(1, 190) // deep in a later visual segment of the wrapped line
+  await testSetup.flush()
+  testSetup.mockInput.pressKey("a", { ctrl: true })
+  await testSetup.flush()
+  const c = ta.editorView.getCursor()
+  expect(c.row).toBe(1) // stayed on the same logical line
+  expect(c.col).toBeGreaterThan(0) // NOT the logical line home (col 0)
+  expect(c.col).toBeLessThan(190) // moved back to this visual row's start
+})
+
+test("Ctrl+E goes to the end of the current VISUAL line, staying put and never advancing to the next line", async () => {
+  const file = join(dir, "vle.ts")
+  await writeFile(file, `hello\n${"word ".repeat(40).trim()}\n`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("hello")
+
+  const ta = getTextarea()
+
+  // --- non-wrapped line: Ctrl+E → end of line 0 ("hello" → col 5) ---
+  ta.setCursor(0, 0)
+  await testSetup.flush()
+  // pressKey ctrl+e emits raw byte 0x05 — the byte a macOS terminal translates
+  // cmd+right into.
+  testSetup.mockInput.pressKey("e", { ctrl: true })
+  await testSetup.flush()
+  expect(ta.editorView.getCursor()).toEqual({ row: 0, col: 5 })
+
+  // The key regression: at end-of-line, a second Ctrl+E must NOT advance to the
+  // next line (OpenTUI's default line-end has that emacs at-EOL jump; visual-line-end
+  // does not).
+  testSetup.mockInput.pressKey("e", { ctrl: true })
+  await testSetup.flush()
+  expect(ta.editorView.getCursor()).toEqual({ row: 0, col: 5 })
+
+  // --- wrapped line: Ctrl+E from an early visual segment → that segment's end,
+  // still on the same logical line and short of the logical line end. ---
+  const lineLen = "word ".repeat(40).trim().length
+  ta.setCursor(1, 20) // an early visual segment (not the last)
+  await testSetup.flush()
+  testSetup.mockInput.pressKey("e", { ctrl: true })
+  await testSetup.flush()
+  const c = ta.editorView.getCursor()
+  expect(c.row).toBe(1) // did NOT advance to the next logical line
+  expect(c.col).toBeGreaterThan(20) // moved forward to this visual row's end
+  expect(c.col).toBeLessThan(lineLen) // a visual-row end, NOT the logical line end
 })
 
 test("triple-click selects the whole line including its trailing newline", async () => {

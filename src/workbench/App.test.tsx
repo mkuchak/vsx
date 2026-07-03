@@ -42,16 +42,38 @@ async function waitForTextGone(text: string, timeoutMs = 4000) {
   throw new Error(`timed out waiting for "${text}" to disappear\n${testSetup.captureCharFrame()}`)
 }
 
+// Flush pending effects AND the render(s) they cascade into. A single flush()
+// reveals freshly-painted output, but an effect that calls setState (e.g.
+// ModalProvider reporting an overlay open into OverlayProvider, which re-renders
+// App to arm its Esc-gate ref) only drains on a subsequent pass. Several passes
+// settle the whole chain deterministically, even on a cold first render.
+async function drainEffects(passes = 6) {
+  for (let i = 0; i < passes; i++) {
+    await testSetup.flush()
+    await Bun.sleep(20)
+  }
+}
+
 // Open Source Control, select the sole modified file's group, and press 'x' to
 // raise the discard dialog. Returns once the confirm prompt is on screen.
 async function openDiscardDialog() {
   testSetup.mockInput.pressKey("g", { ctrl: true, shift: true })
-  await waitForText("SOURCE CONTROL")
-  await waitForText("hello.ts")
+  // Switching to SCM mounts ScmPanel, which discovers repos and shells out to
+  // `git status`; that subprocess is slowest on a cold first render. Gate on the
+  // "Changes" group HEADER, not "hello.ts": callers that also open the file put
+  // "hello.ts" in the editor tab bar, so that substring can match the tab and
+  // return before the async status has produced the discardable row — pressing
+  // 'x' then no-ops and the dialog never appears. The header only renders once a
+  // changed file exists, so it reliably means the row (and selection) are ready.
+  await waitForText("SOURCE CONTROL", 8000)
+  await waitForText("Changes", 8000)
+  // Let the panel's keyboard handler + initial selection settle so 'x' isn't
+  // dispatched into a still-mounting frame and dropped.
+  await drainEffects()
   // First selectable row is the "Changes" group (one file); 'x' discards it,
   // which for a single-file group renders the single-file discard prompt.
   testSetup.mockInput.pressKey("x")
-  await waitForText("discard changes in 'hello.ts'")
+  await waitForText("discard changes in 'hello.ts'", 8000)
 }
 
 beforeEach(async () => {
@@ -345,14 +367,23 @@ test("cancelling a discard dialog with Esc does not flip sidebar focus into the 
   await settle(testSetup)
 
   await openDiscardDialog()
-  testSetup.mockInput.pressEscape()
-  await waitForTextGone("discard changes in 'hello.ts'")
-  await settle(testSetup, 150)
+  // openDiscardDialog returns as soon as the confirm TEXT paints — but the dialog
+  // reports itself into the shared overlay-open signal via an effect that then
+  // cascades one more render into App's Esc-gate ref (overlayOpenRef). Drain that
+  // cascade before pressing Esc; otherwise, on a cold/slow render the App-level
+  // Esc handler runs ungated and flips sidebar→editor focus. Nothing in this test
+  // restores it, so that flip is permanent (the exact cold-run failure observed).
+  await drainEffects()
 
-  // The dialog's own Esc cancels it; the App-level Esc must NOT also flip focus
-  // sidebar→editor (which would surface the cursor in the status bar).
+  testSetup.mockInput.pressEscape()
+  await waitForTextGone("discard changes in 'hello.ts'", 8000)
+  await drainEffects()
+
+  // The dialog's own Esc cancels it; with the App-level Esc correctly suppressed
+  // while the overlay owned the screen, logical focus stays on the sidebar and the
+  // status bar shows no cursor.
   expect(statusShowsCursor()).toBe(false)
-})
+}, 15000)
 
 /** Every editor textarea currently mounted, left-to-right (both split panes share the id). */
 function editorTextareas(): { focused: boolean }[] {
@@ -448,19 +479,39 @@ function headerLabelRed(label: string): number {
   return span.fg.toInts()[0]
 }
 
-test("sidebar header shows all three activity tabs with Explorer active by default", async () => {
+test("sidebar header shows all four activity tabs with Explorer active by default", async () => {
   testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
   await settle(testSetup)
 
   const line0 = testSetup.captureCharFrame().split("\n")[0]
   expect(line0).toContain("Explorer")
   expect(line0).toContain("SCM")
+  expect(line0).toContain("Search")
   expect(line0).toContain("Commits")
 
-  // Explorer is the boot view → accent (bright); the other two are dimmed.
+  // Explorer is the boot view → accent (bright); the other three are dimmed.
   expect(headerLabelRed("Explorer")).toBeGreaterThan(200)
   expect(headerLabelRed("SCM")).toBeLessThan(200)
+  expect(headerLabelRed("Search")).toBeLessThan(200)
   expect(headerLabelRed("Commits")).toBeLessThan(200)
+})
+
+test("Ctrl+Shift+F focuses the Search view and un-collapses the sidebar", async () => {
+  testSetup = await testRender(<App workspaceRoot={root} />, {
+    width: 100,
+    height: 30,
+    kittyKeyboard: true,
+  })
+  await settle(testSetup)
+
+  testSetup.mockInput.pressKey("f", { ctrl: true, shift: true })
+  await settle(testSetup)
+
+  // The regex toggle cell (".*") is unique to the Search panel body, proving it
+  // rendered (not just the tab), and the Search tab is now the accented one.
+  expect(testSetup.captureCharFrame()).toContain(".*")
+  expect(headerLabelRed("Search")).toBeGreaterThan(200)
+  expect(headerLabelRed("Explorer")).toBeLessThan(200)
 })
 
 test("clicking the SCM tab switches to Source Control and highlights that tab", async () => {

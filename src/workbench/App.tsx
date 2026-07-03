@@ -3,6 +3,8 @@ import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useCallback, useEffect, useRef, useState } from "react"
 import { workbenchStore } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
+import { withMacSuper } from "../services/commands"
+import { KeyInspector } from "../services/keyInspector"
 import { getLastRendererSelection, handleRendererSelection } from "./rendererSelection"
 import { activeRepoFor, discoverRepositories, type RepoInfo } from "../services/repos"
 import { theme } from "../theme"
@@ -18,6 +20,8 @@ import { CommitLog } from "../ui/CommitLog"
 import { EditorGroups } from "../ui/EditorGroups"
 import type { CursorPosition } from "../ui/EditorPane"
 import { FileTree } from "../ui/FileTree"
+import { FindWidget } from "../ui/FindWidget"
+import { SearchPanel } from "../ui/SearchPanel"
 import { QuickInput } from "../ui/QuickInput"
 import { ScmPanel } from "../ui/ScmPanel"
 import { SidebarFooter } from "../ui/SidebarFooter"
@@ -33,12 +37,15 @@ import { StatusBar } from "../ui/StatusBar"
  * — opening a file/diff moves keyboard focus into the editor; Esc from the
  * sidebar returns focus to the editor.
  */
-export function App({ workspaceRoot = process.cwd() }: { workspaceRoot?: string } = {}) {
+export function App({
+  workspaceRoot = process.cwd(),
+  initialFile,
+}: { workspaceRoot?: string; initialFile?: string } = {}) {
   return (
     <CommandsProvider>
       <OverlayProvider>
         <WatchersProvider workspaceRoot={workspaceRoot}>
-          <Workbench workspaceRoot={workspaceRoot} />
+          <Workbench workspaceRoot={workspaceRoot} initialFile={initialFile} />
         </WatchersProvider>
       </OverlayProvider>
     </CommandsProvider>
@@ -61,7 +68,7 @@ function editorTextareaOwnsClipboard(renderer: { currentFocusedRenderable: { id?
   return renderer.currentFocusedRenderable?.id === EDITOR_TEXTAREA_ID
 }
 
-function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
+function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; initialFile?: string }) {
   const renderer = useRenderer()
   const commands = useCommands()
   const { isOverlayOpen } = useOverlay()
@@ -155,6 +162,15 @@ function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
   // (and diff panes reading the live file) keep their unsaved edits alive.
   useEffect(() => startDocumentRetainer(), [])
 
+  // `vsx <file>` opens that file on boot as a permanent tab (matching `code
+  // <file>`); openFile also activates it and moves focus into the editor.
+  // Mount-once: the CLI arg is fixed for the session, so re-running on prop
+  // change would reopen it after the user closed the tab.
+  useEffect(() => {
+    if (initialFile) workbenchStore.openFile(initialFile, { preview: false })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // Copy-on-select + Ctrl+C fallback cache for renderer-level selections. The
   // renderer emits `selection` on mouse-up with the finished drag — the only
   // signal for surfaces with no edit buffer (diff pane, commit log, SCM panel,
@@ -208,28 +224,35 @@ function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
         id: "workbench.focusExplorer",
         title: "Show Explorer",
         category: "View",
-        keybinding: "ctrl+shift+e",
+        keybinding: withMacSuper("ctrl+shift+e"),
         run: () => focusView("explorer"),
       }),
       commands.registerCommand({
         id: "workbench.focusScm",
         title: "Show Source Control",
         category: "View",
-        keybinding: "ctrl+shift+g",
+        keybinding: withMacSuper("ctrl+shift+g"),
         run: () => focusView("scm"),
+      }),
+      commands.registerCommand({
+        id: "workbench.focusSearch",
+        title: "Show Search",
+        category: "View",
+        keybinding: withMacSuper("ctrl+shift+f"),
+        run: () => focusView("search"),
       }),
       commands.registerCommand({
         id: "workbench.focusHistory",
         title: "Show History",
         category: "View",
-        keybinding: "ctrl+shift+h",
+        keybinding: withMacSuper("ctrl+shift+h"),
         run: () => focusView("history"),
       }),
       commands.registerCommand({
         id: "workbench.toggleSidebar",
         title: "Toggle Sidebar Visibility",
         category: "View",
-        keybinding: "ctrl+b",
+        keybinding: withMacSuper("ctrl+b"),
         run: toggleSidebar,
       }),
     ]
@@ -237,6 +260,34 @@ function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
       for (const dispose of disposers) dispose()
     }
   }, [commands, focusView, toggleSidebar])
+
+  // Developer: Toggle Key Inspector — a palette-only command that flips a
+  // keypress logger + the console overlay so a user can see, live, exactly which
+  // modifier bits (super/option/…) their terminal+tmux actually delivers. The
+  // inspector is stable across renders (ref) so toggle state survives; unmount
+  // tears down the subscription so no listener leaks.
+  const keyInspectorRef = useRef<KeyInspector | null>(null)
+  useEffect(() => {
+    const inspector = (keyInspectorRef.current ??= new KeyInspector({
+      source: renderer.keyInput,
+      // Drive the console overlay from the inspector's OWN state rather than
+      // toggling it: toggle() assumes exclusive ownership and would HIDE a
+      // console shown some other way. `active` is already the post-transition
+      // value when this fires (enable/disable set it before calling back).
+      toggleConsole: () =>
+        keyInspectorRef.current?.active ? renderer.console.show() : renderer.console.hide(),
+    }))
+    const dispose = commands.registerCommand({
+      id: "developer.toggleKeyInspector",
+      title: "Developer: Toggle Key Inspector",
+      category: "Developer",
+      run: () => inspector.toggle(),
+    })
+    return () => {
+      dispose()
+      inspector.disable()
+    }
+  }, [commands, renderer])
 
   // Esc moves focus from the sidebar into the editor's active tab (opening a
   // file/diff does the same); the editor→sidebar direction is driven by the
@@ -317,6 +368,8 @@ function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
                       onOpenFile={(path) => openFile(path, { preview: true })}
                       onOpenDiff={openDiff}
                     />
+                  ) : sidebarView === "search" ? (
+                    <SearchPanel workspaceRoot={workspaceRoot} focused={sidebarFocused} />
                   ) : (
                     <CommitLog workspaceRoot={workspaceRoot} focused={sidebarFocused} />
                   )}
@@ -331,12 +384,15 @@ function Workbench({ workspaceRoot }: { workspaceRoot: string }) {
               />
             </>
           )}
-          <box flexDirection="column" flexGrow={1} height="100%">
+          {/* position:relative so the find bar's absolute placement is scoped to
+              the editor column (top-right of the editor area, not the whole app). */}
+          <box position="relative" flexDirection="column" flexGrow={1} height="100%">
             <EditorGroups
               editorFocused={editorFocused}
               onCursorChange={editorFocused ? setCursor : undefined}
               containerWidth={sidebarCollapsed ? termWidth : Math.max(1, termWidth - sidebarWidth - 1)}
             />
+            <FindWidget />
           </box>
         </box>
         <StatusBar

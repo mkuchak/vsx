@@ -4,7 +4,15 @@ A VSCode-like code editor for the terminal, built on [OpenTUI](https://github.co
 
 File explorer, tabs, an editable buffer with live syntax highlighting, a VSCode-style Source Control panel (stage/unstage/discard/commit) with a collapsible directory tree, before/after diffs, a linear commit log with per-commit details, find-in-file (`Ctrl+F`) and workspace text search (`Ctrl+Shift+F`), `Ctrl+P` fuzzy file finder doubling as a command palette, and side-by-side split editing.
 
-## Install & run
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mkuchak/vsx/main/install.sh | bash
+```
+
+Works on macOS and Linux; it installs the latest release, checks that [Bun](https://bun.sh) is present (installing it if not), and symlinks a `vsx` command onto your `PATH`. Run the same command again any time to update to the newest release — it no-ops when you're already current. (Until this repository goes public, the raw URL and GitHub release API require a token, so clone and run `bash install.sh` locally in the meantime; no tokens are ever baked into the script.)
+
+### From source
 
 ```bash
 bun install

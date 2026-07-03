@@ -32,16 +32,16 @@ test("a relative arg is resolved against cwd to an absolute path", async () => {
 test("a nonexistent path returns an error result", () => {
   const missing = join(tmpdir(), "vsx-does-not-exist-xyz-123")
   const result = resolveWorkspaceArg(argv(missing), tmpdir())
-  expect(result).toEqual({ error: `vsx: not a directory: ${missing}` })
+  expect(result).toEqual({ error: `vsx: no such file or directory: ${missing}` })
 })
 
-test("a path that is a file (not a directory) returns an error result", async () => {
+test("a path that is a file opens it with its parent directory as the root", async () => {
   const dir = await mkdtemp(join(tmpdir(), "vsx-cli-"))
   try {
     const file = join(dir, "hello.ts")
     await writeFile(file, "x")
     const result = resolveWorkspaceArg(argv(file), tmpdir())
-    expect(result).toEqual({ error: `vsx: not a directory: ${file}` })
+    expect(result).toEqual({ root: dir, file })
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
@@ -104,6 +104,61 @@ test("App renders and opens files under a non-cwd workspace root", async () => {
 
     expect(testSetup.captureCharFrame()).toContain("greeting")
     expect(documentRegistry.get(join(root, "hello.ts"))?.language).toBe("typescript")
+  } finally {
+    if (testSetup) testSetup.renderer.destroy()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// Boot threading: `vsx <file>` resolves to { root, file }; App opens `file` in a
+// mount-once effect as a permanent (non-preview), active tab with editor focus —
+// matching `code <file>`. The file's content must be visible without any input.
+test("App with initialFile opens that file as an active, permanent tab on boot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "vsx-cli-file-"))
+  const file = join(root, "hello.ts")
+  let testSetup: Awaited<ReturnType<typeof testRender>> | undefined
+  try {
+    await writeFile(file, "const greeting = 'hi'\n")
+    workbenchStore.reset()
+
+    testSetup = await testRender(<App workspaceRoot={root} initialFile={file} />, {
+      width: 100,
+      height: 30,
+    })
+    await Bun.sleep(400)
+    await testSetup.renderOnce()
+
+    const state = workbenchStore.getState()
+    const group = state.groups.find((g) => g.id === state.activeGroupId)!
+    const tab = group.tabs.find((t) => t.path === file)
+    expect(tab).toBeDefined()
+    expect(tab?.preview).toBe(false)
+    expect(group.activeTabPath).toBe(file)
+    expect(state.focusArea).toBe("editor")
+    expect(testSetup.captureCharFrame()).toContain("greeting")
+  } finally {
+    if (testSetup) testSetup.renderer.destroy()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+// Control: without initialFile, boot opens no tab — the workbench starts empty on
+// the Explorer, exactly as `vsx <dir>` / `vsx` does today.
+test("App without initialFile opens no tab on boot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "vsx-cli-nofile-"))
+  let testSetup: Awaited<ReturnType<typeof testRender>> | undefined
+  try {
+    await writeFile(join(root, "hello.ts"), "const greeting = 'hi'\n")
+    workbenchStore.reset()
+
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    await Bun.sleep(400)
+    await testSetup.renderOnce()
+
+    const state = workbenchStore.getState()
+    const group = state.groups.find((g) => g.id === state.activeGroupId)!
+    expect(group.tabs).toHaveLength(0)
+    expect(group.activeTabPath).toBeNull()
   } finally {
     if (testSetup) testSetup.renderer.destroy()
     await rm(root, { recursive: true, force: true })

@@ -1,0 +1,147 @@
+# CI, release, and artifact publishing for vsx.
+#
+# On every push to main: run CI, cut a versioned release via release-it
+# (conventional-changelog notes), build the runtime-package tarball, and attach
+# it to the GitHub Release.
+#
+# Loop guard: the release commit release-it creates is `chore(release): v<x>
+# [skip ci]`. GitHub natively honors `[skip ci]` and won't start a workflow for
+# it, so the release doesn't retrigger itself. The `if:` on the `release` job is
+# belt-and-suspenders in case a future commit-message tweak drops `[skip ci]`.
+#
+# Why `build` is a job HERE and not a separate `on: release` workflow: release-it
+# pushes its commit + tag using the default GITHUB_TOKEN, and commits/tags pushed
+# with GITHUB_TOKEN do NOT cascade — they never retrigger `push` or `release`
+# workflows. So the only reliable way to build against the just-cut tag is to
+# continue in this same run.
+#
+# Private-repo caveat: this repo is private today and will open later. Nothing in
+# THIS file depends on public access (the installer one-liner / release-asset URLs
+# 404 until the repo is public, but that lives in the README/installer, not here).
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Queue stacked pushes instead of racing the version bump — two concurrent
+# release-it runs would fight over the tag/commit. Never cancel an in-flight
+# release midway (a half-done tag/release is worse than waiting).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Pin Bun to the repo's local toolchain version (matches `bun --version`) so CI
+  # and releases build with the exact runtime developers use — no silent drift
+  # from setup-bun's floating "latest".
+  BUN_VERSION: 1.2.3
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    # Backstop for a known hang mode: a synchronous JS spin can block bun:test's
+    # own per-test timeouts, so the job timeout is the real ceiling.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bunx tsc --noEmit
+      # Single `bun test` invocation only — do NOT shard or run multiple test
+      # processes in parallel.
+      - name: Test
+        run: bun test
+
+  release:
+    name: Release
+    needs: ci
+    runs-on: ubuntu-latest
+    # Skip the release commit itself (belt-and-suspenders alongside [skip ci]).
+    if: ${{ !contains(github.event.head_commit.message, 'chore(release)') }}
+    permissions:
+      # release-it pushes a commit + tag and creates the GitHub Release.
+      contents: write
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release-it + conventional-changelog need full history and all tags to
+          # compute the next version and generate notes.
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Run release-it
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          before="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
+          # .release-it.json sets git.requireCommits, which makes release-it FAIL
+          # when there are no commits since the last tag. Gate on the commit count
+          # so an empty push (e.g. a re-run) skips cleanly instead of failing.
+          if [ -n "$before" ]; then
+            count="$(git rev-list "$before"..HEAD --count)"
+          else
+            count="$(git rev-list HEAD --count)"
+          fi
+          if [ "$count" -eq 0 ]; then
+            echo "No commits since ${before:-repo start} — nothing to release."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          bun run release
+          # Detect whether a new tag actually landed rather than trusting exit code
+          # alone — this is what `build` keys off of.
+          after="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
+          if [ -n "$after" ] && [ "$after" != "$before" ]; then
+            echo "Released $after"
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$after" >> "$GITHUB_OUTPUT"
+          else
+            echo "No new tag was created."
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build & attach artifacts
+    needs: release
+    runs-on: ubuntu-latest
+    # Only when a release was actually cut. When nothing is releasable this is
+    # skipped (not failed).
+    if: ${{ needs.release.outputs.released == 'true' }}
+    permissions:
+      # Needed to upload assets onto the release.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Build against the tag release-it just pushed. GITHUB_TOKEN pushes don't
+          # retrigger workflows, so this same run must check out and build it.
+          ref: ${{ needs.release.outputs.tag }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      # Produces a single platform-independent tarball (dist/vsx-<version>.tar.gz)
+      # plus dist/SHA256SUMS — see scripts/BUILD_NOTES.md. No per-platform matrix:
+      # node_modules is not shipped, so one ubuntu build serves every target.
+      - name: Build release artifact
+        run: bun run build:release
+      - name: Attach artifacts to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.release.outputs.tag }}" dist/* --clobber

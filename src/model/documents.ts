@@ -31,6 +31,9 @@ const LANGUAGE_BY_EXTENSION: Record<string, string> = {
   json: "json",
   html: "html",
   css: "css",
+  yaml: "yaml",
+  yml: "yaml",
+  toml: "toml",
   md: "markdown",
   sh: "bash",
 }

@@ -1,8 +1,4 @@
-import {
-  SyntaxStyle,
-  type ScrollBoxRenderable,
-  type ThemeTokenStyle,
-} from "@opentui/core"
+import { type ScrollBoxRenderable } from "@opentui/core"
 import { useKeyboard } from "@opentui/react"
 import { createTwoFilesPatch, parsePatch } from "diff"
 import { relative } from "node:path"
@@ -10,7 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { detectLanguage, documentRegistry } from "../model/documents"
 import type { CommitDiffTab, DiffTab } from "../model/workbench"
 import { GitService } from "../services/git"
-import { theme } from "../theme"
+import { getSharedSyntaxStyle, theme } from "../theme"
 import { useOverlay, useOverlayFocusRestore } from "../workbench/OverlayProvider"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
 import { useWorkbenchWatchers } from "../workbench/watchers"
@@ -19,27 +15,6 @@ type DiffView = "unified" | "split"
 
 /** Last-used view mode, persisted across re-opens within the session only. */
 let lastView: DiffView = "split"
-
-/** Mirrors EditorPane's Dark+-ish token colors; the `<diff>` needs one to highlight. */
-const SYNTAX_THEME: ThemeTokenStyle[] = [
-  { scope: ["keyword", "keyword.control", "conditional", "repeat"], style: { foreground: "#c586c0" } },
-  { scope: ["string", "string.special"], style: { foreground: "#ce9178" } },
-  { scope: ["comment"], style: { foreground: "#6a9955", italic: true } },
-  { scope: ["function", "function.call", "function.method"], style: { foreground: "#dcdcaa" } },
-  { scope: ["type", "type.builtin", "constructor"], style: { foreground: "#4ec9b0" } },
-  { scope: ["number", "constant", "constant.builtin", "boolean"], style: { foreground: "#b5cea8" } },
-  { scope: ["variable", "variable.parameter"], style: { foreground: "#9cdcfe" } },
-  { scope: ["property"], style: { foreground: "#9cdcfe" } },
-  { scope: ["operator", "punctuation", "punctuation.delimiter", "punctuation.bracket"], style: { foreground: "#d4d4d4" } },
-  { scope: ["tag"], style: { foreground: "#569cd6" } },
-  { scope: ["attribute"], style: { foreground: "#9cdcfe" } },
-]
-
-let sharedSyntaxStyle: SyntaxStyle | undefined
-function getSyntaxStyle(): SyntaxStyle {
-  if (!sharedSyntaxStyle) sharedSyntaxStyle = SyntaxStyle.fromTheme(SYNTAX_THEME)
-  return sharedSyntaxStyle
-}
 
 function basename(path: string): string {
   const i = path.lastIndexOf("/")
@@ -403,7 +378,7 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
             showLineNumbers
             syncScroll
             filetype={detectLanguage(tab.filePath)}
-            syntaxStyle={getSyntaxStyle()}
+            syntaxStyle={getSharedSyntaxStyle()}
             addedBg={theme.diffAddedBackground}
             removedBg={theme.diffRemovedBackground}
             addedLineNumberBg={theme.diffAddedGutterBackground}

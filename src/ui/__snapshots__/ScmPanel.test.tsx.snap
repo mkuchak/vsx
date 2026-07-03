@@ -4,14 +4,14 @@ exports[`groups merge, staged, changes, and untracked files with counts 1`] = `
 " SOURCE CONTROL                             
 Message (Enter to commit)                   
 [Enter] Commit                              
- Merge Changes                          (1) 
-  conflict.txt                            ! 
+ Merge Changes                       + ↶(1) 
+    conflict.txt                          ! 
  Staged Changes                         (1) 
-  added.txt                               A 
+    added.txt                             A 
  Changes                                (1) 
-  tracked.txt                             M 
+    tracked.txt                           M 
  Untracked Changes                      (1) 
-  untracked.txt                           U 
+    untracked.txt                         U 
                                             
                                             
                                             

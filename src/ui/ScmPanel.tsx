@@ -1,7 +1,7 @@
 import { useKeyboard } from "@opentui/react"
 import type { ScrollBoxRenderable } from "@opentui/core"
 import { join } from "node:path"
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { gitStatusColor, theme } from "../theme"
 import type { FileStatus, StatusResult } from "../services/git"
 import {
@@ -10,6 +10,7 @@ import {
   type RepoInfo,
 } from "../services/repos"
 import * as trash from "../services/trash"
+import { withMacSuper } from "../services/commands"
 import { documentRegistry } from "../model/documents"
 import { useCommands } from "../workbench/CommandsProvider"
 import { useConfirm, type ConfirmOptions } from "../workbench/ModalProvider"
@@ -37,66 +38,220 @@ const GROUPS = [
   label: string
 }>
 
-type SelRow =
-  | {
-      type: "group"
-      id: string
-      repoRoot: string
-      group: GroupKey
-      label: string
-      files: FileStatus[]
-    }
-  | {
-      type: "file"
-      id: string
-      repoRoot: string
-      group: GroupKey
-      file: FileStatus
-      files: FileStatus[]
-    }
+// Rendering one Renderable per file row costs ~13ms, so an unignored directory
+// (a stray node_modules/dist) that makes `git status -uall` enumerate thousands
+// of untracked files would freeze the whole panel. Two bounds keep it instant:
+//   - MAX_RENDERED_GROUP_ROWS caps the rows actually painted per group; the
+//     overflow collapses into one "…and N more" row (header still shows the true
+//     total). This is the hard safety net regardless of tree shape.
+//   - COLLAPSE_THRESHOLD flips a group's directories to collapsed-by-default once
+//     it's huge, so a deep tree shows only its top level until the user expands.
+const MAX_RENDERED_GROUP_ROWS = 200
+const COLLAPSE_THRESHOLD = 500
+
+type GroupRow = {
+  type: "group"
+  id: string
+  repoRoot: string
+  group: GroupKey
+  label: string
+  files: FileStatus[]
+}
+
+type DirRow = {
+  type: "dir"
+  id: string
+  repoRoot: string
+  group: GroupKey
+  dirPath: string
+  name: string
+  depth: number
+  expanded: boolean
+  files: FileStatus[] // every changed file beneath this directory
+}
+
+type FileRow = {
+  type: "file"
+  id: string
+  repoRoot: string
+  group: GroupKey
+  name: string
+  depth: number
+  file: FileStatus
+  files: FileStatus[]
+}
+
+// A trailing informational row shown when a group's rendered rows are capped.
+// It is selectable (so keyboard nav can reach it) but carries no files, so every
+// action no-ops on it.
+type MoreRow = {
+  type: "more"
+  id: string
+  repoRoot: string
+  group: GroupKey
+  hiddenCount: number
+}
+
+type SelRow = GroupRow | DirRow | FileRow | MoreRow
 
 function basename(path: string): string {
   const i = path.lastIndexOf("/")
   return i === -1 ? path : path.slice(i + 1)
 }
 
-function splitPath(path: string): { name: string; dir: string } {
-  const i = path.lastIndexOf("/")
-  return i === -1
-    ? { name: path, dir: "" }
-    : { name: path.slice(i + 1), dir: path.slice(0, i) }
+// A file row targets its one file; a directory row targets every changed file
+// beneath it; a group header targets the whole group; the "more" row targets
+// nothing. The stage/unstage/discard primitives all take FileStatus[], so one
+// call shape serves keyboard, the per-row buttons, and every tree level.
+function rowTargets(row: SelRow): FileStatus[] {
+  if (row.type === "file") return [row.file]
+  if (row.type === "more") return []
+  return row.files
 }
 
-function buildRows(
-  repos: RepoInfo[],
-  statuses: Map<string, StatusResult>,
-): SelRow[] {
-  const rows: SelRow[] = []
-  for (const repo of repos) {
-    const st = statuses.get(repo.root)
-    if (!st) continue
-    for (const gm of GROUPS) {
-      const files = st[gm.field]
-      if (files.length === 0) continue
-      rows.push({
-        type: "group",
-        id: `${repo.root}::grp::${gm.key}`,
-        repoRoot: repo.root,
-        group: gm.key,
-        label: gm.label,
-        files,
-      })
-      for (const file of files) {
+const dirKey = (repoRoot: string, group: GroupKey, dirPath: string) =>
+  `${repoRoot}::${group}::${dirPath}`
+
+type TreeNode = {
+  name: string
+  path: string
+  isDir: boolean
+  file?: FileStatus
+  files: FileStatus[]
+  children: Map<string, TreeNode>
+}
+
+// Build an in-memory directory tree from a group's flat FileStatus[] and flatten
+// it (directories first, then files, each alphabetical) into rows.
+//
+// `toggles` records dirs the user flipped away from their group's DEFAULT
+// expansion. Small groups default to expanded (VSCode behavior); a group past
+// COLLAPSE_THRESHOLD defaults its dirs to COLLAPSED so a huge tree shows only its
+// top level. Either way `expanded = default XOR toggled`, so one toggle set (and
+// one toggleDir that flips membership) drives both regimes and survives refreshes.
+//
+// Finally the flattened list is capped at MAX_RENDERED_GROUP_ROWS; the overflow
+// becomes a single "more" row. Single-child dir-chain compression is skipped.
+function flattenGroup(
+  repoRoot: string,
+  group: GroupKey,
+  files: FileStatus[],
+  toggles: ReadonlySet<string>,
+): Array<DirRow | FileRow | MoreRow> {
+  const defaultExpanded = files.length <= COLLAPSE_THRESHOLD
+  const root: TreeNode = {
+    name: "",
+    path: "",
+    isDir: true,
+    files: [],
+    children: new Map(),
+  }
+  for (const file of files) {
+    const segments = file.path.split("/")
+    let node = root
+    let acc = ""
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i]
+      acc = acc ? `${acc}/${seg}` : seg
+      if (i === segments.length - 1) {
+        node.children.set(seg, {
+          name: seg,
+          path: file.path,
+          isDir: false,
+          file,
+          files: [file],
+          children: new Map(),
+        })
+      } else {
+        let child = node.children.get(seg)
+        if (!child || !child.isDir) {
+          child = { name: seg, path: acc, isDir: true, files: [], children: new Map() }
+          node.children.set(seg, child)
+        }
+        child.files.push(file)
+        node = child
+      }
+    }
+  }
+
+  const rows: Array<DirRow | FileRow | MoreRow> = []
+  let truncated = false
+  const walk = (node: TreeNode, depth: number) => {
+    const children = [...node.children.values()].sort((a, b) =>
+      a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1,
+    )
+    for (const child of children) {
+      // Stopped with items still to place → the group overflows the cap. (A group
+      // that exactly fills it with nothing left over is NOT truncated.)
+      if (rows.length >= MAX_RENDERED_GROUP_ROWS) {
+        truncated = true
+        return
+      }
+      if (child.isDir) {
+        const expanded =
+          defaultExpanded !== toggles.has(dirKey(repoRoot, group, child.path))
+        rows.push({
+          type: "dir",
+          id: `${repoRoot}::dir::${group}::${child.path}`,
+          repoRoot,
+          group,
+          dirPath: child.path,
+          name: child.name,
+          depth,
+          expanded,
+          files: child.files,
+        })
+        if (expanded) walk(child, depth + 1)
+      } else {
         rows.push({
           type: "file",
-          id: `${repo.root}::file::${gm.key}::${file.path}`,
-          repoRoot: repo.root,
-          group: gm.key,
-          file,
-          files,
+          id: `${repoRoot}::file::${group}::${child.file!.path}`,
+          repoRoot,
+          group,
+          name: child.name,
+          depth,
+          file: child.file!,
+          files: [child.file!],
         })
       }
     }
+  }
+  walk(root, 0)
+
+  if (truncated) {
+    const shownFiles = rows.reduce((n, r) => n + (r.type === "file" ? 1 : 0), 0)
+    rows.push({
+      type: "more",
+      id: `${repoRoot}::more::${group}`,
+      repoRoot,
+      group,
+      hiddenCount: files.length - shownFiles,
+    })
+  }
+  return rows
+}
+
+// The selectable rows for ONE repo: each non-empty group's header followed by its
+// (capped) tree. Kept per-repo so the render can memoize each repo's subtree and
+// the keyboard model can reuse the exact same rows (no second flatten).
+function buildRepoRows(
+  repoRoot: string,
+  st: StatusResult,
+  toggles: ReadonlySet<string>,
+): SelRow[] {
+  const rows: SelRow[] = []
+  for (const gm of GROUPS) {
+    const files = st[gm.field]
+    if (files.length === 0) continue
+    rows.push({
+      type: "group",
+      id: `${repoRoot}::grp::${gm.key}`,
+      repoRoot,
+      group: gm.key,
+      label: gm.label,
+      files,
+    })
+    rows.push(...flattenGroup(repoRoot, gm.key, files, toggles))
   }
   return rows
 }
@@ -126,8 +281,15 @@ export function ScmPanel({
   const [focusTarget, setFocusTarget] = useState<"input" | "list">("list")
   const [activeRepoRoot, setActiveRepoRoot] = useState<string | null>(null)
   const [confirmRepo, setConfirmRepo] = useState<string | null>(null)
+  // Directory keys the user flipped away from their group's default expansion
+  // (see flattenGroup). Only user actions mutate it, so it survives status
+  // refreshes untouched and never needs eviction — stale keys never match.
+  const [dirToggles, setDirToggles] = useState<Set<string>>(() => new Set())
 
   const mountedRef = useRef(true)
+  // Tracks the selected row by id so a rebuild (watcher refresh, expand/collapse)
+  // can restore the same logical row even when rows shift above it.
+  const selectedIdRef = useRef<string | null>(null)
   const reposRef = useRef<RepoInfo[]>(repos)
   reposRef.current = repos
   const scrollRef = useRef<ScrollBoxRenderable | null>(null)
@@ -192,23 +354,70 @@ export function ScmPanel({
     }
   }, [workspaceRoot, refresh, sharedWatchers])
 
-  const selectableRows = useMemo(
-    () => buildRows(repos, statuses),
-    [repos, statuses],
-  )
+  // Per-repo rows, memoized on that repo's status object identity (and the toggle
+  // set) so one repo's async status resolution doesn't rebuild every other repo's
+  // tree. The cache preserves each unchanged repo's array identity, which lets the
+  // memoized RepoSection skip re-rendering untouched repos during the load storm.
+  const rowsCacheRef = useRef<
+    Map<string, { status: StatusResult; toggles: ReadonlySet<string>; rows: SelRow[] }>
+  >(new Map())
+  const rowsByRepo = useMemo(() => {
+    const map = new Map<string, SelRow[]>()
+    const cache = rowsCacheRef.current
+    for (const repo of repos) {
+      const st = statuses.get(repo.root)
+      if (!st) continue
+      const cached = cache.get(repo.root)
+      if (cached && cached.status === st && cached.toggles === dirToggles) {
+        map.set(repo.root, cached.rows)
+      } else {
+        const rows = buildRepoRows(repo.root, st, dirToggles)
+        cache.set(repo.root, { status: st, toggles: dirToggles, rows })
+        map.set(repo.root, rows)
+      }
+    }
+    for (const key of [...cache.keys()]) if (!map.has(key)) cache.delete(key)
+    return map
+  }, [repos, statuses, dirToggles])
+
+  // Flat, repo-ordered rows for the keyboard model — the SAME array instances the
+  // render consumes, so nothing is flattened twice per render.
+  const selectableRows = useMemo(() => {
+    const flat: SelRow[] = []
+    for (const repo of repos) {
+      const rows = rowsByRepo.get(repo.root)
+      if (rows) flat.push(...rows)
+    }
+    return flat
+  }, [repos, rowsByRepo])
 
   const idToIndex = useMemo(() => {
     const m = new Map<string, number>()
     selectableRows.forEach((row, i) => m.set(row.id, i))
     return m
   }, [selectableRows])
+  // idToIndex is rebuilt on every status update; read it through a ref so the
+  // stably-registered selectById keeps one identity and doesn't defeat the
+  // per-repo RepoSection memo.
+  const idToIndexRef = useRef(idToIndex)
+  idToIndexRef.current = idToIndex
 
+  // Reconcile selection across every row rebuild by id, not position: a refresh
+  // or an expand/collapse can insert/remove rows above the selection. Keep the
+  // same logical row when its id survives; otherwise clamp the old index.
   useEffect(() => {
-    setSelectedIndex((i) => {
-      if (selectableRows.length === 0) return 0
-      return Math.min(Math.max(0, i), selectableRows.length - 1)
+    setSelectedIndex((prev) => {
+      if (selectableRows.length === 0) {
+        selectedIdRef.current = null
+        return 0
+      }
+      const id = selectedIdRef.current
+      const byId = id != null ? idToIndex.get(id) : undefined
+      const next = byId ?? Math.min(Math.max(0, prev), selectableRows.length - 1)
+      selectedIdRef.current = selectableRows[next]?.id ?? null
+      return next
     })
-  }, [selectableRows.length])
+  }, [selectableRows, idToIndex])
 
   // Committing targets the repo you're navigating; explicit input focus can
   // override it, but selection keeps it in sync otherwise.
@@ -253,32 +462,22 @@ export function ScmPanel({
     return s.selectableRows[s.selectedIndex] ?? null
   }, [])
 
-  const stageSelected = useCallback(() => {
-    const row = selectedRow()
-    if (!row) return
-    const svc = serviceFor(row.repoRoot)
-    if (!svc) return
-    const paths = row.type === "file" ? [row.file.path] : row.files.map((f) => f.path)
-    void svc.stage(paths).then(() => refresh(row.repoRoot))
-  }, [selectedRow, serviceFor, refresh])
+  const stageRow = useCallback((repoRoot: string, files: FileStatus[]) => {
+    const svc = serviceFor(repoRoot)
+    if (!svc || files.length === 0) return
+    void svc.stage(files.map((f) => f.path)).then(() => refresh(repoRoot))
+  }, [serviceFor, refresh])
 
-  const unstageSelected = useCallback(() => {
-    const row = selectedRow()
-    if (!row) return
-    const svc = serviceFor(row.repoRoot)
-    if (!svc) return
-    const paths = row.type === "file" ? [row.file.path] : row.files.map((f) => f.path)
-    void svc.unstage(paths).then(() => refresh(row.repoRoot))
-  }, [selectedRow, serviceFor, refresh])
+  const unstageRow = useCallback((repoRoot: string, files: FileStatus[]) => {
+    const svc = serviceFor(repoRoot)
+    if (!svc || files.length === 0) return
+    void svc.unstage(files.map((f) => f.path)).then(() => refresh(repoRoot))
+  }, [serviceFor, refresh])
 
-  const discardSelected = useCallback(() => {
-    const row = selectedRow()
-    if (!row) return
-    const svc = serviceFor(row.repoRoot)
-    if (!svc) return
+  const discardRow = useCallback((repoRoot: string, targets: FileStatus[]) => {
+    const svc = serviceFor(repoRoot)
+    if (!svc || targets.length === 0) return
 
-    const repoRoot = row.repoRoot
-    const targets = row.type === "file" ? [row.file] : row.files
     const tracked = targets.filter((f) => f.statusLetter !== "U")
     const untracked = targets.filter((f) => f.statusLetter === "U")
     const trackedPaths = tracked.map((f) => f.path)
@@ -352,7 +551,22 @@ export function ScmPanel({
     void confirm(options).then((choice) => {
       if (choice === "confirm") void doDiscard()
     })
-  }, [selectedRow, serviceFor, refresh, confirm])
+  }, [serviceFor, refresh, confirm])
+
+  const stageSelected = useCallback(() => {
+    const row = selectedRow()
+    if (row) stageRow(row.repoRoot, rowTargets(row))
+  }, [selectedRow, stageRow])
+
+  const unstageSelected = useCallback(() => {
+    const row = selectedRow()
+    if (row) unstageRow(row.repoRoot, rowTargets(row))
+  }, [selectedRow, unstageRow])
+
+  const discardSelected = useCallback(() => {
+    const row = selectedRow()
+    if (row) discardRow(row.repoRoot, rowTargets(row))
+  }, [selectedRow, discardRow])
 
   const openSelected = useCallback(() => {
     const row = selectedRow()
@@ -403,7 +617,7 @@ export function ScmPanel({
         id: "scm.commit",
         title: "Commit",
         category: "Source Control",
-        keybinding: "ctrl+enter",
+        keybinding: withMacSuper("ctrl+enter"),
         run: commitActive,
       }),
       commands.registerCommand({
@@ -443,15 +657,25 @@ export function ScmPanel({
     openDiffSelected,
   ])
 
-  const selectById = useCallback(
-    (id: string) => {
-      const index = idToIndex.get(id)
-      if (index === undefined) return
-      setFocusTarget("list")
-      setSelectedIndex(index)
-    },
-    [idToIndex],
-  )
+  const selectById = useCallback((id: string) => {
+    const index = idToIndexRef.current.get(id)
+    if (index === undefined) return
+    setFocusTarget("list")
+    selectedIdRef.current = id
+    setSelectedIndex(index)
+  }, [])
+
+  // Flip a dir's toggle membership, which flips its expansion regardless of the
+  // group's default (expanded = default XOR toggled — see flattenGroup).
+  const toggleDir = useCallback((row: DirRow) => {
+    const key = dirKey(row.repoRoot, row.group, row.dirPath)
+    setDirToggles((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
 
   useKeyboard((key) => {
     if (!focused) return
@@ -473,20 +697,75 @@ export function ScmPanel({
       return
     }
 
+    // Move selection to a row, tracking its id so a later rebuild can restore
+    // it (see the reconcile effect above). Both use functional updates so rapid
+    // presses that fire before a re-render still compose correctly.
+    const moveBy = (delta: number) =>
+      setSelectedIndex((i) => {
+        const clamped = Math.min(
+          Math.max(0, i + delta),
+          selectableRows.length - 1,
+        )
+        selectedIdRef.current = selectableRows[clamped]?.id ?? null
+        return clamped
+      })
+    const selectAt = (index: number) =>
+      setSelectedIndex(() => {
+        if (selectableRows.length === 0) return 0
+        const clamped = Math.min(Math.max(0, index), selectableRows.length - 1)
+        selectedIdRef.current = selectableRows[clamped]?.id ?? null
+        return clamped
+      })
+
+    const row = selectableRows[selectedIndex]
     switch (key.name) {
       case "up":
-        setSelectedIndex((i) => Math.max(0, i - 1))
+        moveBy(-1)
         break
       case "down":
-        setSelectedIndex((i) => Math.min(selectableRows.length - 1, i + 1))
+        moveBy(1)
         break
+      case "right":
+        // Expand a collapsed dir, step into an expanded one; leaves do nothing.
+        if (row?.type === "dir") {
+          if (row.expanded) moveBy(1)
+          else toggleDir(row)
+        }
+        break
+      case "left": {
+        // Collapse an expanded dir in place; otherwise jump to the parent row
+        // (the enclosing dir, or the group header for a top-level entry).
+        if (!row) break
+        if (row.type === "dir" && row.expanded) {
+          toggleDir(row)
+          break
+        }
+        if (row.type === "group") break
+        // A "more" row's parent is its group header; a file/collapsed-dir jumps
+        // to its enclosing dir, or the group header when it's top-level.
+        let parentId: string
+        if (row.type === "more") {
+          parentId = `${row.repoRoot}::grp::${row.group}`
+        } else {
+          const path = row.type === "dir" ? row.dirPath : row.file.path
+          const slash = path.lastIndexOf("/")
+          parentId =
+            slash === -1
+              ? `${row.repoRoot}::grp::${row.group}`
+              : `${row.repoRoot}::dir::${row.group}::${path.slice(0, slash)}`
+        }
+        const parentIndex = idToIndex.get(parentId)
+        if (parentIndex !== undefined) selectAt(parentIndex)
+        break
+      }
       case "tab":
       case "i":
         if (effectiveActiveRepo) setFocusTarget("input")
         break
       case "return":
       case "enter":
-        openSelected()
+        if (row?.type === "dir") toggleDir(row)
+        else openSelected()
         break
       case "space":
       case "+":
@@ -506,6 +785,10 @@ export function ScmPanel({
 
   const selectedId = selectableRows[selectedIndex]?.id
 
+  const handleMessageInput = useCallback((repoRoot: string, value: string) => {
+    setMessages((prev) => new Map(prev).set(repoRoot, value))
+  }, [])
+
   return (
     <box flexDirection="column" height="100%" backgroundColor={theme.sidebarBackground}>
       <box height={1} paddingLeft={1}>
@@ -515,107 +798,216 @@ export function ScmPanel({
         {repos.length === 0 ? (
           <text fg={theme.dimForeground}>No repositories</text>
         ) : (
-          repos.map((repo) => {
-            const st = statuses.get(repo.root)
-            const message = messages.get(repo.root) ?? ""
-            const inputFocused =
-              focused && focusTarget === "input" && effectiveActiveRepo === repo.root
-            return (
-              <box key={repo.root} flexDirection="column" width="100%">
-                {repos.length > 1 ? (
-                  <box height={1} paddingLeft={1}>
-                    <text fg={theme.foreground}>{basename(repo.root)}</text>
-                  </box>
-                ) : null}
-                <input
-                  value={message}
-                  onInput={(value) =>
-                    setMessages((prev) => new Map(prev).set(repo.root, value))
-                  }
-                  focused={inputFocused}
-                  placeholder="Message (Enter to commit)"
-                />
-                {confirmRepo === repo.root ? (
-                  <text fg={theme.warning}>
-                    No staged changes. Press Enter again to stage all & commit,
-                    Esc to cancel
-                  </text>
-                ) : (
-                  <text fg={theme.dimForeground}>[Enter] Commit</text>
-                )}
-                {st
-                  ? GROUPS.map((gm) => {
-                      const files = st[gm.field]
-                      if (files.length === 0) return null
-                      const groupId = `${repo.root}::grp::${gm.key}`
-                      return (
-                        <box key={groupId} flexDirection="column" width="100%">
-                          <box
-                            id={groupId}
-                            flexDirection="row"
-                            width="100%"
-                            height={1}
-                            paddingLeft={1}
-                            backgroundColor={
-                              selectedId === groupId
-                                ? theme.selectionBackground
-                                : undefined
-                            }
-                            onMouseDown={() => selectById(groupId)}
-                          >
-                            <text fg={theme.foreground}>{gm.label}</text>
-                            <box flexGrow={1} />
-                            <text fg={theme.dimForeground}>{`(${files.length})`}</text>
-                            <text fg={theme.dimForeground}> </text>
-                          </box>
-                          {files.map((file) => {
-                            const fileId = `${repo.root}::file::${gm.key}::${file.path}`
-                            const { name, dir } = splitPath(file.path)
-                            const diffable =
-                              gm.key === "staged" || gm.key === "changes"
-                            return (
-                              <box
-                                key={fileId}
-                                id={fileId}
-                                flexDirection="row"
-                                width="100%"
-                                height={1}
-                                paddingLeft={2}
-                                backgroundColor={
-                                  selectedId === fileId
-                                    ? theme.selectionBackground
-                                    : undefined
-                                }
-                                onMouseDown={() => {
-                                  selectById(fileId)
-                                  if (diffable)
-                                    onOpenDiff?.(
-                                      join(repo.root, file.path),
-                                      gm.key === "staged" ? "staged" : "unstaged",
-                                    )
-                                }}
-                              >
-                                <text fg={theme.foreground}>{name}</text>
-                                {dir ? (
-                                  <text fg={theme.dimForeground}>{` ${dir}`}</text>
-                                ) : null}
-                                <box flexGrow={1} />
-                                <text fg={gitStatusColor(file.statusLetter)}>
-                                  {file.statusLetter}
-                                </text>
-                                <text fg={theme.dimForeground}> </text>
-                              </box>
-                            )
-                          })}
-                        </box>
-                      )
-                    })
-                  : null}
-              </box>
-            )
-          })
+          repos.map((repo) => (
+            <RepoSection
+              key={repo.root}
+              repo={repo}
+              rows={rowsByRepo.get(repo.root) ?? EMPTY_ROWS}
+              showRepoHeader={repos.length > 1}
+              message={messages.get(repo.root) ?? ""}
+              inputFocused={
+                focused && focusTarget === "input" && effectiveActiveRepo === repo.root
+              }
+              confirmActive={confirmRepo === repo.root}
+              selectedId={selectedId}
+              onMessageInput={handleMessageInput}
+              selectById={selectById}
+              toggleDir={toggleDir}
+              stageRow={stageRow}
+              unstageRow={unstageRow}
+              discardRow={discardRow}
+              onOpenDiff={onOpenDiff}
+            />
+          ))
         )}
       </scrollbox>
     </box>
   )
 }
+
+const EMPTY_ROWS: SelRow[] = []
+
+type RepoSectionProps = {
+  repo: RepoInfo
+  rows: SelRow[]
+  showRepoHeader: boolean
+  message: string
+  inputFocused: boolean
+  confirmActive: boolean
+  selectedId: string | undefined
+  onMessageInput: (repoRoot: string, value: string) => void
+  selectById: (id: string) => void
+  toggleDir: (row: DirRow) => void
+  stageRow: (repoRoot: string, files: FileStatus[]) => void
+  unstageRow: (repoRoot: string, files: FileStatus[]) => void
+  discardRow: (repoRoot: string, files: FileStatus[]) => void
+  onOpenDiff?: (path: string, kind: "staged" | "unstaged") => void
+}
+
+// One repo's commit box + resource groups. Memoized so another repo's async
+// status resolution (they land independently) doesn't re-render or re-reconcile
+// this repo's row subtree — the fix for the multi-repo freeze. Every prop is a
+// primitive or a stable ref from ScmPanel, so React.memo's shallow compare holds
+// unless THIS repo's rows / selection / input state actually change.
+const RepoSection = memo(function RepoSection({
+  repo,
+  rows,
+  showRepoHeader,
+  message,
+  inputFocused,
+  confirmActive,
+  selectedId,
+  onMessageInput,
+  selectById,
+  toggleDir,
+  stageRow,
+  unstageRow,
+  discardRow,
+  onOpenDiff,
+}: RepoSectionProps) {
+  // VSCode-style hover actions, shown only on the selected row (the 32-col
+  // sidebar has no room to render them on every row without clipping names).
+  // stopPropagation keeps a button click from also selecting the row / opening
+  // a diff; preventDefault suppresses the renderer's text-selection gesture.
+  const renderActions = (group: GroupKey, files: FileStatus[]) => {
+    const specs =
+      group === "staged"
+        ? [{ key: "unstage", glyph: "−", run: () => unstageRow(repo.root, files) }]
+        : [
+            { key: "stage", glyph: "+", run: () => stageRow(repo.root, files) },
+            { key: "discard", glyph: "↶", run: () => discardRow(repo.root, files) },
+          ]
+    return specs.map((s) => (
+      <box
+        key={s.key}
+        onMouseDown={(e) => {
+          e.stopPropagation()
+          e.preventDefault()
+          s.run()
+        }}
+      >
+        <text fg={theme.foreground}>{` ${s.glyph}`}</text>
+      </box>
+    ))
+  }
+
+  const renderRow = (row: SelRow) => {
+    const selected = selectedId === row.id
+    const bg = selected ? theme.selectionBackground : undefined
+    if (row.type === "group") {
+      return (
+        <box
+          key={row.id}
+          id={row.id}
+          flexDirection="row"
+          width="100%"
+          height={1}
+          paddingLeft={1}
+          backgroundColor={bg}
+          onMouseDown={() => selectById(row.id)}
+        >
+          <text fg={theme.foreground}>{row.label}</text>
+          <box flexGrow={1} />
+          {selected ? renderActions(row.group, row.files) : null}
+          <text fg={theme.dimForeground}>{`(${row.files.length})`}</text>
+          <text fg={theme.dimForeground}> </text>
+        </box>
+      )
+    }
+    if (row.type === "more") {
+      return (
+        <box
+          key={row.id}
+          id={row.id}
+          flexDirection="row"
+          width="100%"
+          height={1}
+          paddingLeft={2}
+          backgroundColor={bg}
+          onMouseDown={() => selectById(row.id)}
+        >
+          <text fg={theme.dimForeground}>
+            {`…and ${row.hiddenCount} more files (group too large to display)`}
+          </text>
+        </box>
+      )
+    }
+    // Indent by depth; a 2-col prefix (twisty for dirs, blank for files) keeps
+    // names aligned like VSCode.
+    const indent = "  ".repeat(row.depth)
+    if (row.type === "dir") {
+      return (
+        <box
+          key={row.id}
+          id={row.id}
+          flexDirection="row"
+          width="100%"
+          height={1}
+          paddingLeft={2}
+          backgroundColor={bg}
+          onMouseDown={() => {
+            selectById(row.id)
+            toggleDir(row)
+          }}
+        >
+          <text fg={theme.foreground}>
+            {`${indent}${row.expanded ? "▾ " : "▸ "}${row.name}`}
+          </text>
+          <box flexGrow={1} />
+          {selected ? renderActions(row.group, row.files) : null}
+          <text fg={theme.dimForeground}> </text>
+        </box>
+      )
+    }
+    const diffable = row.group === "staged" || row.group === "changes"
+    return (
+      <box
+        key={row.id}
+        id={row.id}
+        flexDirection="row"
+        width="100%"
+        height={1}
+        paddingLeft={2}
+        backgroundColor={bg}
+        onMouseDown={() => {
+          selectById(row.id)
+          if (diffable)
+            onOpenDiff?.(
+              join(repo.root, row.file.path),
+              row.group === "staged" ? "staged" : "unstaged",
+            )
+        }}
+      >
+        <text fg={theme.foreground}>{`${indent}  ${row.name}`}</text>
+        <box flexGrow={1} />
+        {selected ? renderActions(row.group, [row.file]) : null}
+        <text fg={gitStatusColor(row.file.statusLetter)}>{row.file.statusLetter}</text>
+        <text fg={theme.dimForeground}> </text>
+      </box>
+    )
+  }
+
+  return (
+    <box flexDirection="column" width="100%">
+      {showRepoHeader ? (
+        <box height={1} paddingLeft={1}>
+          <text fg={theme.foreground}>{basename(repo.root)}</text>
+        </box>
+      ) : null}
+      <input
+        value={message}
+        onInput={(value) => onMessageInput(repo.root, value)}
+        focused={inputFocused}
+        placeholder="Message (Enter to commit)"
+      />
+      {confirmActive ? (
+        <text fg={theme.warning}>
+          No staged changes. Press Enter again to stage all & commit, Esc to cancel
+        </text>
+      ) : (
+        <text fg={theme.dimForeground}>[Enter] Commit</text>
+      )}
+      {rows.map(renderRow)}
+    </box>
+  )
+})

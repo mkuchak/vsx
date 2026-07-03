@@ -30,6 +30,28 @@ export type DiffEntry = {
   oldPath?: string
 }
 
+export type CommitStats = {
+  files: number
+  insertions: number
+  deletions: number
+}
+
+export type GrepMatch = {
+  /** Path relative to the repo root, as `git grep` emits it. */
+  path: string
+  line: number
+  /** 1-based BYTE column of the first match (git `--column`); callers that need a
+   * char column must normalize against the preview (see search.ts). */
+  col: number
+  preview: string
+}
+
+export type GrepOptions = {
+  matchCase?: boolean
+  wholeWord?: boolean
+  regex?: boolean
+}
+
 export type HeadInfo = {
   branch: string | null
   detached: boolean
@@ -295,6 +317,66 @@ export class GitService {
     return entries
   }
 
+  async commitStats(hash: string): Promise<CommitStats> {
+    // `git show --numstat` diffs a commit against its first parent — and against
+    // the empty tree for a root commit — so no explicit parent handling is
+    // needed. `-z` emits one NUL-terminated `added\tdeleted\tpath` record per
+    // file; a rename instead emits `added\tdeleted\t` then oldpath and newpath
+    // as two further NUL fields. Binary files show "-" for both counts.
+    const { stdout } = await this.git(["show", "-z", "--numstat", "--format=", hash])
+    const fields = stdout.split("\0")
+
+    let files = 0
+    let insertions = 0
+    let deletions = 0
+    let i = 0
+    while (i < fields.length) {
+      const field = fields[i]
+      if (!field) {
+        i += 1
+        continue
+      }
+      const tab1 = field.indexOf("\t")
+      const tab2 = field.indexOf("\t", tab1 + 1)
+      if (tab1 === -1 || tab2 === -1) {
+        i += 1
+        continue
+      }
+      const added = field.slice(0, tab1)
+      const deleted = field.slice(tab1 + 1, tab2)
+      const path = field.slice(tab2 + 1)
+      insertions += added === "-" ? 0 : Number(added) || 0
+      deletions += deleted === "-" ? 0 : Number(deleted) || 0
+      files += 1
+      // An empty path means a rename/copy: skip its oldpath+newpath NUL fields.
+      i += path === "" ? 3 : 1
+    }
+
+    return { files, insertions, deletions }
+  }
+
+  async grep(query: string, opts: GrepOptions = {}): Promise<GrepMatch[]> {
+    // `-I` skips binaries, `-z` NUL-delimits the path (unquoted), `--column`
+    // gives the 1-based column of the first match, `--untracked` matches
+    // VSCode by also searching untracked-not-ignored files.
+    const args = ["grep", "-n", "-I", "--column", "-z", "--untracked"]
+    if (!opts.matchCase) args.push("-i")
+    // git's regex engine has no \b; -w is its dedicated whole-word matcher and
+    // works with both fixed (-F) and extended-regex (-E) patterns.
+    if (opts.wholeWord) args.push("-w")
+    args.push(opts.regex ? "-E" : "-F", "-e", query)
+    args.push("--", ".")
+
+    try {
+      const { stdout } = await this.git(args)
+      return parseGrepZ(stdout)
+    } catch (e) {
+      // `git grep` exits 1 with no output when nothing matched — not an error.
+      if (e instanceof GitError && e.code === 1 && e.stderr.trim() === "") return []
+      throw e
+    }
+  }
+
   async head(): Promise<HeadInfo> {
     let name: string
     try {
@@ -338,6 +420,34 @@ export class GitService {
 
     return { branch, detached, ahead, behind }
   }
+}
+
+// `git grep -n --column -z` emits one record per matching line as
+// `path\0line\0col\0text\n`. The path is unquoted (raw bytes) thanks to -z, and
+// the matched line text (never binary, since -I) runs to the trailing newline.
+function parseGrepZ(stdout: string): GrepMatch[] {
+  const matches: GrepMatch[] = []
+  let i = 0
+  while (i < stdout.length) {
+    const p1 = stdout.indexOf("\0", i)
+    if (p1 < 0) break
+    const p2 = stdout.indexOf("\0", p1 + 1)
+    if (p2 < 0) break
+    const p3 = stdout.indexOf("\0", p2 + 1)
+    if (p3 < 0) break
+    let nl = stdout.indexOf("\n", p3 + 1)
+    if (nl < 0) nl = stdout.length
+
+    const path = stdout.slice(i, p1)
+    const line = Number(stdout.slice(p1 + 1, p2))
+    const col = Number(stdout.slice(p2 + 1, p3))
+    const preview = stdout.slice(p3 + 1, nl).replace(/\r$/, "")
+    if (path && Number.isFinite(line) && Number.isFinite(col)) {
+      matches.push({ path, line, col, preview })
+    }
+    i = nl + 1
+  }
+  return matches
 }
 
 function isPathMissing(stderr: string): boolean {

@@ -335,6 +335,103 @@ describe("diffNameStatus", () => {
   })
 })
 
+describe("commitStats", () => {
+  test("sums insertions/deletions across files and counts a binary as 0/0", async () => {
+    // Root commit with a text file and a binary file.
+    await write("a.txt", "1\n2\n3\n")
+    await writeFile(join(root, "logo.bin"), Buffer.from([0, 1, 2, 3, 0, 255]))
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "root"])
+
+    // Second commit: edit a.txt (line 2 changed => +1/-1, plus 2 appended) and
+    // add b.txt (+2 lines). a.txt: +3/-1, b.txt: +2/-0.
+    await write("a.txt", "1\n2b\n3\n4\n5\n")
+    await write("b.txt", "x\ny\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "second"])
+    const head = (await sh(["rev-parse", "HEAD"])).trim()
+
+    const stats = await git.commitStats(head)
+    expect(stats.files).toBe(2)
+    expect(stats.insertions).toBe(5) // 3 in a.txt + 2 in b.txt
+    expect(stats.deletions).toBe(1) // 1 removed from a.txt
+  })
+
+  test("counts a binary file as a changed file with zero line counts", async () => {
+    await write("seed.txt", "x\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "seed"])
+
+    await writeFile(join(root, "img.bin"), Buffer.from([0, 1, 2, 3]))
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "add binary"])
+    const head = (await sh(["rev-parse", "HEAD"])).trim()
+
+    const stats = await git.commitStats(head)
+    expect(stats.files).toBe(1)
+    expect(stats.insertions).toBe(0)
+    expect(stats.deletions).toBe(0)
+  })
+
+  test("works on a root commit (diffs against the empty tree)", async () => {
+    await write("a.txt", "1\n2\n")
+    await write("b.txt", "3\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "root"])
+    const root0 = (await sh(["rev-parse", "HEAD"])).trim()
+
+    const stats = await git.commitStats(root0)
+    expect(stats.files).toBe(2)
+    expect(stats.insertions).toBe(3) // 2 + 1 lines added from nothing
+    expect(stats.deletions).toBe(0)
+  })
+
+  test("counts a rename+edit as one file without miscounting paths", async () => {
+    await write("orig.txt", "1\n2\n3\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "root"])
+
+    await sh(["mv", "orig.txt", "renamed.txt"])
+    await write("renamed.txt", "1\n2\n3\n4\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "rename+edit"])
+    const head = (await sh(["rev-parse", "HEAD"])).trim()
+
+    const stats = await git.commitStats(head)
+    expect(stats.files).toBe(1)
+    expect(stats.insertions).toBe(1)
+    expect(stats.deletions).toBe(0)
+  })
+})
+
+describe("grep", () => {
+  test("parses a colon in a filename correctly through -z output", async () => {
+    // `git grep -z` NUL-terminates the path, so a ':' in the name must not be
+    // mistaken for the path/line/col field separators of the non-z format.
+    await write("co:lon.txt", "alpha needle beta\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "colon"])
+
+    const matches = await git.grep("needle")
+    const m = matches.find((x) => x.path === "co:lon.txt")
+    expect(m).toBeDefined()
+    expect(m!.line).toBe(1)
+    expect(m!.col).toBe(7) // "alpha " is 6 chars; "needle" starts at column 7
+    expect(m!.preview).toBe("alpha needle beta")
+  })
+
+  test("whole-word uses git's -w flag (a match trailed by a word char is excluded)", async () => {
+    await write("w.txt", "foo(bar) and lone foo here\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "w"])
+
+    // `foo` matches as a whole word (grep is line-based → one record for the
+    // line); `foo(` does not, because the '(' match is trailed by a word char.
+    expect((await git.grep("foo", { wholeWord: true })).length).toBe(1)
+    expect(await git.grep("foo(", { wholeWord: true })).toEqual([])
+  })
+})
+
 describe("show", () => {
   test("returns staged (:0) and HEAD content of a path", async () => {
     await write("f.txt", "committed\n")

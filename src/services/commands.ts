@@ -9,8 +9,12 @@ export interface CommandDescriptor {
   id: string
   title: string
   category?: string
-  /** Key chord (e.g. "ctrl+p") or stroke object bound to this command. */
-  keybinding?: KeyLike
+  /**
+   * Key chord (e.g. "ctrl+p") or stroke object bound to this command. An array
+   * binds the command to every chord in it — used to dual-register a macOS
+   * `super+…` variant alongside the `ctrl+…` one (see {@link withMacSuper}).
+   */
+  keybinding?: KeyLike | readonly KeyLike[]
   /** VSCode `when`-style predicate; a falsy result blocks key + programmatic dispatch. */
   enabled?: () => boolean
   run: () => void
@@ -94,7 +98,7 @@ export class CommandRegistry<T extends object = Renderable, E extends KeymapEven
       },
     } as unknown as Command<T, E>
 
-    const bindings = keybinding ? [{ key: keybinding, cmd: id } as Binding<T, E>] : []
+    const bindings = keyLikeList(keybinding).map((key) => ({ key, cmd: id }) as Binding<T, E>)
     const disposeLayer = this.#keymap.registerLayer({ commands: [command], bindings })
 
     return () => {
@@ -145,7 +149,8 @@ export class CommandRegistry<T extends object = Renderable, E extends KeymapEven
         id,
         title: d.title,
         category: d.category,
-        keybinding: d.keybinding,
+        // Palette hint shows a single chord: the first entry (the ctrl variant).
+        keybinding: keyLikeList(d.keybinding)[0],
         recency: recency === -1 ? undefined : recency,
       }
     })
@@ -172,4 +177,35 @@ export class CommandRegistry<T extends object = Renderable, E extends KeymapEven
 function remove(list: string[], value: string): void {
   const i = list.indexOf(value)
   if (i !== -1) list.splice(i, 1)
+}
+
+/** Normalize the descriptor's single-or-array keybinding into a flat list. */
+function keyLikeList(keybinding: KeyLike | readonly KeyLike[] | undefined): readonly KeyLike[] {
+  if (keybinding == null) return []
+  return Array.isArray(keybinding) ? keybinding : [keybinding as KeyLike]
+}
+
+/**
+ * On macOS, pair a `ctrl+…` chord with its `super+…` (Cmd) twin so Cmd shortcuts
+ * work the way they do in VSCode; elsewhere the chord is returned unchanged.
+ *
+ * We can't use the keymap's "mod" token: it resolves to a SINGLE modifier
+ * (super on mac, ctrl on Linux), which would drop ctrl+p on mac — and its
+ * expander isn't registered by createDefaultOpenTuiKeymap, so a literal "mod+…"
+ * throws at registration. Dual-registering both explicit chords keeps ctrl AND
+ * adds super. `super` bindings stay inert until the terminal delivers the Cmd
+ * bit (kitty protocol), so this is harmless where Cmd isn't forwarded.
+ *
+ * `platform` is injectable so tests can force darwin without gating on the host.
+ */
+export function withMacSuper(
+  binding: string,
+  platform: NodeJS.Platform = process.platform,
+): string | readonly string[] {
+  if (platform !== "darwin") return binding
+  const supered = binding.replace(/^ctrl\+/, "super+")
+  // A non-ctrl chord (e.g. "alt+z") leaves the string unchanged; returning both
+  // would register the SAME binding twice, so fall back to the single binding.
+  if (supered === binding) return binding
+  return [binding, supered]
 }

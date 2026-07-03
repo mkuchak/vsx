@@ -1,9 +1,11 @@
-import { useTerminalDimensions } from "@opentui/react"
+import { useKeyboard, useTerminalDimensions } from "@opentui/react"
 import { useEffect, useRef, useState } from "react"
 import { documentRegistry } from "../model/documents.ts"
 import { workbenchStore, type Group } from "../model/workbench.ts"
+import { withMacSuper } from "../services/commands.ts"
 import { theme } from "../theme"
 import { useCommands } from "../workbench/CommandsProvider.tsx"
+import { useOverlay } from "../workbench/OverlayProvider"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore.ts"
 import { DiffPane } from "./DiffPane.tsx"
 import { EditorPane, type CursorPosition } from "./EditorPane.tsx"
@@ -48,6 +50,7 @@ export function EditorGroups({
 }: EditorGroupsProps = {}) {
   const state = useWorkbenchStore()
   const commands = useCommands()
+  const { isOverlayOpen } = useOverlay()
   const { width: termWidth } = useTerminalDimensions()
   const areaWidth = containerWidth ?? termWidth
 
@@ -87,6 +90,19 @@ export function EditorGroups({
     gesture.current = null
   }
 
+  // Without the terminal's option-as-alt setting, macOS composes opt+z into the
+  // literal glyph "Ω" delivered with NO modifiers, so the alt+z command above
+  // never matches and the focused textarea would self-insert the char. Catch the
+  // composed glyph globally and run the same toggle; key.preventDefault() runs
+  // before the textarea phase, suppressing the insert. The real fix is the
+  // terminal's macos-option-as-alt setting; this is the fallback for when it's off.
+  useKeyboard((key) => {
+    if (isOverlayOpen) return
+    if (key.name !== "Ω" || key.ctrl || key.meta || key.super) return
+    key.preventDefault()
+    setWordWrap((mode) => (mode === "word" ? "none" : "word"))
+  })
+
   useEffect(() => {
     const nudgeActive = (sign: 1 | -1) => {
       const s = workbenchStore.getState()
@@ -109,7 +125,7 @@ export function EditorGroups({
         id: "workbench.splitEditor",
         title: "Split Editor",
         category: "View",
-        keybinding: "ctrl+\\",
+        keybinding: withMacSuper("ctrl+\\"),
         // Cap the split so panes never fall below the ~20-cell floor: derive the
         // limit from the live editor-area width minus its interior dividers. A
         // refused split is a silent no-op (the store returns without mutating).
@@ -180,7 +196,7 @@ export function EditorGroups({
         id: "editor.closeActiveTab",
         title: "Close Editor",
         category: "Editor",
-        keybinding: "ctrl+w",
+        keybinding: withMacSuper("ctrl+w"),
         run: () => void workbenchStore.closeActiveTab(),
       }),
       // Save is registered ONCE here, not per editor pane: a per-pane binding
@@ -190,7 +206,7 @@ export function EditorGroups({
         id: "editor.save",
         title: "Save",
         category: "File",
-        keybinding: "ctrl+s",
+        keybinding: withMacSuper("ctrl+s"),
         run: () => {
           const s = workbenchStore.getState()
           const group = s.groups.find((g) => g.id === s.activeGroupId)

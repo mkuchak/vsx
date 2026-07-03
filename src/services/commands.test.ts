@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test"
 import { registerEnabledFields, registerMetadataFields } from "@opentui/keymap/addons"
 import { createTestKeymap } from "@opentui/keymap/testing"
-import { CommandRegistry } from "./commands"
+import { CommandRegistry, withMacSuper } from "./commands"
 
 function makeRegistry() {
   const harness = createTestKeymap({ defaultKeys: true })
@@ -182,6 +182,27 @@ describe("CommandRegistry", () => {
     }
   })
 
+  it("dispatches a command registered with an array of keybindings on each chord", () => {
+    const { registry, host, cleanup } = makeRegistry()
+    const calls: string[] = []
+
+    registry.registerCommand({
+      id: "multi",
+      title: "Multi",
+      keybinding: ["ctrl+p", "super+p"],
+      run: () => calls.push("hit"),
+    })
+
+    host.press("p", { ctrl: true })
+    host.press("p", { super: true })
+    expect(calls).toEqual(["hit", "hit"])
+
+    // The palette hint collapses the array to its first (ctrl) chord.
+    expect(registry.getCommands().find((c) => c.id === "multi")?.keybinding).toBe("ctrl+p")
+
+    cleanup()
+  })
+
   it("removes a command and its binding when disposed", () => {
     const { registry, host, cleanup } = makeRegistry()
     const calls: string[] = []
@@ -199,6 +220,39 @@ describe("CommandRegistry", () => {
     host.press("t", { ctrl: true })
     expect(calls).toEqual([])
     expect(registry.getCommands().find((c) => c.id === "temp")).toBeUndefined()
+
+    cleanup()
+  })
+})
+
+describe("withMacSuper", () => {
+  it("pairs a ctrl chord with its super twin on darwin, unchanged elsewhere", () => {
+    expect(withMacSuper("ctrl+p", "darwin")).toEqual(["ctrl+p", "super+p"])
+    expect(withMacSuper("ctrl+shift+p", "darwin")).toEqual(["ctrl+shift+p", "super+shift+p"])
+    expect(withMacSuper("ctrl+p", "linux")).toBe("ctrl+p")
+    expect(withMacSuper("ctrl+p", "win32")).toBe("ctrl+p")
+  })
+
+  it("does not duplicate a non-ctrl chord on darwin (nothing to super-ize)", () => {
+    // "alt+z" has no leading ctrl+, so the super replacement is a no-op; returning
+    // both would register the identical binding twice.
+    expect(withMacSuper("alt+z", "darwin")).toBe("alt+z")
+  })
+
+  it("fires the same command from a synthetic super chord as from ctrl on darwin", () => {
+    const { registry, host, cleanup } = makeRegistry()
+    const calls: string[] = []
+
+    registry.registerCommand({
+      id: "workbench.quickOpen",
+      title: "Quick Open",
+      keybinding: withMacSuper("ctrl+p", "darwin"),
+      run: () => calls.push("open"),
+    })
+
+    host.press("p", { ctrl: true })
+    host.press("p", { super: true })
+    expect(calls).toEqual(["open", "open"])
 
     cleanup()
   })

@@ -9,17 +9,24 @@ import { act, useState } from "react"
 import { documentRegistry } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
 import { CommandsProvider, useCommands } from "../workbench/CommandsProvider"
-import { OverlayProvider } from "../workbench/OverlayProvider"
+import { OverlayProvider, useOverlay } from "../workbench/OverlayProvider"
 import type { CommandRegistry } from "../services/commands"
 import { EditorGroups } from "./EditorGroups"
 
 let testSetup: Awaited<ReturnType<typeof testRender>> | undefined
 let dir: string
 let registry: CommandRegistry | null = null
+let setOverlay: ((id: string, open: boolean) => void) | undefined
 
 /** Captures the registry so tests can dispatch commands by id (like ctrl+1/ctrl+2). */
 function CaptureRegistry() {
   registry = useCommands()
+  return null
+}
+
+/** Captures the overlay opener so tests can simulate Quick Open owning the keyboard. */
+function CaptureOverlay() {
+  setOverlay = useOverlay().setOverlayOpen
   return null
 }
 
@@ -35,6 +42,7 @@ function FocusHarness({ initial }: { initial: boolean }) {
 beforeEach(async () => {
   workbenchStore.reset()
   registry = null
+  setOverlay = undefined
   setEditorFocused = undefined
   dir = await mkdtemp(join(tmpdir(), "vsx-editorgroups-"))
 })
@@ -54,6 +62,7 @@ async function render(dims = { width: 80, height: 12 }) {
           <EditorGroups />
         </box>
         <CaptureRegistry />
+        <CaptureOverlay />
       </CommandsProvider>
     </OverlayProvider>,
     dims,
@@ -748,6 +757,58 @@ test("Toggle Word Wrap applies to every pane in a split", async () => {
   }
   // Both panes flip together — the setting is workbench-wide.
   expect(wraps()).toEqual(["none", "none"])
+})
+
+test("the composed macOS 'Ω' glyph (opt+z) toggles wrap without self-inserting", async () => {
+  const file = join(dir, "omega.ts")
+  await writeFile(file, "hello\n")
+  const doc = await documentRegistry.openDocument(file)
+  workbenchStore.openFile(file, { preview: false })
+
+  await render()
+  await waitForText("hello")
+
+  const ta = textareas()[0] as unknown as TextareaRenderable
+  expect(ta.wrapMode).toBe("word")
+
+  // opt+z on macOS (without option-as-alt) arrives as the bare glyph "Ω".
+  await testSetup!.mockInput.typeText("Ω")
+  const deadline = Date.now() + 2000
+  while (Date.now() < deadline && ta.wrapMode !== "none") {
+    await testSetup!.flush()
+    await Bun.sleep(20)
+  }
+
+  // The global alias flipped wrap AND suppressed the textarea's self-insert.
+  expect(ta.wrapMode).toBe("none")
+  expect((ta as unknown as { plainText: string }).plainText).not.toContain("Ω")
+  expect(doc.getText()).not.toContain("Ω")
+
+  documentRegistry.releaseDocument(file)
+})
+
+test("the 'Ω' glyph does NOT toggle wrap while an overlay owns the keyboard", async () => {
+  const file = join(dir, "omega-overlay.ts")
+  await writeFile(file, "hello\n")
+  workbenchStore.openFile(file, { preview: false })
+
+  await render()
+  await waitForText("hello")
+
+  const ta = textareas()[0] as unknown as TextareaRenderable
+  expect(ta.wrapMode).toBe("word")
+
+  // Simulate Quick Open owning the keyboard, as the real overlay does.
+  act(() => setOverlay!("quick-open", true))
+  await testSetup!.flush()
+
+  await testSetup!.mockInput.typeText("Ω")
+  await testSetup!.flush()
+  await Bun.sleep(60)
+  await testSetup!.flush()
+
+  // The gated alias stayed out of the way: wrap is untouched.
+  expect(ta.wrapMode).toBe("word")
 })
 
 test("editor.save writes the ACTIVE group's file, leaving the other pane's dirty file untouched", async () => {

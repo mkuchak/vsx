@@ -6,7 +6,7 @@ import { join, relative } from "node:path"
 import type { ReactNode } from "react"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { workbenchStore } from "../model/workbench"
-import type { CommandInfo } from "../services/commands"
+import { type CommandInfo, withMacSuper } from "../services/commands"
 import { scoreAndSort, type MatchRange } from "../services/fuzzy"
 import { enumerateFiles, listDir, type DirEntry } from "../services/workspace"
 import { theme } from "../theme"
@@ -150,14 +150,14 @@ export function QuickInput({
         id: "workbench.quickOpen",
         title: "Quick Open",
         category: "Navigation",
-        keybinding: "ctrl+p",
+        keybinding: withMacSuper("ctrl+p"),
         run: () => openWith(""),
       }),
       commands.registerCommand({
         id: "workbench.showCommands",
         title: "Show All Commands",
         category: "Navigation",
-        keybinding: "ctrl+shift+p",
+        keybinding: withMacSuper("ctrl+shift+p"),
         run: () => openWith(">"),
       }),
       // F1 fallback: Ctrl+Shift+letter needs a kitty-capable terminal to

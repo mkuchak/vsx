@@ -4,6 +4,15 @@ import { dirname, resolve } from "node:path"
 export type WorkspaceArgResult = { root: string; file?: string } | { error: string }
 
 /**
+ * Whether `--version`/`-v` appears anywhere in `argv` (VSCode's `code --version`).
+ * `argv` is `process.argv`, so the binary and script path (index < 2) are skipped.
+ * The flag wins over any positional so `vsx -v somedir` still prints the version.
+ */
+export function isVersionRequested(argv: string[]): boolean {
+  return argv.slice(2).some((entry) => entry === "--version" || entry === "-v")
+}
+
+/**
  * Resolve the optional workspace positional (VSCode's `code <dir|file>`).
  * `argv` is `process.argv`, so the first non-flag entry after the binary and
  * script path (index >= 2) is the workspace. Flags (leading `-`) are ignored.

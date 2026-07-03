@@ -2,9 +2,17 @@
 import { fileURLToPath } from "node:url"
 import { createCliRenderer } from "@opentui/core"
 import { createRoot } from "@opentui/react"
-import { resolveWorkspaceArg } from "./cli"
+import pkg from "../package.json"
+import { isVersionRequested, resolveWorkspaceArg } from "./cli"
 import { registerBundledGrammars } from "./grammars"
 import { App } from "./workbench/App"
+
+// `--version`/`-v` prints and exits before any renderer or shim work, so the
+// installer can probe the running version instantly. Runs first to stay fast.
+if (isVersionRequested(process.argv)) {
+  console.log(`vsx ${pkg.version}`)
+  process.exit(0)
+}
 
 // Point OpenTUI's tree-sitter client at our worker shim, which works around a
 // Bun 1.2.3 bug that otherwise stops the parser worker from ever booting (see

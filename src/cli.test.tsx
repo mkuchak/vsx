@@ -3,7 +3,8 @@ import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join, resolve } from "node:path"
 import { testRender } from "@opentui/react/test-utils"
-import { resolveWorkspaceArg } from "./cli"
+import pkg from "../package.json"
+import { isVersionRequested, resolveWorkspaceArg } from "./cli"
 import { documentRegistry } from "./model/documents"
 import { workbenchStore } from "./model/workbench"
 import { App } from "./workbench/App"
@@ -66,6 +67,22 @@ test("a symlink pointing at a real directory resolves successfully", async () =>
 test("leading-flag args are skipped in favor of the first positional", () => {
   const result = resolveWorkspaceArg(argv("--foo", "-x"), "/some/cwd")
   expect(result).toEqual({ root: "/some/cwd" })
+})
+
+test("--version is recognized regardless of position", () => {
+  expect(isVersionRequested(argv("--version"))).toBe(true)
+  expect(isVersionRequested(argv("-v", "somedir"))).toBe(true)
+  expect(isVersionRequested(argv("somedir", "-v"))).toBe(true)
+})
+
+test("absent version flags are not recognized", () => {
+  expect(isVersionRequested(argv())).toBe(false)
+  expect(isVersionRequested(argv("somedir"))).toBe(false)
+  expect(isVersionRequested(argv("--foo"))).toBe(false)
+})
+
+test("the printed version string matches the package version", () => {
+  expect(`vsx ${pkg.version}`).toBe("vsx 0.1.0")
 })
 
 // Integration: a resolved root that is NOT process.cwd() must drive the whole

@@ -5,6 +5,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { workbenchStore } from "../model/workbench"
+import { CommandsProvider } from "../workbench/CommandsProvider"
+import { ModalProvider } from "../workbench/ModalProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
 import { CommitLog, formatRelativeDate, parseRefs } from "./CommitLog"
 
@@ -62,11 +64,15 @@ afterEach(async () => {
 
 async function renderLog(pageSize?: number, dims = { width: 80, height: 20 }) {
   testSetup = await testRender(
-    <OverlayProvider>
-      <box width={dims.width} height={dims.height}>
-        <CommitLog workspaceRoot={root} focused pageSize={pageSize} />
-      </box>
-    </OverlayProvider>,
+    <CommandsProvider>
+      <OverlayProvider>
+        <ModalProvider>
+          <box width={dims.width} height={dims.height}>
+            <CommitLog workspaceRoot={root} focused pageSize={pageSize} />
+          </box>
+        </ModalProvider>
+      </OverlayProvider>
+    </CommandsProvider>,
     dims,
   )
   return testSetup
@@ -90,6 +96,17 @@ async function waitForText(text: string, timeoutMs = 4000) {
     await Bun.sleep(20)
   }
   throw new Error(`timed out waiting for "${text}"\n${setup.captureCharFrame()}`)
+}
+
+async function waitForGone(text: string, timeoutMs = 4000) {
+  const setup = testSetup!
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    await setup.flush()
+    if (!setup.captureCharFrame().includes(text)) return
+    await Bun.sleep(20)
+  }
+  throw new Error(`timed out waiting for "${text}" to disappear\n${setup.captureCharFrame()}`)
 }
 
 describe("formatRelativeDate", () => {
@@ -238,5 +255,80 @@ describe("CommitLog rendering + interaction", () => {
     expect(frame.split("rename b to c").length - 1).toBe(1)
     expect(frame.split("change a add b").length - 1).toBe(1)
     expect(frame).not.toContain("Load more") // reached the root; nothing older
+  })
+})
+
+// HEAD carries a multi-line body plus a two-file change so the overlay can show
+// the full message, author, and computed stats.
+async function buildDetailFixture(): Promise<void> {
+  await write("a.txt", "a1\na2\na3\n")
+  await sh(["add", "a.txt"])
+  await sh(["commit", "-qm", "root subject"])
+  await write("a.txt", "a1\naEDIT\na3\na4\n")
+  await write("newfile.txt", "n1\nn2\n")
+  await sh(["add", "-A"])
+  await sh([
+    "commit",
+    "-q",
+    "-m",
+    "detailed subject line",
+    "-m",
+    "This is a longer body paragraph.",
+  ])
+}
+
+async function openHeadDetails(): Promise<void> {
+  await buildDetailFixture()
+  await renderLog()
+  await waitForText("COMMITS")
+  testSetup!.mockInput.pressEnter() // expand the COMMITS section
+  await waitForText("detailed subject line")
+  testSetup!.mockInput.pressArrow("down") // select the HEAD (detailed) commit
+  await tick()
+  testSetup!.mockInput.pressKey("i") // open the details overlay
+  await waitForText("This is a longer body paragraph.")
+}
+
+describe("CommitDetailsOverlay wiring", () => {
+  test("i opens the overlay with the full message, author, email, and stats", async () => {
+    await openHeadDetails()
+
+    const frame = testSetup!.captureCharFrame()
+    expect(frame).toContain("detailed subject line")
+    expect(frame).toContain("This is a longer body paragraph.")
+    expect(frame).toContain("Tester")
+    expect(frame).toContain("a@b.com")
+
+    // Stats fetch lazily after open; wait for the "N files changed" line.
+    await waitForText("changed")
+    expect(testSetup!.captureCharFrame()).toContain("+")
+  })
+
+  test("Escape closes the overlay and list keys work again", async () => {
+    await openHeadDetails()
+
+    testSetup!.mockInput.pressEscape()
+    // Wait for the overlay to fully unmount (and isOverlayOpen to settle back to
+    // false) before pressing a list key — a keypress while still gated is lost.
+    // Generous deadlines: the git fixture + overlay open/close + poll chain runs
+    // close to bun:test's 5s default under load (seen finishing at ~4.7s), so the
+    // per-test timeout is raised well above the summed poll budget.
+    await waitForGone("This is a longer body paragraph.", 8000)
+    await tick()
+
+    // The list regained its key handling: Enter now toggles the commit's files.
+    testSetup!.mockInput.pressEnter()
+    await waitForText("newfile.txt", 8000)
+  }, 15000)
+
+  test("the open overlay gates the list's own keys", async () => {
+    await openHeadDetails()
+
+    // Enter is swallowed while the overlay owns the screen: it must not toggle
+    // the changed-files list, and the overlay stays open.
+    testSetup!.mockInput.pressEnter()
+    await tick()
+    expect(testSetup!.captureCharFrame()).toContain("This is a longer body paragraph.")
+    expect(testSetup!.captureCharFrame()).not.toContain("newfile.txt")
   })
 })

@@ -6,6 +6,7 @@ import { workbenchStore } from "../model/workbench"
 import type { CommitInfo, DiffEntry } from "../services/git"
 import { discoverRepositories, type RepoInfo } from "../services/repos"
 import { gitStatusColor, theme } from "../theme"
+import { useCommitDetails } from "../workbench/ModalProvider"
 import { useOverlay } from "../workbench/OverlayProvider"
 
 /** Git's well-known empty-tree SHA; used as the "before" ref for a root commit. */
@@ -137,6 +138,7 @@ export type CommitLogProps = {
  */
 export function CommitLog({ workspaceRoot, focused, pageSize = DEFAULT_PAGE_SIZE }: CommitLogProps) {
   const { isOverlayOpen } = useOverlay()
+  const showCommitDetails = useCommitDetails()
   const [repos, setRepos] = useState<RepoInfo[]>([])
   const [states, setStates] = useState<Map<string, RepoState>>(() => new Map())
   const [selectedIndex, setSelectedIndex] = useState(0)
@@ -288,6 +290,15 @@ export function CommitLog({ workspaceRoot, focused, pageSize = DEFAULT_PAGE_SIZE
 
   const selectRow = (index: number) => setSelectedIndex(index)
 
+  const openDetails = (repoRoot: string, commit: CommitInfo) => {
+    const svc = serviceFor(repoRoot)
+    if (!svc) return
+    showCommitDetails({
+      commit,
+      fetchStats: () => svc.commitStats(commit.hash).catch(() => null),
+    })
+  }
+
   useKeyboard((key) => {
     if (!focused || isOverlayOpen) return
     switch (key.name) {
@@ -301,6 +312,11 @@ export function CommitLog({ workspaceRoot, focused, pageSize = DEFAULT_PAGE_SIZE
       case "enter": {
         const row = rows[selectedIndex]
         if (row) activateRow(row)
+        break
+      }
+      case "i": {
+        const row = rows[selectedIndex]
+        if (row && row.type === "commit") openDetails(row.repoRoot, row.commit)
         break
       }
     }
@@ -351,6 +367,7 @@ export function CommitLog({ workspaceRoot, focused, pageSize = DEFAULT_PAGE_SIZE
                       selectedId={selectedId}
                       onSelect={selectRow}
                       onActivate={activateRow}
+                      onShowDetails={openDetails}
                     />
                   )
                 ) : null}
@@ -370,6 +387,7 @@ function CommitList({
   selectedId,
   onSelect,
   onActivate,
+  onShowDetails,
 }: {
   repo: RepoInfo
   state: RepoState
@@ -377,6 +395,7 @@ function CommitList({
   selectedId: string | undefined
   onSelect: (index: number) => void
   onActivate: (row: Row) => void
+  onShowDetails: (repoRoot: string, commit: CommitInfo) => void
 }) {
   const indexOf = (id: string) => rows.findIndex((r) => r.id === id)
 
@@ -408,7 +427,21 @@ function CommitList({
               ))}
               <box flexGrow={1} />
               <text fg={theme.dimForeground}>{formatRelativeDate(commit.authorDate)}</text>
-              <text fg={theme.dimForeground}> </text>
+              {selectedId === commitId ? (
+                <text
+                  fg={theme.info}
+                  onMouseDown={(event) => {
+                    // stopPropagation so the ⓘ opens details without the row's
+                    // own onMouseDown also toggling its changed-files list.
+                    event.stopPropagation()
+                    onShowDetails(repo.root, commit)
+                  }}
+                >
+                  {" ⓘ"}
+                </text>
+              ) : (
+                <text fg={theme.dimForeground}> </text>
+              )}
             </box>
             {files === "loading" ? (
               <box paddingLeft={4}>

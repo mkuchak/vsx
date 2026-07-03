@@ -1,5 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react"
+import { CommitDetailsOverlay } from "../ui/CommitDetailsOverlay"
 import { ConfirmDialog, type ConfirmButton } from "../ui/ConfirmDialog"
+import type { CommitInfo, CommitStats } from "../services/git"
 import { useOverlay } from "./OverlayProvider"
 
 export type ConfirmOptions = {
@@ -9,9 +11,17 @@ export type ConfirmOptions = {
   buttons: ConfirmButton[]
 }
 
+export type CommitDetailsOptions = {
+  commit: CommitInfo
+  /** Lazily fetched when the overlay opens; resolves null on failure. */
+  fetchStats: () => Promise<CommitStats | null>
+}
+
 type ModalContextValue = {
   /** Open a confirmation; resolves with the chosen button id, or null if cancelled. */
   confirm: (options: ConfirmOptions) => Promise<string | null>
+  /** Open the read-only commit-details inspector over the whole viewport. */
+  showCommitDetails: (options: CommitDetailsOptions) => void
 }
 
 type PendingModal = ConfirmOptions & { resolve: (choice: string | null) => void }
@@ -28,6 +38,7 @@ const ModalContext = createContext<ModalContextValue | null>(null)
 export function ModalProvider({ children }: { children?: ReactNode }) {
   const { setOverlayOpen } = useOverlay()
   const [pending, setPending] = useState<PendingModal | null>(null)
+  const [details, setDetails] = useState<CommitDetailsOptions | null>(null)
   const pendingRef = useRef<PendingModal | null>(null)
   pendingRef.current = pending
 
@@ -37,6 +48,13 @@ export function ModalProvider({ children }: { children?: ReactNode }) {
     setOverlayOpen("modal", pending !== null)
     return () => setOverlayOpen("modal", false)
   }, [pending, setOverlayOpen])
+
+  // The commit-details inspector is a separate overlay id so it gates global keys
+  // and restores focus independently of any confirm dialog.
+  useEffect(() => {
+    setOverlayOpen("commitDetails", details !== null)
+    return () => setOverlayOpen("commitDetails", false)
+  }, [details, setOverlayOpen])
 
   const confirm = useCallback((options: ConfirmOptions) => {
     return new Promise<string | null>((resolve) => {
@@ -54,6 +72,10 @@ export function ModalProvider({ children }: { children?: ReactNode }) {
     current?.resolve(choice)
   }, [])
 
+  const showCommitDetails = useCallback((options: CommitDetailsOptions) => {
+    setDetails(options)
+  }, [])
+
   // Teardown while a modal is still open: settle the dangling promise so awaiters
   // don't hang. ConfirmDialog's own effect cleanup pops the keymap layer.
   useEffect(() => {
@@ -62,7 +84,7 @@ export function ModalProvider({ children }: { children?: ReactNode }) {
     }
   }, [])
 
-  const value: ModalContextValue = { confirm }
+  const value: ModalContextValue = { confirm, showCommitDetails }
 
   return (
     <ModalContext.Provider value={value}>
@@ -76,6 +98,13 @@ export function ModalProvider({ children }: { children?: ReactNode }) {
           onCancel={() => resolveWith(null)}
         />
       ) : null}
+      {details ? (
+        <CommitDetailsOverlay
+          commit={details.commit}
+          fetchStats={details.fetchStats}
+          onClose={() => setDetails(null)}
+        />
+      ) : null}
     </ModalContext.Provider>
   )
 }
@@ -84,4 +113,10 @@ export function useConfirm(): (options: ConfirmOptions) => Promise<string | null
   const ctx = useContext(ModalContext)
   if (!ctx) throw new Error("useConfirm must be used within a ModalProvider")
   return ctx.confirm
+}
+
+export function useCommitDetails(): (options: CommitDetailsOptions) => void {
+  const ctx = useContext(ModalContext)
+  if (!ctx) throw new Error("useCommitDetails must be used within a ModalProvider")
+  return ctx.showCommitDetails
 }

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { workbenchStore } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
 import { withMacSuper } from "../services/commands"
+import { createFileHistory, type FileHistory } from "../services/fileHistory"
 import { KeyInspector } from "../services/keyInspector"
 import { getLastRendererSelection, handleRendererSelection } from "./rendererSelection"
 import { activeRepoFor, discoverRepositories, type RepoInfo } from "../services/repos"
@@ -162,6 +163,18 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
   // (and diff panes reading the live file) keep their unsaved edits alive.
   useEffect(() => startDocumentRetainer(), [])
 
+  // Persisted frecency file-history: records every real file open so Quick Open
+  // can rank most-used files across projects. Created once (lazy ref) at render so
+  // the SAME instance both records opens and backs Quick Open's ranking/eviction.
+  // The recorder wiring below still mounts BEFORE the initialFile effect, so the
+  // `vsx <file>` boot open is counted too.
+  const fileHistoryRef = useRef<FileHistory | null>(null)
+  const fileHistory = (fileHistoryRef.current ??= createFileHistory())
+  useEffect(() => {
+    workbenchStore.setOpenRecorder(fileHistory.record)
+    return () => workbenchStore.setOpenRecorder(null)
+  }, [fileHistory])
+
   // `vsx <file>` opens that file on boot as a permanent tab (matching `code
   // <file>`); openFile also activates it and moves focus into the editor.
   // Mount-once: the CLI arg is fixed for the session, so re-running on prop
@@ -213,7 +226,12 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
         title: "Quit vsx",
         category: "Workbench",
         keybinding: "ctrl+q",
-        run: () => renderer.destroy(),
+        run: () => {
+          // Best-effort: persist the frecency ranking before teardown, but never
+          // block or fail quitting on a cache write — fire-and-forget, then destroy.
+          fileHistoryRef.current?.flush().catch(() => {})
+          renderer.destroy()
+        },
       }),
     [commands, renderer],
   )
@@ -401,7 +419,7 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
           onToggleSidebar={toggleSidebar}
           overlayOpen={isOverlayOpen}
         />
-        <QuickInput workspaceRoot={workspaceRoot} onGotoLine={gotoLine} />
+        <QuickInput workspaceRoot={workspaceRoot} onGotoLine={gotoLine} fileHistory={fileHistory} />
       </ModalProvider>
     </box>
   )

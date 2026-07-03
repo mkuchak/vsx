@@ -7,11 +7,15 @@ import { testRender } from "@opentui/react/test-utils"
 import { CommandsProvider } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
 import { workbenchStore } from "../model/workbench"
+import { createFileHistory, type FileHistory } from "../services/fileHistory"
 import * as workspace from "../services/workspace"
 import type { DirEntry } from "../services/workspace"
 import { QuickInput, splitPathQuery } from "./QuickInput"
 
 const HOME = "/home/tester"
+// The delete key escape sequence; with kittyKeyboard the mock re-encodes it as a
+// kitty `delete` so `pressKey(DELETE, { shift: true })` becomes Shift+Delete.
+const DELETE = "\x1b[3~"
 
 describe("splitPathQuery", () => {
   test("splits an absolute path at the last slash", () => {
@@ -54,6 +58,8 @@ let testSetup: Awaited<ReturnType<typeof testRender>>
 let dir: string
 // Fixture directory created OUTSIDE the workspace root for path-browse tests.
 let browseDir: string | undefined
+// Isolated state dir backing hermetic FileHistory instances (never the real one).
+let historyDir: string
 
 beforeEach(async () => {
   workbenchStore.reset()
@@ -63,21 +69,35 @@ beforeEach(async () => {
   await writeFile(join(dir, "src", "util.ts"), "export {}\n")
   await writeFile(join(dir, "src", "utils_helper.ts"), "export {}\n")
   await writeFile(join(dir, "README.md"), "# hi\n")
+  historyDir = await mkdtemp(join(tmpdir(), "vsx-history-"))
 })
 
 afterEach(async () => {
   if (testSetup) testSetup.renderer.destroy()
   workbenchStore.reset()
+  // Clear any recorder a test wired so it can't leak into the next one.
+  workbenchStore.setOpenRecorder(null)
   await rm(dir, { recursive: true, force: true })
+  await rm(historyDir, { recursive: true, force: true })
   if (browseDir) {
     await rm(browseDir, { recursive: true, force: true })
     browseDir = undefined
   }
 })
 
+// A hermetic history backed by the per-test temp state dir.
+function makeHistory(): FileHistory {
+  return createFileHistory({ baseDir: historyDir })
+}
+
+// Record `path` `times` opens into `history`, oldest bump first.
+function seed(history: FileHistory, path: string, times = 1): void {
+  for (let i = 0; i < times; i++) history.record(path)
+}
+
 let gotoCalls: Array<[number, number | undefined]>
 
-function render(homeDir?: string) {
+function render(homeDir?: string, fileHistory?: FileHistory) {
   gotoCalls = []
   return testRender(
     <OverlayProvider>
@@ -85,14 +105,25 @@ function render(homeDir?: string) {
         <QuickInput
           workspaceRoot={dir}
           homeDir={homeDir}
+          fileHistory={fileHistory}
           onGotoLine={(line, column) => gotoCalls.push([line, column])}
         />
       </CommandsProvider>
     </OverlayProvider>,
-    // kittyKeyboard lets the mock emit disambiguated Ctrl+Shift+letter and F1
-    // sequences (a real terminal needs the same capability for these chords).
+    // kittyKeyboard lets the mock emit disambiguated Ctrl+Shift+letter, F1, and
+    // Shift+Delete sequences (a real terminal needs the same capability).
     { width: 80, height: 24, kittyKeyboard: true },
   )
+}
+
+// Screen coordinate (0-based) of the first `glyph` in the current frame, or null.
+function findGlyph(glyph: string): { x: number; y: number } | null {
+  const lines = testSetup.captureCharFrame().split("\n")
+  for (let y = 0; y < lines.length; y++) {
+    const x = lines[y]!.indexOf(glyph)
+    if (x !== -1) return { x, y }
+  }
+  return null
 }
 
 // Lets React commit state AND run passive effects (which refresh useKeyboard's
@@ -326,23 +357,56 @@ test("switching from file text to a leading '>' re-routes to command mode live",
   expect(frame).not.toContain("util.ts")
 })
 
-test("reopening with an empty query shows the recently-opened list", async () => {
-  testSetup = await render()
+test("empty query ranks the most-used files by frecency across projects", async () => {
+  const history = makeHistory()
+  seed(history, join(dir, "src", "index.ts"), 3)
+  seed(history, join(dir, "README.md"), 1)
+  testSetup = await render(undefined, history)
   await settle()
 
-  // Accept a file once to populate the MRU.
   await open()
-  await testSetup.mockInput.typeText("index")
   await settle()
-  testSetup.mockInput.pressEnter()
-  await settle()
-  expect(activePath()).toBe(join(dir, "src", "index.ts"))
-
-  // Reopen with an empty query — the accepted file appears without retyping.
-  await open()
   const frame = testSetup.captureCharFrame()
-  expect(frame).toContain("Go to file")
   expect(frame).toContain("index.ts")
+  expect(frame).toContain("README.md")
+  // The 3×-opened file outranks the 1×-opened one.
+  expect(frame.indexOf("index.ts")).toBeLessThan(frame.indexOf("README.md"))
+})
+
+test("empty query shows an outside-workspace entry with a ~-path and badge", async () => {
+  // Injected home holds a file that lives OUTSIDE the workspace root.
+  browseDir = await mkdtemp(join(tmpdir(), "vsx-home-"))
+  await mkdir(join(browseDir, "proj"))
+  const outside = join(browseDir, "proj", "notes.txt")
+  await writeFile(outside, "x")
+
+  const history = makeHistory()
+  seed(history, outside, 2)
+  testSetup = await render(browseDir, history)
+  await settle()
+
+  await open()
+  await settle()
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("notes.txt")
+  // Home-abbreviated path + the outside badge, not an ugly ../../ chain.
+  expect(frame).toContain("~/proj/notes.txt")
+  expect(frame).toContain("↗")
+})
+
+test("empty query filters out a history entry whose file no longer exists", async () => {
+  const history = makeHistory()
+  seed(history, join(dir, "README.md"), 1)
+  // Never written to disk — should be stat-filtered out of the display.
+  seed(history, join(dir, "src", "gone.ts"), 5)
+  testSetup = await render(undefined, history)
+  await settle()
+
+  await open()
+  await settle()
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("README.md")
+  expect(frame).not.toContain("gone.ts")
 })
 
 // Builds a fixture tree OUTSIDE the workspace root: two dirs + two files, plus a
@@ -504,4 +568,160 @@ test("a fragment keystroke that cancels an in-flight directory load still lists 
   } finally {
     spy.mockRestore()
   }
+})
+
+test("a typed-query favorite wins a same-tier tie against a non-favorite", async () => {
+  // Both files prefix-match "util" (same tier); util.ts otherwise sorts first.
+  const history = makeHistory()
+  seed(history, join(dir, "src", "utils_helper.ts"), 5)
+  testSetup = await render(undefined, history)
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText("util")
+  await settle()
+
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("util.ts")
+  expect(frame).toContain("utils_helper.ts")
+  // The frecency boost lifts the favorite above the otherwise-higher util.ts.
+  expect(frame.indexOf("utils_helper.ts")).toBeLessThan(frame.indexOf("util.ts"))
+})
+
+test("an outside match renders in the trailing group, never above an in-project exact match", async () => {
+  browseDir = await mkdtemp(join(tmpdir(), "vsx-home-"))
+  await mkdir(join(browseDir, "proj"))
+  const outside = join(browseDir, "proj", "index.ts")
+  await writeFile(outside, "x")
+
+  const history = makeHistory()
+  // Heavily favored, yet still pinned below the in-project index.ts by grouping.
+  seed(history, outside, 10)
+  testSetup = await render(browseDir, history)
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText("index.ts")
+  await settle()
+
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("src/index.ts")
+  expect(frame).toContain("~/proj/index.ts")
+  expect(frame).toContain("↗")
+  expect(frame.indexOf("src/index.ts")).toBeLessThan(frame.indexOf("~/proj/index.ts"))
+})
+
+test("a project file also in history appears once, not duplicated in the outside group", async () => {
+  const history = makeHistory()
+  seed(history, join(dir, "src", "util.ts"), 3)
+  testSetup = await render(undefined, history)
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText("util")
+  await settle()
+
+  const frame = testSetup.captureCharFrame()
+  // The in-workspace history entry boosts the project row but is not re-listed
+  // in the outside group (its display path appears exactly once).
+  expect(frame.split("src/util.ts").length - 1).toBe(1)
+})
+
+test("accept() opens and records through the store exactly once (no MRU double-count)", async () => {
+  const history = makeHistory()
+  // Wire the store's recorder to the SAME injected history, as App does.
+  workbenchStore.setOpenRecorder(history.record)
+  testSetup = await render(undefined, history)
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText("index")
+  await settle()
+  testSetup.mockInput.pressEnter()
+  await settle()
+
+  const abs = join(dir, "src", "index.ts")
+  expect(activePath()).toBe(abs)
+  // Recorded a single open — the removed mruRef never double-counted the store.
+  expect(history.top(10).find((e) => e.path === abs)?.score).toBe(1)
+})
+
+test("Shift+Delete on a history row removes it from the list and the store", async () => {
+  const history = makeHistory()
+  seed(history, join(dir, "src", "index.ts"), 3)
+  seed(history, join(dir, "README.md"), 1)
+  testSetup = await render(undefined, history)
+  await settle()
+  await open()
+  await settle()
+
+  // index.ts is the top (selected) row; Shift+Delete evicts it.
+  testSetup.mockInput.pressKey(DELETE, { shift: true })
+  await settle()
+
+  const frame = testSetup.captureCharFrame()
+  expect(frame).not.toContain("index.ts")
+  expect(frame).toContain("README.md")
+
+  // Persisted: a fresh instance from the same dir no longer knows the path.
+  await history.flush()
+  const reloaded = makeHistory()
+  expect(reloaded.top(10).some((e) => e.path === join(dir, "src", "index.ts"))).toBe(false)
+  expect(reloaded.top(10).some((e) => e.path === join(dir, "README.md"))).toBe(true)
+})
+
+test("clicking the ✕ evicts the row without opening the file", async () => {
+  const history = makeHistory()
+  seed(history, join(dir, "README.md"), 1)
+  testSetup = await render(undefined, history)
+  await settle()
+  await open()
+  await settle()
+
+  const cross = findGlyph("✕")
+  expect(cross).not.toBeNull()
+  await testSetup.mockMouse.click(cross!.x, cross!.y)
+  await settle()
+
+  // The row is gone AND nothing was opened (stopPropagation kept onAccept silent).
+  expect(testSetup.captureCharFrame()).not.toContain("README.md")
+  expect(activePath()).toBeNull()
+})
+
+test("Shift+Delete on a project (non-history) row is a no-op", async () => {
+  const history = makeHistory()
+  testSetup = await render(undefined, history)
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText("util")
+  await settle()
+  // The selected row is a project fuzzy result with no onEvict.
+  testSetup.mockInput.pressKey(DELETE, { shift: true })
+  await settle()
+
+  // Nothing removed, nothing opened, no crash.
+  expect(testSetup.captureCharFrame()).toContain("util.ts")
+  expect(activePath()).toBeNull()
+})
+
+test("evicting the last row keeps the selection valid", async () => {
+  const history = makeHistory()
+  seed(history, join(dir, "README.md"), 1)
+  testSetup = await render(undefined, history)
+  await settle()
+  await open()
+  await settle()
+
+  testSetup.mockInput.pressKey(DELETE, { shift: true })
+  await settle()
+
+  // Empty list, overlay still alive; navigation/accept can't crash or go OOB.
+  expect(testSetup.captureCharFrame()).toContain("Go to file")
+  testSetup.mockInput.pressArrow("down")
+  testSetup.mockInput.pressArrow("up")
+  testSetup.mockInput.pressEnter()
+  await settle()
+  expect(activePath()).toBeNull()
+  expect(testSetup.captureCharFrame()).toContain("Go to file")
 })

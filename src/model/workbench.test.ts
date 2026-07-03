@@ -988,3 +988,68 @@ describe("focus area", () => {
     expect(store.getState().focusArea).toBe("editor")
   })
 })
+
+describe("open recorder", () => {
+  test("records a fresh file open exactly once", () => {
+    const store = new WorkbenchStore()
+    const recorded: string[] = []
+    store.setOpenRecorder((p) => recorded.push(p))
+
+    store.openFile("/a.ts")
+    expect(recorded).toEqual(["/a.ts"])
+  })
+
+  test("re-activating the already-active tab does NOT record again", () => {
+    const store = new WorkbenchStore()
+    const recorded: string[] = []
+    store.setOpenRecorder((p) => recorded.push(p))
+
+    store.openFile("/a.ts")
+    // Repeated opens of the same, already-active file (preview re-click, promote).
+    store.openFile("/a.ts")
+    store.openFile("/a.ts", { preview: false })
+    expect(recorded).toEqual(["/a.ts"])
+  })
+
+  test("switching to a different file, then back, records both opens", () => {
+    const store = new WorkbenchStore()
+    const recorded: string[] = []
+    store.setOpenRecorder((p) => recorded.push(p))
+
+    store.openFile("/a.ts", { preview: false })
+    store.openFile("/b.ts", { preview: false })
+    store.openFile("/a.ts") // a.ts is open but not active → counts as a real open
+    expect(recorded).toEqual(["/a.ts", "/b.ts", "/a.ts"])
+  })
+
+  test("openDiff and openCommitDiff never record", () => {
+    const store = new WorkbenchStore()
+    const recorded: string[] = []
+    store.setOpenRecorder((p) => recorded.push(p))
+
+    store.openDiff("/repo/a.ts", "unstaged", "/repo")
+    store.openCommitDiff("/repo/a.ts", "old", "new", "/repo", "a.ts (new)")
+    expect(recorded).toEqual([])
+  })
+
+  test("clearing the recorder with null stops recording", () => {
+    const store = new WorkbenchStore()
+    const recorded: string[] = []
+    store.setOpenRecorder((p) => recorded.push(p))
+    store.openFile("/a.ts")
+    store.setOpenRecorder(null)
+    store.openFile("/b.ts")
+    expect(recorded).toEqual(["/a.ts"])
+  })
+
+  test("a throwing recorder does not break openFile", () => {
+    const store = new WorkbenchStore()
+    store.setOpenRecorder(() => {
+      throw new Error("boom")
+    })
+
+    expect(() => store.openFile("/a.ts")).not.toThrow()
+    expect(activeTabs(store)).toEqual(["/a.ts"])
+    expect(activePath(store)).toBe("/a.ts")
+  })
+})

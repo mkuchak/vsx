@@ -1,10 +1,12 @@
 import type { KeyEvent, Renderable, ScrollBoxRenderable } from "@opentui/core"
 import type { Binding, Command, KeyLike } from "@opentui/keymap"
 import { useKeyboard } from "@opentui/react"
+import { access } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join, relative } from "node:path"
 import type { ReactNode } from "react"
 import { useEffect, useMemo, useRef, useState } from "react"
+import type { FileHistory } from "../services/fileHistory"
 import { workbenchStore } from "../model/workbench"
 import { type CommandInfo, withMacSuper } from "../services/commands"
 import { scoreAndSort, type MatchRange } from "../services/fuzzy"
@@ -14,11 +16,49 @@ import { useCommands } from "../workbench/CommandsProvider"
 import { useOverlay } from "../workbench/OverlayProvider"
 
 const MAX_RESULTS = 50
-const MRU_CAP = 20
+// Global recommendations shown on an empty query, and the trailing cap on
+// out-of-workspace history matches for a typed query.
+const EMPTY_QUERY_TOP = 15
+const OUTSIDE_CAP = 5
+// How deep into the ranked history to scan for boosts / outside matches / staleness.
+const HISTORY_SCAN = 200
+// Frecency boost ceiling for a typed-query favorite. Kept far below the fuzzy
+// tier size (65536) so a boost reorders WITHIN a match tier but never across one.
+const FRECENCY_BOOST_MAX = 1000
+// Dim marker on rows whose file lives outside the workspace, so opening (or
+// evicting) one is no surprise.
+const OUTSIDE_BADGE = "↗"
 
 function basename(path: string): string {
   const i = path.lastIndexOf("/")
   return i === -1 ? path : path.slice(i + 1)
+}
+
+/** Whether `path` is `dir` itself or nested under it. */
+function isInside(path: string, dir: string): boolean {
+  if (path === dir) return true
+  return path.startsWith(dir.endsWith("/") ? dir : `${dir}/`)
+}
+
+/**
+ * How a history entry's ABSOLUTE path reads in the picker: workspace-relative
+ * when it lives under the root, else the home dir abbreviated to `~`. A bare
+ * `relative(workspaceRoot, …)` would yield ugly ../../ chains for outside-root
+ * paths, so those get the `~` abbreviation (or the raw absolute path) instead.
+ */
+function displayPath(absPath: string, workspaceRoot: string, home: string): string {
+  if (isInside(absPath, workspaceRoot)) return relative(workspaceRoot, absPath)
+  if (isInside(absPath, home)) return `~${absPath.slice(home.length)}`
+  return absPath
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function capitalize(part: string): string {
@@ -71,9 +111,13 @@ type ResultItem = {
   description?: string
   /** Right-aligned, dimmed keybinding hint (command mode only). */
   keybinding?: string
+  /** Dim trailing marker, e.g. the outside-workspace badge. */
+  badge?: string
   labelMatches: MatchRange[]
   descriptionMatches: MatchRange[]
   onAccept: () => void
+  /** History-sourced rows only: remove this entry from the frecency store. */
+  onEvict?: () => void
 }
 
 function highlight(text: string, ranges: MatchRange[]): ReactNode {
@@ -93,12 +137,18 @@ export function QuickInput({
   workspaceRoot,
   onGotoLine,
   homeDir,
+  fileHistory,
 }: {
   workspaceRoot: string
   onGotoLine?: (line: number, column?: number) => void
   // Overridable home for `~` expansion; defaults to the OS home. Injectable so
   // path-browse tests stay hermetic instead of reading the CI machine's $HOME.
   homeDir?: string
+  // The cross-project frecency ranking that powers the empty-query
+  // recommendations, typed-query boosts, and per-entry eviction. Injected (like
+  // `homeDir`) so tests seed a hermetic store instead of the real state dir; when
+  // absent the history features are simply inert.
+  fileHistory?: FileHistory
 }) {
   const commands = useCommands()
   const { setOverlayOpen } = useOverlay()
@@ -122,19 +172,23 @@ export function QuickInput({
     entries: [],
   })
 
-  // Self-contained "recently opened" MRU standing in for a real global one,
-  // which does not exist yet. A future workbench-level MRU can replace this.
-  // Stores ABSOLUTE paths (matching the document/tab invariant); the relative
-  // display label is derived at render time.
-  const mruRef = useRef<string[]>([])
   // What was active before opening — tracked for future MRU/focus-restore work.
   const restoreRef = useRef<string | null>(null)
 
+  // History paths that no longer exist on disk (stat'd on open); filtered out of
+  // display so a deleted favorite never shows as a dead row.
+  const [missingHistory, setMissingHistory] = useState<Set<string>>(() => new Set())
+  // Bumped on eviction to force the results memo to re-read the (mutated-in-place)
+  // history store, which does not notify React on its own.
+  const [evictTick, setEvictTick] = useState(0)
+
   const scrollRef = useRef<ScrollBoxRenderable | null>(null)
 
-  // Live mirror so the modal layer's Down command (registered once per open) can
-  // clamp against the current result count without re-registering every render.
+  // Live mirrors so the modal layer's commands (registered once per open) can read
+  // the current results/selection without re-registering every render.
   const resultsRef = useRef<ResultItem[]>([])
+  const selectedIndexRef = useRef(0)
+  selectedIndexRef.current = selectedIndex
 
   useEffect(() => {
     const openWith = (seed: string) => {
@@ -215,6 +269,29 @@ export function QuickInput({
     }
   }, [visible, query, home, dirListing.dir])
 
+  // On open, stat the ranked history paths and hide any that vanished from disk
+  // (display-only — the store's own 90-day `pruneMissing` is the real remover,
+  // kicked opportunistically here). Mirrors the listDir effect's cancel flag so a
+  // reopen mid-scan can't commit a stale result.
+  useEffect(() => {
+    if (!visible || !fileHistory) return
+    let cancelled = false
+    const candidates = fileHistory.top(HISTORY_SCAN)
+    void (async () => {
+      const missing = new Set<string>()
+      await Promise.all(
+        candidates.map(async (e) => {
+          if (!(await pathExists(e.path))) missing.add(e.path)
+        }),
+      )
+      if (!cancelled) setMissingHistory(missing)
+    })()
+    void fileHistory.pruneMissing(pathExists)
+    return () => {
+      cancelled = true
+    }
+  }, [visible, fileHistory])
+
   // Modal keymap layer, live for the whole time the overlay is open. It (a)
   // shadows base bindings such as ctrl+q quit so they can't fire mid-query, and
   // (b) owns Up/Down — the focused <input> swallows arrow keys before they reach
@@ -232,11 +309,18 @@ export function QuickInput({
         name: "quickInput.down",
         run: () => setSelectedIndex((i) => Math.min(resultsRef.current.length - 1, i + 1)),
       },
+      // Shift+Delete (the browser remove-suggestion idiom) evicts the selected row
+      // IF it is history-sourced; a no-op otherwise. Ctrl+X stays reserved for cut.
+      {
+        name: "quickInput.evict",
+        run: () => resultsRef.current[selectedIndexRef.current]?.onEvict?.(),
+      },
       { name: "quickInput.block", run: () => {} },
     ] as unknown as Command<Renderable, KeyEvent>[]
     const bindings = [
       { key: "up", cmd: "quickInput.up" },
       { key: "down", cmd: "quickInput.down" },
+      { key: "shift+delete", cmd: "quickInput.evict" },
       { key: "ctrl+q", cmd: "quickInput.block" },
     ] as unknown as Binding<Renderable, KeyEvent>[]
     return commands.pushLayer({ commands: layerCommands, bindings })
@@ -245,9 +329,17 @@ export function QuickInput({
   // `absPath` MUST be absolute — tab paths and the document registry are keyed by
   // absolute path, so the same file never becomes two tabs/Documents.
   const accept = (absPath: string) => {
+    // openFile records the open through the store's frecency recorder — the ranking
+    // now lives in the injected history service, not a local MRU.
     workbenchStore.openFile(absPath, { preview: true })
-    mruRef.current = [absPath, ...mruRef.current.filter((p) => p !== absPath)].slice(0, MRU_CAP)
     setVisible(false)
+  }
+
+  const evict = (absPath: string) => {
+    fileHistory?.evict(absPath)
+    // The store mutates in place without notifying React; bump a tick so the
+    // results memo re-reads top()/frecency and drops the evicted row.
+    setEvictTick((t) => t + 1)
   }
 
   const results = useMemo<ResultItem[]>(() => {
@@ -345,28 +437,89 @@ export function QuickInput({
       }))
     }
 
+    // Empty query: global recommendations — the most-used files across ALL
+    // projects, by frecency. Absolute paths; in-workspace ones read relative, the
+    // rest `~`-abbreviated + badged. Missing-on-disk paths are filtered out.
     if (query === "") {
-      return mruRef.current.map((absPath) => ({
-        label: basename(absPath),
-        description: relative(workspaceRoot, absPath),
-        labelMatches: [],
-        descriptionMatches: [],
-        onAccept: () => accept(absPath),
-      }))
+      if (!fileHistory) return []
+      return fileHistory
+        .top(EMPTY_QUERY_TOP)
+        .filter((e) => !missingHistory.has(e.path))
+        .map((e) => ({
+          label: basename(e.path),
+          description: displayPath(e.path, workspaceRoot, home),
+          badge: isInside(e.path, workspaceRoot) ? undefined : OUTSIDE_BADGE,
+          labelMatches: [] as MatchRange[],
+          descriptionMatches: [] as MatchRange[],
+          onAccept: () => accept(e.path),
+          onEvict: () => evict(e.path),
+        }))
     }
-    // `enumerateFiles` yields workspace-relative paths (git ls-files-relative); we
-    // display the relative label but open the absolute path to keep the invariant.
-    return scoreAndSort(query, files, (f) => ({ label: basename(f), description: f }))
+
+    // Typed query: project fuzzy stays the PRIMARY list (`enumerateFiles` yields
+    // workspace-relative paths — display relative, open absolute). A file also in
+    // the history earns a bounded additive frecency boost, normalized to
+    // 0..FRECENCY_BOOST_MAX (far below the fuzzy tier size), so favorites win ties
+    // within a match tier without ever jumping tiers.
+    const now = Date.now()
+    const frecencyByPath = new Map<string, number>()
+    let maxFrecency = 0
+    if (fileHistory) {
+      for (const e of fileHistory.top(HISTORY_SCAN, now)) {
+        const f = fileHistory.frecency(e, now)
+        frecencyByPath.set(e.path, f)
+        if (f > maxFrecency) maxFrecency = f
+      }
+    }
+    const boostFor = (absPath: string): number => {
+      const f = frecencyByPath.get(absPath)
+      if (f === undefined || maxFrecency <= 0) return 0
+      return Math.round((f / maxFrecency) * FRECENCY_BOOST_MAX)
+    }
+
+    const projectScored = scoreAndSort(query, files, (f) => ({ label: basename(f), description: f }))
+      .map((r) => ({ r, abs: join(workspaceRoot, r.item), boosted: 0 }))
+      .map((x) => ({ ...x, boosted: x.r.score + boostFor(x.abs) }))
+      .sort((a, b) => b.boosted - a.boosted)
       .slice(0, MAX_RESULTS)
-      .map((r) => ({
-        label: basename(r.item),
-        description: r.item,
-        labelMatches: r.labelMatches,
-        descriptionMatches: r.descriptionMatches,
-        onAccept: () => accept(join(workspaceRoot, r.item)),
+    const projectAbs = new Set(projectScored.map((x) => x.abs))
+    const projectItems: ResultItem[] = projectScored.map(({ r, abs }) => ({
+      label: basename(r.item),
+      description: r.item,
+      labelMatches: r.labelMatches,
+      descriptionMatches: r.descriptionMatches,
+      onAccept: () => accept(abs),
+    }))
+
+    // History files OUTSIDE the workspace that fuzzy-match render as a compact,
+    // badged group AFTER the project results — never above a same-name in-project
+    // match — deduped by absolute path against the project list.
+    let outsideItems: ResultItem[] = []
+    if (fileHistory) {
+      const outsideEntries = fileHistory
+        .top(HISTORY_SCAN, now)
+        .filter((e) => !isInside(e.path, workspaceRoot))
+        .filter((e) => !missingHistory.has(e.path))
+        .filter((e) => !projectAbs.has(e.path))
+      outsideItems = scoreAndSort(query, outsideEntries, (e) => ({
+        label: basename(e.path),
+        description: displayPath(e.path, workspaceRoot, home),
       }))
+        .slice(0, OUTSIDE_CAP)
+        .map((r) => ({
+          label: basename(r.item.path),
+          description: displayPath(r.item.path, workspaceRoot, home),
+          badge: OUTSIDE_BADGE,
+          labelMatches: r.labelMatches,
+          descriptionMatches: r.descriptionMatches,
+          onAccept: () => accept(r.item.path),
+          onEvict: () => evict(r.item.path),
+        }))
+    }
+
+    return [...projectItems, ...outsideItems]
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, query, files, commands, onGotoLine, workspaceRoot, home, dirListing])
+  }, [visible, query, files, commands, onGotoLine, workspaceRoot, home, dirListing, fileHistory, missingHistory, evictTick])
 
   useEffect(() => {
     setSelectedIndex((i) => {
@@ -432,8 +585,24 @@ export function QuickInput({
                 {item.description ? (
                   <span fg={theme.dimForeground}>{highlight(item.description, item.descriptionMatches)}</span>
                 ) : null}
+                {item.badge ? <span fg={theme.dimForeground}>{` ${item.badge}`}</span> : null}
               </text>
-              {item.keybinding ? <text fg={theme.dimForeground}>{item.keybinding}</text> : null}
+              {item.onEvict && index === selectedIndex ? (
+                <box
+                  onMouseDown={(event) => {
+                    // stopPropagation so the ✕ evicts without the row's onAccept
+                    // (which opens the file) also firing — OpenTUI mouse events
+                    // bubble. preventDefault suppresses the text-selection gesture.
+                    event.stopPropagation()
+                    event.preventDefault()
+                    item.onEvict?.()
+                  }}
+                >
+                  <text fg={theme.dimForeground}> ✕</text>
+                </box>
+              ) : item.keybinding ? (
+                <text fg={theme.dimForeground}>{item.keybinding}</text>
+              ) : null}
             </box>
           ))}
         </scrollbox>

@@ -141,6 +141,7 @@ export class WorkbenchStore {
   private version = 0
   private readonly listeners = new Set<Listener>()
   private confirmDirtyClose?: ConfirmDirtyClose
+  private openRecorder?: (path: string) => void
 
   constructor() {
     const group = createGroup()
@@ -163,6 +164,18 @@ export class WorkbenchStore {
    */
   setConfirmDirtyCloseHandler(fn: ConfirmDirtyClose | undefined): void {
     this.confirmDirtyClose = fn
+  }
+
+  /**
+   * Register (or clear with `null`) a fire-and-forget hook invoked once per REAL
+   * file open — a genuine switch to a different or freshly opened file, never a
+   * no-op re-activation of the already-active tab. Keeps the store
+   * service-agnostic: the UI layer injects the frecency file-history recorder
+   * here. Faults are swallowed so a ranking-cache failure can never break opening
+   * a file.
+   */
+  setOpenRecorder(fn: ((path: string) => void) | null): void {
+    this.openRecorder = fn ?? undefined
   }
 
   subscribe(listener: Listener): () => void {
@@ -317,6 +330,12 @@ export class WorkbenchStore {
   }
 
   openFile(path: string, opts?: OpenFileOptions): void {
+    // Whether this open only RE-ACTIVATES the already-active tab — captured before
+    // any mutation. Repeated preview clicks / re-activating the active file must
+    // count once toward frecency, not per click, so the recorder skips these no-op
+    // opens yet still counts a genuine switch to a different or freshly opened file.
+    const reactivatingActive = this.activeGroup.activeTabPath === path
+
     // Opening a tab is an editor-side action; take keyboard focus so a file opened
     // from the sidebar (FileTree / Quick Open) doesn't leave keystrokes on the tree.
     this.state.focusArea = "editor"
@@ -328,12 +347,26 @@ export class WorkbenchStore {
       // A non-preview open of an already-open tab promotes it permanently.
       if (!preview && existing.preview) existing.preview = false
       this.activateTab(path)
-      return
+    } else {
+      const newTab: FileTab = { kind: "file", path, preview, pinned: false }
+      this.placeTab(group, newTab, preview)
+      this.activateTab(path)
     }
 
-    const newTab: FileTab = { kind: "file", path, preview, pinned: false }
-    this.placeTab(group, newTab, preview)
-    this.activateTab(path)
+    if (!reactivatingActive) this.recordOpen(path)
+  }
+
+  /**
+   * Invoke the injected open recorder defensively: a ranking-cache fault must
+   * never surface into the editor's file-open path.
+   */
+  private recordOpen(path: string): void {
+    if (!this.openRecorder) return
+    try {
+      this.openRecorder(path)
+    } catch {
+      // Best-effort ranking only; swallow so openFile always succeeds.
+    }
   }
 
   /**

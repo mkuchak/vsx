@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -6,6 +6,8 @@ import { testRender } from "@opentui/react/test-utils"
 import { documentRegistry } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
+import * as fileHistory from "../services/fileHistory"
+import type { FileHistory } from "../services/fileHistory"
 import { App } from "./App"
 import { getLastRendererSelection, handleRendererSelection } from "./rendererSelection"
 
@@ -808,5 +810,52 @@ test("clicking the status-bar ☰ affordance preserves the cached renderer selec
     expect(writeSpy.mock.calls[0][0]).toBe("selection to keep")
   } finally {
     writeSpy.mockRestore()
+  }
+})
+
+// Stub the frecency service so the App tests can observe record()/flush() without
+// touching the real on-disk history, and assert the store wiring routes through it.
+function stubFileHistory() {
+  const record = mock((_path: string) => {})
+  const flush = mock(async () => {})
+  const stub: FileHistory = {
+    record,
+    flush,
+    frecency: () => 0,
+    top: () => [],
+    evict: () => {},
+    pruneMissing: async () => {},
+  }
+  const spy = spyOn(fileHistory, "createFileHistory").mockReturnValue(stub)
+  return { record, flush, spy }
+}
+
+test("the initialFile boot open is recorded exactly once", async () => {
+  const { record, spy } = stubFileHistory()
+  try {
+    testSetup = await testRender(<App workspaceRoot={root} initialFile={join(root, "hello.ts")} />, {
+      width: 100,
+      height: 30,
+    })
+    await settle(testSetup)
+
+    expect(record).toHaveBeenCalledTimes(1)
+    expect(record.mock.calls[0][0]).toBe(join(root, "hello.ts"))
+  } finally {
+    spy.mockRestore()
+  }
+})
+
+test("quitting flushes the file history before teardown", async () => {
+  const { flush, spy } = stubFileHistory()
+  try {
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    await settle(testSetup)
+
+    testSetup.mockInput.pressKey("q", { ctrl: true })
+
+    expect(flush).toHaveBeenCalledTimes(1)
+  } finally {
+    spy.mockRestore()
   }
 })

@@ -46,7 +46,7 @@ async function writeDeep(rel: string, content: string): Promise<void> {
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "vsx-scm-"))
-  await sh(["init", "-q"])
+  await sh(["init", "-q", "-b", "main"])
   await sh(["config", "user.email", "a@b.com"])
   await sh(["config", "user.name", "Tester"])
   await sh(["config", "commit.gpgsign", "false"])
@@ -917,7 +917,7 @@ test("a huge repo does not stop a small sibling repo from rendering", async () =
     const small = join(ws, "small")
     for (const dir of [giant, small]) {
       await mkdir(dir)
-      await gitIn(dir, ["init", "-q"])
+      await gitIn(dir, ["init", "-q", "-b", "main"])
     }
     await Promise.all(
       Array.from({ length: 210 }, (_, i) =>

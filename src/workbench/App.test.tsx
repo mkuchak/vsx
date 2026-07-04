@@ -80,7 +80,7 @@ async function openDiscardDialog() {
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "vsx-app-"))
-  await git(root, ["init", "-q"])
+  await git(root, ["init", "-q", "-b", "main"])
   await git(root, ["config", "user.email", "a@b.com"])
   await git(root, ["config", "user.name", "Test"])
   await writeFile(join(root, "hello.ts"), "const greeting = 'hi'\n")

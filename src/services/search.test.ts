@@ -50,7 +50,7 @@ async function writeCommonFiles(): Promise<void> {
 describe("searchWorkspace — git engine", () => {
   beforeEach(async () => {
     root = await mkdtemp(join(tmpdir(), "vsx-search-git-"))
-    await sh(["init", "-q"])
+    await sh(["init", "-q", "-b", "main"])
     await sh(["config", "user.email", "a@b.com"])
     await sh(["config", "user.name", "Tester"])
     await sh(["config", "commit.gpgsign", "false"])

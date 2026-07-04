@@ -21,7 +21,7 @@ afterEach(async () => {
 })
 
 async function initGitRepo(dir: string): Promise<void> {
-  const proc = Bun.spawn(["git", "init", "-q"], { cwd: dir, stdout: "pipe", stderr: "pipe" })
+  const proc = Bun.spawn(["git", "init", "-q", "-b", "main"], { cwd: dir, stdout: "pipe", stderr: "pipe" })
   const code = await proc.exited
   expect(code).toBe(0)
 }

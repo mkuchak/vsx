@@ -47,7 +47,7 @@ async function buildFixture(): Promise<void> {
 beforeEach(async () => {
   workbenchStore.reset()
   root = await mkdtemp(join(tmpdir(), "vsx-clog-"))
-  await sh(["init", "-q"])
+  await sh(["init", "-q", "-b", "main"])
   await sh(["config", "user.email", "a@b.com"])
   await sh(["config", "user.name", "Tester"])
   await sh(["config", "commit.gpgsign", "false"])

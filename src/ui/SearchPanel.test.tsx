@@ -38,7 +38,7 @@ beforeEach(async () => {
   // realpath so `root` matches git's resolved paths (/var → /private/var on macOS),
   // keeping the panel's workspace-relative display paths clean.
   root = realpathSync(await mkdtemp(join(tmpdir(), "vsx-search-")))
-  await sh(["init", "-q"])
+  await sh(["init", "-q", "-b", "main"])
   await sh(["config", "user.email", "a@b.com"])
   await sh(["config", "user.name", "Tester"])
 })

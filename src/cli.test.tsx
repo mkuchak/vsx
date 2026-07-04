@@ -97,7 +97,7 @@ test("App renders and opens files under a non-cwd workspace root", async () => {
   }
   let testSetup: Awaited<ReturnType<typeof testRender>> | undefined
   try {
-    await git(["init", "-q"])
+    await git(["init", "-q", "-b", "main"])
     await git(["config", "user.email", "a@b.com"])
     await git(["config", "user.name", "Test"])
     await writeFile(join(root, "hello.ts"), "const greeting = 'hi'\n")

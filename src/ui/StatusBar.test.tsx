@@ -16,7 +16,7 @@ async function git(cwd: string, args: string[]) {
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "vsx-statusbar-"))
-  await git(root, ["init", "-q"])
+  await git(root, ["init", "-q", "-b", "main"])
   await git(root, ["config", "user.email", "a@b.com"])
   await git(root, ["config", "user.name", "Test"])
   await writeFile(join(root, "a.ts"), "const x = 1\n")

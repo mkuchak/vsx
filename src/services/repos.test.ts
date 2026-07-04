@@ -28,7 +28,7 @@ async function sh(cwd: string, args: string[]): Promise<string> {
 
 async function initRepo(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true })
-  await sh(dir, ["init", "-q"])
+  await sh(dir, ["init", "-q", "-b", "main"])
   await sh(dir, ["config", "user.email", "a@b.com"])
   await sh(dir, ["config", "user.name", "Tester"])
   await sh(dir, ["config", "commit.gpgsign", "false"])

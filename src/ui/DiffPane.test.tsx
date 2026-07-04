@@ -65,7 +65,7 @@ function diffTab(rel: string, diffKind: "staged" | "unstaged"): DiffTab {
 beforeEach(async () => {
   workbenchStore.reset()
   root = await mkdtemp(join(tmpdir(), "vsx-diff-"))
-  await sh(["init", "-q"])
+  await sh(["init", "-q", "-b", "main"])
   await sh(["config", "user.email", "a@b.com"])
   await sh(["config", "user.name", "Tester"])
   await sh(["config", "commit.gpgsign", "false"])

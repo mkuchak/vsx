@@ -33,7 +33,7 @@ async function write(rel: string, content: string): Promise<void> {
 
 beforeEach(async () => {
   root = await mkdtemp(join(tmpdir(), "vsx-git-"))
-  await sh(["init", "-q"])
+  await sh(["init", "-q", "-b", "main"])
   await sh(["config", "user.email", "a@b.com"])
   await sh(["config", "user.name", "Tester"])
   await sh(["config", "commit.gpgsign", "false"])

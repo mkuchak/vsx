@@ -214,9 +214,12 @@ main() {
     info "updating vsx ${current:-<unknown>} → ${version}"
   fi
 
-  local artifact base tmp
+  local artifact base
   artifact="vsx-${version}.tar.gz"
   base="https://github.com/${REPO}/releases/download/${tag}"
+  # Not `local`: the EXIT trap fires at the real end of the script's process,
+  # after main() has already returned and this variable would be out of scope
+  # — under `set -u` that's an unbound-variable error, not a silent no-op.
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
 

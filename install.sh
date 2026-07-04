@@ -262,6 +262,6 @@ main() {
 
 # Source guard: allows the test suite to source this file and call the pure
 # helpers without running the installer.
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
   main "$@"
 fi

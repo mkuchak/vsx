@@ -35,7 +35,13 @@ env:
   # Pin Bun to the repo's local toolchain version (matches `bun --version`) so CI
   # and releases build with the exact runtime developers use — no silent drift
   # from setup-bun's floating "latest".
-  BUN_VERSION: 1.2.3
+  #
+  # 1.2.3 is known to segfault under fd/inotify-instance exhaustion (the test
+  # suite's real fs.watch + git-subprocess usage triggers this on stock Linux's
+  # default fs.inotify.max_user_instances=128), which is what caused every CI
+  # run to exhaust the 25-minute job timeout above with zero output. Confirmed
+  # fixed on 1.3.14 under the same constrained-inotify reproduction.
+  BUN_VERSION: 1.3.14
 
 jobs:
   ci:

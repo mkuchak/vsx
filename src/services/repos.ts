@@ -157,8 +157,16 @@ export class GitWatcher {
     }
 
     // git-dir: HEAD (branch switch) and index (staging) live here — for a
-    // worktree these are worktree-private.
-    this.watchDir(repo.gitDir, false, (name) => name === "HEAD" || name === "index", mark)
+    // worktree these are worktree-private. This watch is already scoped to just
+    // gitDir's own top level (non-recursive), and everything that lives there
+    // (HEAD, index, index.lock, COMMIT_EDITMSG, ...) is git-internal state, so
+    // there's no name to filter on: any event here means "re-check status".
+    // Deliberately not filtering by filename — git stages via a lockfile-then-
+    // rename (index.lock -> index), and Node/Bun's fs.watch can
+    // non-deterministically report only one side of that rename (sometimes
+    // neither the source nor the destination name reliably), so a name-based
+    // accept check would intermittently miss a real staging change.
+    this.watchDir(repo.gitDir, false, () => true, mark)
 
     // common-dir HEAD: covers repos sharing the main checkout's HEAD.
     this.watchDir(repo.commonDir, false, (name) => name === "HEAD", mark)

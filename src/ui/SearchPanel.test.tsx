@@ -153,23 +153,26 @@ async function search(query: string) {
 }
 
 /**
- * Type a query, flip a mode toggle (Aa / ab / .*) by clicking its label, THEN run.
- * The toggle MUST come after typing: clicking a toggle first desyncs the mock
- * input's controlled value, so subsequent keystrokes never reach onInput and the
- * query would run empty. Settles around the click so the top row is painted (a
- * click on an unrendered frame silently misses) and the new toggle state is
- * flushed into optsRef before Enter reads it; throws if the label isn't visible.
+ * Type a query, flip one or more mode toggles (Aa / ab / .*) by clicking their
+ * labels, THEN run. The toggles MUST come after typing: clicking a toggle first
+ * desyncs the mock input's controlled value, so subsequent keystrokes never
+ * reach onInput and the query would run empty. Settles around each click so the
+ * top row is painted (a click on an unrendered frame silently misses) and the
+ * new toggle state is flushed into optsRef before Enter reads it; throws if a
+ * label isn't visible.
  */
-async function searchWithToggle(query: string, label: string) {
+async function searchWithToggle(query: string, labels: string | string[]) {
   await waitForInputFocus()
   await testSetup!.mockInput.typeText(query)
   await testSetup!.flush()
 
-  await settle()
-  const line0 = frame().split("\n")[0]
-  const x = line0.indexOf(label)
-  if (x < 0) throw new Error(`toggle "${label}" not visible in top row: ${JSON.stringify(line0)}`)
-  await testSetup!.mockMouse.click(x, 0)
+  for (const label of Array.isArray(labels) ? labels : [labels]) {
+    await settle()
+    const line0 = frame().split("\n")[0]
+    const x = line0.indexOf(label)
+    if (x < 0) throw new Error(`toggle "${label}" not visible in top row: ${JSON.stringify(line0)}`)
+    await testSetup!.mockMouse.click(x, 0)
+  }
   await settle()
 
   testSetup!.mockInput.pressEnter()
@@ -383,10 +386,12 @@ test("regex rows bold the git-matched token, not what a JS regex would match", a
   // git ERE treats `\d` as a literal 'd', so `\d+` matches "d" in "def" (col 5);
   // a JS RegExp would instead match "123". The bold must follow git's start, so a
   // full JS re-search (the old bug) can't drift the highlight to the wrong token.
+  // Match case must be on: git's regex engine only takes this literal-`d` path
+  // case-sensitively — combined with case-insensitive search, `\d` matches nothing.
   await write("digits.ts", "abc def 123 ghi\n")
 
   await render()
-  await searchWithToggle("\\d+", ".*")
+  await searchWithToggle("\\d+", [".*", "Aa"])
   await waitFor("1 result in 1 file")
 
   expect(boldText()).toBe("d")

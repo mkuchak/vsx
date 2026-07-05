@@ -109,6 +109,13 @@ export interface WorkbenchState {
    * command can never move the active group without also moving keyboard focus.
    */
   focusArea: FocusArea
+  /**
+   * Which directories are expanded in the Explorer file tree. Lifted out of
+   * FileTree's own component state so it survives the sidebar being hidden or
+   * the user switching to a different sidebar tab and back — both of which
+   * unmount FileTree.
+   */
+  explorerExpandedPaths: ReadonlySet<string>
 }
 
 export interface OpenFileOptions {
@@ -145,7 +152,13 @@ export class WorkbenchStore {
 
   constructor() {
     const group = createGroup()
-    this.state = { groups: [group], activeGroupId: group.id, sizes: [1], focusArea: "sidebar" }
+    this.state = {
+      groups: [group],
+      activeGroupId: group.id,
+      sizes: [1],
+      focusArea: "sidebar",
+      explorerExpandedPaths: new Set(),
+    }
   }
 
   getState(): WorkbenchState {
@@ -188,7 +201,13 @@ export class WorkbenchStore {
   /** Reset to a single empty group. Intended for tests. */
   reset(): void {
     const group = createGroup()
-    this.state = { groups: [group], activeGroupId: group.id, sizes: [1], focusArea: "sidebar" }
+    this.state = {
+      groups: [group],
+      activeGroupId: group.id,
+      sizes: [1],
+      focusArea: "sidebar",
+      explorerExpandedPaths: new Set(),
+    }
     this.notify()
   }
 
@@ -260,6 +279,29 @@ export class WorkbenchStore {
   setFocusArea(area: FocusArea): void {
     if (this.state.focusArea === area) return
     this.state.focusArea = area
+    this.notify()
+  }
+
+  /** Mark an Explorer directory expanded. No-op if already expanded. */
+  expandExplorerPath(path: string): void {
+    if (this.state.explorerExpandedPaths.has(path)) return
+    this.state.explorerExpandedPaths = new Set(this.state.explorerExpandedPaths).add(path)
+    this.notify()
+  }
+
+  /** Mark an Explorer directory collapsed. No-op if already collapsed. */
+  collapseExplorerPath(path: string): void {
+    if (!this.state.explorerExpandedPaths.has(path)) return
+    const next = new Set(this.state.explorerExpandedPaths)
+    next.delete(path)
+    this.state.explorerExpandedPaths = next
+    this.notify()
+  }
+
+  /** Collapse every expanded Explorer directory at once. No-op if already empty. */
+  collapseAllExplorerPaths(): void {
+    if (this.state.explorerExpandedPaths.size === 0) return
+    this.state.explorerExpandedPaths = new Set()
     this.notify()
   }
 

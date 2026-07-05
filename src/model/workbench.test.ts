@@ -989,6 +989,61 @@ describe("focus area", () => {
   })
 })
 
+describe("explorer expanded paths", () => {
+  test("a fresh store starts with nothing expanded", () => {
+    expect(new WorkbenchStore().getState().explorerExpandedPaths.size).toBe(0)
+  })
+
+  test("expandExplorerPath adds a path and notifies once; a repeat is a no-op", () => {
+    const store = new WorkbenchStore()
+    let calls = 0
+    store.subscribe(() => calls++)
+
+    store.expandExplorerPath("/root/src")
+    expect(store.getState().explorerExpandedPaths.has("/root/src")).toBe(true)
+    expect(calls).toBe(1)
+
+    store.expandExplorerPath("/root/src")
+    expect(calls).toBe(1)
+  })
+
+  test("collapseExplorerPath removes a path and notifies once; a repeat is a no-op", () => {
+    const store = new WorkbenchStore()
+    store.expandExplorerPath("/root/src")
+    let calls = 0
+    store.subscribe(() => calls++)
+
+    store.collapseExplorerPath("/root/src")
+    expect(store.getState().explorerExpandedPaths.has("/root/src")).toBe(false)
+    expect(calls).toBe(1)
+
+    store.collapseExplorerPath("/root/src")
+    expect(calls).toBe(1)
+  })
+
+  test("collapseAllExplorerPaths clears every path and notifies once; empty is a no-op", () => {
+    const store = new WorkbenchStore()
+    store.expandExplorerPath("/root/src")
+    store.expandExplorerPath("/root/src/components")
+    let calls = 0
+    store.subscribe(() => calls++)
+
+    store.collapseAllExplorerPaths()
+    expect(store.getState().explorerExpandedPaths.size).toBe(0)
+    expect(calls).toBe(1)
+
+    store.collapseAllExplorerPaths()
+    expect(calls).toBe(1)
+  })
+
+  test("reset() clears expanded paths along with everything else", () => {
+    const store = new WorkbenchStore()
+    store.expandExplorerPath("/root/src")
+    store.reset()
+    expect(store.getState().explorerExpandedPaths.size).toBe(0)
+  })
+})
+
 describe("open recorder", () => {
   test("records a fresh file open exactly once", () => {
     const store = new WorkbenchStore()

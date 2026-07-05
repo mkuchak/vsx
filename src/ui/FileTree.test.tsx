@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { testRender } from "@opentui/react/test-utils"
+import { workbenchStore } from "../model/workbench"
 import * as workspace from "../services/workspace"
 import { FileTree } from "./FileTree"
 
@@ -26,6 +27,7 @@ afterEach(async () => {
   listDirSpy.mockRestore()
   watchSpy?.mockRestore()
   if (testSetup) testSetup.renderer.destroy()
+  workbenchStore.reset()
   await rm(dir, { recursive: true, force: true })
 })
 
@@ -147,4 +149,48 @@ test("watcher refresh picks up a file created under the root", async () => {
 
   await waitForText("fresh.ts")
   expect(testSetup.captureCharFrame()).toContain("fresh.ts")
+})
+
+test("expanded folders survive an unmount + remount (sidebar hide/show or tab switch)", async () => {
+  // Stub the watcher: this test is about expand-state persistence across mounts,
+  // orthogonal to watcher-driven refreshes (see the lazy-load test's rationale).
+  watchSpy = spyOn(workspace, "watch").mockReturnValue(() => {})
+  testSetup = await render()
+  await waitForText("src")
+
+  // src is selected (index 0); Enter expands it.
+  testSetup.mockInput.pressEnter()
+  await waitForText("index.ts")
+  expect(testSetup.captureCharFrame()).toContain("▾")
+
+  // Tear down this FileTree entirely — this is what App.tsx's sidebar does both
+  // on Ctrl+B (unmount the whole sidebar) and on switching sidebarView away from
+  // "explorer" and back (a ternary swap, not a CSS hide). The workbenchStore
+  // singleton is untouched by this, unlike local component state.
+  testSetup.renderer.destroy()
+
+  testSetup = await render()
+  // The remounted instance must show src already expanded, children and all —
+  // not just the caret: this also exercises the mount-time fix that kicks off
+  // load() for every already-expanded directory, since `cache` is NOT persisted
+  // (only `expanded` is), so a fresh mount has no cached children yet.
+  await waitForText("index.ts")
+  expect(testSetup.captureCharFrame()).toContain("util.ts")
+  expect(testSetup.captureCharFrame()).toContain("▾")
+})
+
+test("collapseAllExplorerPaths collapses an already-rendered tree reactively", async () => {
+  watchSpy = spyOn(workspace, "watch").mockReturnValue(() => {})
+  testSetup = await render()
+  await waitForText("src")
+
+  testSetup.mockInput.pressEnter()
+  await waitForText("index.ts")
+
+  workbenchStore.collapseAllExplorerPaths()
+  await settle()
+
+  expect(testSetup.captureCharFrame()).not.toContain("index.ts")
+  expect(testSetup.captureCharFrame()).not.toContain("util.ts")
+  expect(testSetup.captureCharFrame()).toContain("▸")
 })

@@ -82,7 +82,9 @@ test("absent version flags are not recognized", () => {
 })
 
 test("the printed version string matches the package version", () => {
-  expect(`vsx ${pkg.version}`).toBe("vsx 0.1.0")
+  // package.json's version is bumped automatically by the release pipeline, so
+  // this must check the *format* main.tsx prints, not a specific release's number.
+  expect(`vsx ${pkg.version}`).toMatch(/^vsx \d+\.\d+\.\d+$/)
 })
 
 // Integration: a resolved root that is NOT process.cwd() must drive the whole

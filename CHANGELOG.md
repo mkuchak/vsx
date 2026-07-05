@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/mkuchak/vsx/compare/v0.2.1...v0.3.0) (2026-07-05)
+
+### Features
+
+* **explorer:** add a Collapse All command and footer button ([5ab29eb](https://github.com/mkuchak/vsx/commit/5ab29eb94090de9feddca06e4e6faf76fc344dba))
+* **explorer:** persist expanded folders in the workbench store ([34fe91d](https://github.com/mkuchak/vsx/commit/34fe91d448b72421211e871c6e8c2552de00c9a0))
+
 ## [0.2.1](https://github.com/mkuchak/vsx/compare/v0.2.0...v0.2.1) (2026-07-05)
 
 ### Bug Fixes

@@ -273,6 +273,16 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
         keybinding: withMacSuper("ctrl+b"),
         run: toggleSidebar,
       }),
+      // No default keybinding — mirrors VSCode's own Explorer "Collapse All",
+      // which is palette/toolbar-only too. Explorer-specific, so it no-ops
+      // harmlessly (nothing is ever expanded) while a different sidebar tab is
+      // active, rather than needing a `sidebarView` guard here.
+      commands.registerCommand({
+        id: "workbench.explorer.collapseAll",
+        title: "Explorer: Collapse All Folders",
+        category: "View",
+        run: () => workbenchStore.collapseAllExplorerPaths(),
+      }),
     ]
     return () => {
       for (const dispose of disposers) dispose()
@@ -392,7 +402,15 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
                     <CommitLog workspaceRoot={workspaceRoot} focused={sidebarFocused} />
                   )}
                 </box>
-                <SidebarFooter onCollapse={collapseSidebar} overlayOpen={isOverlayOpen} />
+                <SidebarFooter
+                  onCollapse={collapseSidebar}
+                  overlayOpen={isOverlayOpen}
+                  onCollapseAll={
+                    sidebarView === "explorer"
+                      ? () => workbenchStore.collapseAllExplorerPaths()
+                      : undefined
+                  }
+                />
               </box>
               <SplitDivider
                 kind="sidebar"

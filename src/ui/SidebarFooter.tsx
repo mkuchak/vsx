@@ -2,24 +2,32 @@ import { theme } from "../theme"
 
 /**
  * One-row clickable footer pinned to the bottom of the sidebar (the sidebar
- * body's flexGrow pushes it down). Clicking it collapses the sidebar, mirroring
- * VSCode's hide-sidebar affordance; the status bar's ☰ cell re-expands it. Uses
- * SidebarTabs' clickable-box pattern (onMouseDown on a padded inner box). Height
- * is always exactly 1 row.
+ * body's flexGrow pushes it down). Clicking "Hide Sidebar" collapses the
+ * sidebar, mirroring VSCode's hide-sidebar affordance; the status bar's ☰ cell
+ * re-expands it. Uses SidebarTabs' clickable-box pattern (onMouseDown on a
+ * padded inner box). Height is always exactly 1 row.
  */
 export function SidebarFooter({
   onCollapse,
   overlayOpen,
+  onCollapseAll,
 }: {
   onCollapse: () => void
-  /** When an overlay owns the screen, the collapse click is inert (mirrors Ctrl+B's dispatch gate). */
+  /** When an overlay owns the screen, both clicks are inert (mirrors Ctrl+B's dispatch gate). */
   overlayOpen?: boolean
+  /** Shown only when passed (Explorer view) — collapses every expanded folder at once. */
+  onCollapseAll?: () => void
 }) {
   const handleCollapse = () => {
     // A click landing under an open overlay must not restructure the workbench —
     // mirrors Ctrl+B, which the command dispatch gate blocks while one is open.
     if (overlayOpen) return
     onCollapse()
+  }
+
+  const handleCollapseAll = () => {
+    if (overlayOpen) return
+    onCollapseAll?.()
   }
 
   return (
@@ -38,6 +46,13 @@ export function SidebarFooter({
           ◂ Hide Sidebar
         </text>
       </box>
+      {onCollapseAll && (
+        <box paddingRight={1} onMouseDown={handleCollapseAll}>
+          <text fg={theme.dimForeground} selectable={false}>
+            Collapse All
+          </text>
+        </box>
+      )}
     </box>
   )
 }

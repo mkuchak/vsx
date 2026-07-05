@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { testRender } from "@opentui/react/test-utils"
@@ -747,6 +747,93 @@ test("clicking the sidebar footer collapses the sidebar", async () => {
   expect(findById("sidebar")).toBeNull()
   expect(testSetup.captureCharFrame()).not.toContain("Hide Sidebar")
 })
+
+test("an expanded Explorer folder survives switching sidebar tabs and toggling the sidebar", async () => {
+  await mkdir(join(root, "src"))
+  await writeFile(join(root, "src", "index.ts"), "export {}\n")
+  // kittyKeyboard: true — Ctrl+Shift+<letter> is only disambiguable from plain
+  // Ctrl+<letter> on a kitty-keyboard-capable terminal (see the dedicated
+  // "Ctrl+Shift+G switches..." test above); without it "g"+ctrl+shift is
+  // indistinguishable from plain Ctrl+G and workbench.focusScm never fires.
+  testSetup = await testRender(<App workspaceRoot={root} />, {
+    width: 100,
+    height: 30,
+    kittyKeyboard: true,
+  })
+  await settle(testSetup)
+  await waitForText("hello.ts")
+
+  // Rows sort dirs-first then alphabetically: the real `.git` repo from
+  // beforeEach is row 0, "src" is row 1 — one Down then Enter expands "src".
+  testSetup.mockInput.pressArrow("down")
+  await settle(testSetup, 100)
+  testSetup.mockInput.pressEnter()
+  await waitForText("index.ts")
+  expect(testSetup.captureCharFrame()).toContain("▾")
+
+  // Switch away to SCM and back: FileTree fully unmounts on each switch (a
+  // ternary swap in App.tsx, not a CSS hide) — this is the "switch to source
+  // control, commit, or search" case from the bug report.
+  testSetup.mockInput.pressKey("g", { ctrl: true, shift: true })
+  // ScmPanel's cold first mount shells out to `git status`, the slowest part of
+  // this transition — matches openDiscardDialog's extended timeout above.
+  await waitForText("SOURCE CONTROL", 8000)
+  testSetup.mockInput.pressKey("e", { ctrl: true, shift: true })
+  await waitForText("index.ts")
+  expect(testSetup.captureCharFrame()).toContain("▾")
+
+  // Hide and re-show the sidebar: this unmounts the sidebar (and FileTree)
+  // entirely, the "minimize/toggle the side menu" case from the bug report.
+  testSetup.mockInput.pressKey("b", { ctrl: true })
+  await settle(testSetup, 100)
+  expect(findById("sidebar")).toBeNull()
+
+  testSetup.mockInput.pressKey("b", { ctrl: true })
+  await waitForText("index.ts")
+  expect(testSetup.captureCharFrame()).toContain("▾")
+}, 15000)
+
+test("clicking Collapse All in the sidebar footer collapses the Explorer tree", async () => {
+  await mkdir(join(root, "src"))
+  await writeFile(join(root, "src", "index.ts"), "export {}\n")
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  await settle(testSetup)
+  await waitForText("hello.ts")
+
+  // Rows sort dirs-first then alphabetically: the real `.git` repo from
+  // beforeEach is row 0, "src" is row 1 — one Down then Enter expands "src".
+  testSetup.mockInput.pressArrow("down")
+  await settle(testSetup, 100)
+  testSetup.mockInput.pressEnter()
+  await waitForText("index.ts")
+
+  const line = testSetup
+    .captureCharFrame()
+    .split("\n")
+    .findIndex((l) => l.includes("Collapse All"))
+  const col = testSetup.captureCharFrame().split("\n")[line].indexOf("Collapse All")
+  await testSetup.mockMouse.click(col + 1, line)
+  await waitForTextGone("index.ts")
+
+  expect(testSetup.captureCharFrame()).toContain("▸")
+  expect(testSetup.captureCharFrame()).not.toContain("▾")
+})
+
+test("Collapse All is not shown while a non-Explorer sidebar tab is active", async () => {
+  // kittyKeyboard: true — see the dedicated "Ctrl+Shift+G switches..." test.
+  testSetup = await testRender(<App workspaceRoot={root} />, {
+    width: 100,
+    height: 30,
+    kittyKeyboard: true,
+  })
+  await settle(testSetup)
+  await waitForText("hello.ts")
+  expect(testSetup.captureCharFrame()).toContain("Collapse All")
+
+  testSetup.mockInput.pressKey("g", { ctrl: true, shift: true })
+  await waitForText("SOURCE CONTROL", 8000)
+  expect(testSetup.captureCharFrame()).not.toContain("Collapse All")
+}, 15000)
 
 test("clicking the status-bar ☰ affordance toggles the sidebar both ways", async () => {
   testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })

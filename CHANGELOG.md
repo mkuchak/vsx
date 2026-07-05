@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/mkuchak/vsx/compare/v0.2.0...v0.2.1) (2026-07-05)
+
+### Bug Fixes
+
+* **install:** stop the installer exiting 1 after a successful install ([b646934](https://github.com/mkuchak/vsx/commit/b64693495970c7335034d8bb778f3a4f7b562327))
+* **test:** stop hardcoding a release version in cli.test.tsx ([2b4dc09](https://github.com/mkuchak/vsx/commit/2b4dc092e205d48fc8795177f87a5692b1d1d8ca))
+
 ## 0.2.0 (2026-07-04)
 
 ### Features

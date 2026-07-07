@@ -228,9 +228,14 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
         keybinding: "ctrl+q",
         run: () => {
           // Best-effort: persist the frecency ranking before teardown, but never
-          // block or fail quitting on a cache write — fire-and-forget, then destroy.
-          fileHistoryRef.current?.flush().catch(() => {})
-          renderer.destroy()
+          // block quitting for long on a slow cache write — race the flush
+          // against a 250ms timeout and destroy either way (usually persists,
+          // never hangs). flush() is still invoked synchronously here, before
+          // any await, so an immediately-following quit still sees it called.
+          const flushed = fileHistoryRef.current?.flush().catch(() => {}) ?? Promise.resolve()
+          void Promise.race([flushed, new Promise((resolve) => setTimeout(resolve, 250))]).then(() => {
+            renderer.destroy()
+          })
         },
       }),
     [commands, renderer],

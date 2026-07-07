@@ -8,6 +8,7 @@ import { CommandsProvider } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
 import { workbenchStore } from "../model/workbench"
 import { createFileHistory, type FileHistory } from "../services/fileHistory"
+import * as fuzzy from "../services/fuzzy"
 import * as workspace from "../services/workspace"
 import type { DirEntry } from "../services/workspace"
 import { QuickInput, splitPathQuery } from "./QuickInput"
@@ -124,6 +125,19 @@ function findGlyph(glyph: string): { x: number; y: number } | null {
     if (x !== -1) return { x, y }
   }
   return null
+}
+
+// Count of `<box id="quick-N">` result rows actually mounted — unlike the
+// captured frame (clipped to the scrollbox's visible height), this reflects
+// every row in `results`, scrolled-off ones included.
+function quickRowCount(): number {
+  let count = 0
+  const walk = (node: { id?: string; getChildren: () => unknown[] }) => {
+    if (node.id?.startsWith("quick-")) count++
+    for (const child of node.getChildren()) walk(child as typeof node)
+  }
+  walk(testSetup.renderer.root as unknown as { id?: string; getChildren: () => unknown[] })
+  return count
 }
 
 // Lets React commit state AND run passive effects (which refresh useKeyboard's
@@ -724,4 +738,155 @@ test("evicting the last row keeps the selection valid", async () => {
   await settle()
   expect(activePath()).toBeNull()
   expect(testSetup.captureCharFrame()).toContain("Go to file")
+})
+
+test("plain Delete (no Shift) does not evict a history row", async () => {
+  const history = makeHistory()
+  seed(history, join(dir, "README.md"), 1)
+  testSetup = await render(undefined, history)
+  await settle()
+  await open()
+  await settle()
+
+  testSetup.mockInput.pressKey(DELETE)
+  await settle()
+
+  expect(testSetup.captureCharFrame()).toContain("README.md")
+  expect(activePath()).toBeNull()
+})
+
+test("Shift+Delete evicts an outside-group row during a TYPED query, not just the empty-query list", async () => {
+  browseDir = await mkdtemp(join(tmpdir(), "vsx-home-"))
+  await mkdir(join(browseDir, "proj"))
+  const outside = join(browseDir, "proj", "notes.txt")
+  await writeFile(outside, "x")
+
+  const history = makeHistory()
+  seed(history, outside, 2)
+  testSetup = await render(browseDir, history)
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText("notes")
+  await settle()
+  expect(testSetup.captureCharFrame()).toContain("notes.txt")
+
+  testSetup.mockInput.pressKey(DELETE, { shift: true })
+  await settle()
+
+  expect(testSetup.captureCharFrame()).not.toContain("notes.txt")
+  expect(activePath()).toBeNull()
+
+  await history.flush()
+  const reloaded = makeHistory()
+  expect(reloaded.top(10).some((e) => e.path === outside)).toBe(false)
+})
+
+test("clicking the ✕ evicts an outside-group row during a TYPED query", async () => {
+  browseDir = await mkdtemp(join(tmpdir(), "vsx-home-"))
+  await mkdir(join(browseDir, "proj"))
+  const outside = join(browseDir, "proj", "notes.txt")
+  await writeFile(outside, "x")
+
+  const history = makeHistory()
+  seed(history, outside, 2)
+  testSetup = await render(browseDir, history)
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText("notes")
+  await settle()
+
+  const cross = findGlyph("✕")
+  expect(cross).not.toBeNull()
+  await testSetup.mockMouse.click(cross!.x, cross!.y)
+  await settle()
+
+  expect(testSetup.captureCharFrame()).not.toContain("notes.txt")
+  expect(activePath()).toBeNull()
+})
+
+test("empty query backfills to 15 rows even when some top-ranked entries are missing on disk", async () => {
+  const history = makeHistory()
+  // 3 top-ranked entries point at files never written to disk (missing); 15
+  // more, lower-ranked, DO exist. The old cap-then-filter order (top(15) THEN
+  // drop missing) would only backfill 12 of them; scanning a deeper buffer
+  // first must still surface all 15 live ones.
+  for (let i = 0; i < 3; i++) seed(history, join(dir, `missing-${i}.ts`), 100 - i)
+  for (let i = 0; i < 15; i++) {
+    const p = join(dir, `live-${i}.ts`)
+    await writeFile(p, "x")
+    seed(history, p, 50 - i)
+  }
+  testSetup = await render(undefined, history)
+  await settle()
+  await open()
+  await settle()
+
+  expect(quickRowCount()).toBe(15)
+})
+
+test("a maxed frecency boost on a PREFIX match never overtakes an unboosted EXACT match", async () => {
+  // "index.tsx" PREFIX-matches "index.ts" ("index.tsx".startsWith("index.ts"));
+  // src/index.ts EXACT-matches it. Boosting the PREFIX match to the ceiling must
+  // still leave it below the tier gap (~131072) separating it from EXACT.
+  await writeFile(join(dir, "index.tsx"), "export {}\n")
+  const history = makeHistory()
+  seed(history, join(dir, "index.tsx"), 500)
+  testSetup = await render(undefined, history)
+  await settle()
+  await open()
+
+  await testSetup.mockInput.typeText("index.ts")
+  await settle()
+
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("src/index.ts")
+  expect(frame).toContain("index.tsx")
+  expect(frame.indexOf("src/index.ts")).toBeLessThan(frame.indexOf("index.tsx"))
+})
+
+// Pins the MAJOR fix directly: real fuzzy scores can't organically reach the
+// adversarial boundary this guards against (a description-only match's raw DP
+// score never gets anywhere near the TIER_CONTAINS clamp for any realistic
+// query/path length — the clamp only matters for query lengths in the
+// thousands, far past any real filename), so scoreAndSort is mocked to
+// engineer the EXACT boundary the review flagged: a description-only match
+// clamped just under the tier seam, maxed out on frecency, versus an
+// unboosted label match just above it. Proves QuickInput's isLabelMatch gate,
+// not the fuzzy engine's real-world score distribution.
+test("a maxed frecency boost cannot lift a description-only match across the label-tier seam", async () => {
+  const TIER_CONTAINS = 1 << 16
+  await writeFile(join(dir, "attacker.ts"), "x")
+  await writeFile(join(dir, "victim.ts"), "x")
+
+  const fakeScoreAndSort = (<T,>(_query: string, items: T[], getLabel: (item: T) => { label: string; description?: string }) =>
+    items.map((item) => {
+      const isAttacker = getLabel(item).description?.endsWith("attacker.ts")
+      return {
+        item,
+        score: isAttacker ? TIER_CONTAINS - 1 : TIER_CONTAINS + 1,
+        labelMatches: isAttacker ? [] : ([[0, 1]] as [number, number][]),
+        descriptionMatches: isAttacker ? ([[0, 1]] as [number, number][]) : [],
+      }
+    })) satisfies typeof fuzzy.scoreAndSort
+  const scoreSpy = spyOn(fuzzy, "scoreAndSort").mockImplementation(fakeScoreAndSort)
+  try {
+    const history = makeHistory()
+    seed(history, join(dir, "attacker.ts"), 500) // maxes out the frecency boost
+    testSetup = await render(undefined, history)
+    await settle()
+    await open()
+
+    await testSetup.mockInput.typeText("x")
+    await settle()
+
+    const frame = testSetup.captureCharFrame()
+    expect(frame).toContain("victim.ts")
+    expect(frame).toContain("attacker.ts")
+    // The boosted description-only match must never cross into label territory.
+    expect(frame.indexOf("victim.ts")).toBeLessThan(frame.indexOf("attacker.ts"))
+  } finally {
+    scoreSpy.mockRestore()
+  }
 })

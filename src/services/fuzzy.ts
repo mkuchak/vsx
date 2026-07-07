@@ -15,6 +15,16 @@ const TIER_EXACT = 1 << 18; // 262144
 const TIER_PREFIX = 1 << 17; // 131072
 const TIER_CONTAINS = 1 << 16; // 65536
 
+// A score at or above TIER_CONTAINS came from a LABEL match (exact/prefix/
+// contains); anything below it is a description-only match, clamped under
+// TIER_CONTAINS so it can never cross into label territory (see scoreItem).
+// Callers that add an external boost (e.g. QuickInput's frecency nudge) must
+// gate it behind this check — boosting a description-only score can otherwise
+// walk it up to just under the next tier and jump the seam.
+export function isLabelMatch(score: number): boolean {
+  return score >= TIER_CONTAINS;
+}
+
 // Char codes for separator classification.
 const SLASH = 47; // /
 const BACKSLASH = 92; // \

@@ -9,7 +9,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import type { FileHistory } from "../services/fileHistory"
 import { workbenchStore } from "../model/workbench"
 import { type CommandInfo, withMacSuper } from "../services/commands"
-import { scoreAndSort, type MatchRange } from "../services/fuzzy"
+import { isLabelMatch, scoreAndSort, type MatchRange } from "../services/fuzzy"
 import { enumerateFiles, listDir, type DirEntry } from "../services/workspace"
 import { theme } from "../theme"
 import { useCommands } from "../workbench/CommandsProvider"
@@ -23,7 +23,12 @@ const OUTSIDE_CAP = 5
 // How deep into the ranked history to scan for boosts / outside matches / staleness.
 const HISTORY_SCAN = 200
 // Frecency boost ceiling for a typed-query favorite. Kept far below the fuzzy
-// tier size (65536) so a boost reorders WITHIN a match tier but never across one.
+// tier size (65536) so a boost reorders WITHIN a match tier but never across
+// one — but ONLY once it's gated to label-tier matches (isLabelMatch) below.
+// A description-only score is clamped to TIER_CONTAINS - 1 (fuzzy.ts), just 1
+// point under the seam, so boosting it unconditionally could walk it past a
+// weak label match on a different file; the gate keeps the boost from ever
+// applying there.
 const FRECENCY_BOOST_MAX = 1000
 // Dim marker on rows whose file lives outside the workspace, so opening (or
 // evicting) one is no surprise.
@@ -311,6 +316,9 @@ export function QuickInput({
       },
       // Shift+Delete (the browser remove-suggestion idiom) evicts the selected row
       // IF it is history-sourced; a no-op otherwise. Ctrl+X stays reserved for cut.
+      // Needs a Kitty-protocol terminal to carry the shift bit — on a legacy
+      // terminal, bare Delete (\x1b[3~) can't be told apart from Shift+Delete, so
+      // this chord silently never fires there; the row's ✕ button is the fallback.
       {
         name: "quickInput.evict",
         run: () => resultsRef.current[selectedIndexRef.current]?.onEvict?.(),
@@ -440,11 +448,16 @@ export function QuickInput({
     // Empty query: global recommendations — the most-used files across ALL
     // projects, by frecency. Absolute paths; in-workspace ones read relative, the
     // rest `~`-abbreviated + badged. Missing-on-disk paths are filtered out.
+    // Scans a deeper buffer (HISTORY_SCAN) before filtering+capping — capping to
+    // EMPTY_QUERY_TOP FIRST would under-fill the list whenever any of the top 15
+    // ranked entries happen to be missing-on-disk, even though lower-ranked live
+    // entries exist to backfill it.
     if (query === "") {
       if (!fileHistory) return []
       return fileHistory
-        .top(EMPTY_QUERY_TOP)
+        .top(HISTORY_SCAN)
         .filter((e) => !missingHistory.has(e.path))
+        .slice(0, EMPTY_QUERY_TOP)
         .map((e) => ({
           label: basename(e.path),
           description: displayPath(e.path, workspaceRoot, home),
@@ -460,7 +473,11 @@ export function QuickInput({
     // workspace-relative paths — display relative, open absolute). A file also in
     // the history earns a bounded additive frecency boost, normalized to
     // 0..FRECENCY_BOOST_MAX (far below the fuzzy tier size), so favorites win ties
-    // within a match tier without ever jumping tiers.
+    // within a match tier without ever jumping tiers. The boost is gated to
+    // label-tier matches (isLabelMatch) — a description-only match's score sits
+    // just 1 point under the TIER_CONTAINS seam (fuzzy.ts), so an unconditional
+    // boost could walk it past a weaker label match on a different file;
+    // description-only matches keep their un-boosted clamp instead.
     const now = Date.now()
     const frecencyByPath = new Map<string, number>()
     let maxFrecency = 0
@@ -479,7 +496,7 @@ export function QuickInput({
 
     const projectScored = scoreAndSort(query, files, (f) => ({ label: basename(f), description: f }))
       .map((r) => ({ r, abs: join(workspaceRoot, r.item), boosted: 0 }))
-      .map((x) => ({ ...x, boosted: x.r.score + boostFor(x.abs) }))
+      .map((x) => ({ ...x, boosted: isLabelMatch(x.r.score) ? x.r.score + boostFor(x.abs) : x.r.score }))
       .sort((a, b) => b.boosted - a.boosted)
       .slice(0, MAX_RESULTS)
     const projectAbs = new Set(projectScored.map((x) => x.abs))

@@ -97,6 +97,17 @@ export class GitService {
   ): Promise<{ stdout: string; stderr: string }> {
     const proc = Bun.spawn(["git", ...args], {
       cwd: this.repoRoot,
+      // GIT_OPTIONAL_LOCKS=0 forbids read-only commands (status, diff) from
+      // taking the opportunistic index lock and rewriting .git/index. Without
+      // it, `git status` on a just-edited file whose mtime lands in the same
+      // second as the last index write hits git's racy-index path and REWRITES
+      // the index every invocation. That write trips the shared GitWatcher
+      // (repos.ts), which re-runs status, which rewrites again — a self-
+      // sustaining ~150ms loop that makes the diff view flicker forever.
+      // Mandatory writers (add/commit/reset) ignore this flag and still lock.
+      // Bun.spawn replaces the environment wholesale when `env` is set, so
+      // process.env must be spread in (git needs PATH, HOME for config, etc.).
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
       stdin: opts?.stdin !== undefined ? "pipe" : undefined,
       stdout: "pipe",
       stderr: "pipe",

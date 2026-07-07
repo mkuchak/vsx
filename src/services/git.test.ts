@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import { mkdtemp, rm, symlink, writeFile, rename as renameFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -522,6 +522,44 @@ describe("head", () => {
     expect(h.branch).not.toBeNull()
     expect(h.ahead).toBe(0)
     expect(h.behind).toBe(0)
+  })
+})
+
+describe("optional locks", () => {
+  // Read-only git commands (status, diff, ...) must run with
+  // GIT_OPTIONAL_LOCKS=0 so they never take the opportunistic index lock and
+  // rewrite .git/index. Without it, a `git status` on a just-edited file whose
+  // mtime lands in the racy-index window rewrites the index on every call,
+  // which re-trips the shared GitWatcher and drives an endless status→write
+  // loop (the diff-view flicker bug).
+  //
+  // Verified by spying on Bun.spawn rather than by measuring .git/index mtime
+  // across runs: the racy-index rewrite only fires when the file mtime falls in
+  // the same second as the index write, which is inherently timing-dependent
+  // and cannot be provoked deterministically (modern git also smudges racy
+  // entries at write time, so a naive add+status often won't reproduce it).
+  // Asserting the spawn env is the one fully deterministic check of the
+  // invariant the fix actually establishes.
+  test("spawns git with GIT_OPTIONAL_LOCKS=0 and an inherited environment", async () => {
+    const spy = spyOn(Bun, "spawn")
+    let calls: unknown[][]
+    try {
+      await git.status()
+      // Snapshot before restoring: mockRestore() clears spy.mock.calls.
+      calls = [...spy.mock.calls]
+    } finally {
+      spy.mockRestore()
+    }
+
+    const call = calls.find(
+      ([cmd]) => Array.isArray(cmd) && cmd[0] === "git" && cmd[1] === "status",
+    )
+    expect(call).toBeDefined()
+    const env = (call![1] as { env?: Record<string, string> }).env
+    expect(env?.GIT_OPTIONAL_LOCKS).toBe("0")
+    // process.env must be spread in — Bun.spawn otherwise replaces the whole
+    // environment and git loses PATH/HOME.
+    expect(env?.PATH).toBe(process.env.PATH)
   })
 })
 

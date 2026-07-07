@@ -498,15 +498,15 @@ test("sidebar header shows all four activity tabs with Explorer active by defaul
 
   const line0 = testSetup.captureCharFrame().split("\n")[0]
   expect(line0).toContain("Explorer")
-  expect(line0).toContain("SCM")
   expect(line0).toContain("Search")
-  expect(line0).toContain("Commits")
+  expect(line0).toContain("Source")
+  expect(line0).toContain("Commit")
 
   // Explorer is the boot view → accent (bright); the other three are dimmed.
   expect(headerLabelRed("Explorer")).toBeGreaterThan(200)
-  expect(headerLabelRed("SCM")).toBeLessThan(200)
   expect(headerLabelRed("Search")).toBeLessThan(200)
-  expect(headerLabelRed("Commits")).toBeLessThan(200)
+  expect(headerLabelRed("Source")).toBeLessThan(200)
+  expect(headerLabelRed("Commit")).toBeLessThan(200)
 })
 
 test("Ctrl+Shift+F focuses the Search view and un-collapses the sidebar", async () => {
@@ -527,27 +527,27 @@ test("Ctrl+Shift+F focuses the Search view and un-collapses the sidebar", async 
   expect(headerLabelRed("Explorer")).toBeLessThan(200)
 })
 
-test("clicking the SCM tab switches to Source Control and highlights that tab", async () => {
+test("clicking the Source tab switches to Source Control and highlights that tab", async () => {
   testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
   await settle(testSetup)
 
-  await testSetup.mockMouse.pressDown(headerLabelX("SCM"), 0)
+  await testSetup.mockMouse.pressDown(headerLabelX("Source"), 0)
   await waitForText("SOURCE CONTROL")
 
-  expect(headerLabelRed("SCM")).toBeGreaterThan(200)
+  expect(headerLabelRed("Source")).toBeGreaterThan(200)
   expect(headerLabelRed("Explorer")).toBeLessThan(200)
 })
 
-test("clicking the Commits tab switches to the commit log", async () => {
+test("clicking the Commit tab switches to the commit log", async () => {
   testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
   await settle(testSetup)
 
-  await testSetup.mockMouse.pressDown(headerLabelX("Commits"), 0)
-  // The uppercase "COMMITS" panel header (distinct from the "Commits" tab label)
+  await testSetup.mockMouse.pressDown(headerLabelX("Commit"), 0)
+  // The uppercase "COMMITS" panel header (distinct from the "Commit" tab label)
   // proves CommitLog rendered in the sidebar body.
   await waitForText("COMMITS")
 
-  expect(headerLabelRed("Commits")).toBeGreaterThan(200)
+  expect(headerLabelRed("Commit")).toBeGreaterThan(200)
 })
 
 test("Ctrl+Shift+E keyboard command still switches to and highlights the Explorer tab", async () => {
@@ -560,7 +560,7 @@ test("Ctrl+Shift+E keyboard command still switches to and highlights the Explore
 
   // Move off Explorer via a click, then prove the keyboard path returns to it —
   // both routes share the same focus(view) action.
-  await testSetup.mockMouse.pressDown(headerLabelX("SCM"), 0)
+  await testSetup.mockMouse.pressDown(headerLabelX("Source"), 0)
   await waitForText("SOURCE CONTROL")
   expect(headerLabelRed("Explorer")).toBeLessThan(200)
 
@@ -579,8 +579,8 @@ test("clicking a sidebar tab does not leak focus into the editor", async () => {
   await openHelloFromTree()
   expect(statusShowsCursor()).toBe(true)
 
-  // Clicking the SCM tab must move focus to the sidebar, never leave it on the editor.
-  await testSetup.mockMouse.pressDown(headerLabelX("SCM"), 0)
+  // Clicking the Source tab must move focus to the sidebar, never leave it on the editor.
+  await testSetup.mockMouse.pressDown(headerLabelX("Source"), 0)
   await waitForText("SOURCE CONTROL")
   expect(statusShowsCursor()).toBe(false)
 })

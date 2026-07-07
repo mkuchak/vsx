@@ -3,15 +3,15 @@ import { theme } from "../theme"
 
 export type SidebarView = "explorer" | "scm" | "search" | "history"
 
-// Concise labels so all FOUR tabs plus separators fit the default 32-col sidebar;
-// at narrower widths the row clips rather than wrapping (height is pinned to 1).
-// "SCM"/"Commits" abbreviate "Source Control"/"History". Only a single leading pad
-// per tab (no trailing pad) is used so the four labels + separators stay ≤ 32.
+// Labels so all FOUR tabs plus separators fit the default 32-col sidebar; at
+// narrower widths the row clips rather than wrapping (height is pinned to 1).
+// "Source"/"Commit" abbreviate "Source Control"/"History". The leading pad is
+// dropped for the first tab only, so 3 separators + 3 pads + 26 label cols = 32.
 const TABS: { view: SidebarView; label: string }[] = [
   { view: "explorer", label: "Explorer" },
-  { view: "scm", label: "SCM" },
   { view: "search", label: "Search" },
-  { view: "history", label: "Commits" },
+  { view: "scm", label: "Source" },
+  { view: "history", label: "Commit" },
 ]
 
 /**
@@ -41,7 +41,7 @@ export function SidebarTabs({
           <Fragment key={tab.view}>
             {i > 0 && <text fg={theme.border}>│</text>}
             <box
-              paddingLeft={1}
+              paddingLeft={i === 0 ? 0 : 1}
               backgroundColor={isActive ? theme.selectionBackground : theme.sidebarBackground}
               onMouseDown={() => onSelect(tab.view)}
             >

@@ -23,7 +23,13 @@ test("all four tab labels fit uncut at the default sidebar width", async () => {
   await testSetup.renderOnce()
 
   const frame = testSetup.captureCharFrame()
-  for (const label of ["Explorer", "SCM", "Search", "Commits"]) {
-    expect(frame).toContain(label)
+  const labels = ["Explorer", "Search", "Source", "Commit"]
+  const positions = labels.map((label) => {
+    const index = frame.indexOf(label)
+    expect(index).toBeGreaterThanOrEqual(0)
+    return index
+  })
+  for (let i = 1; i < positions.length; i++) {
+    expect(positions[i]).toBeGreaterThan(positions[i - 1])
   }
 })

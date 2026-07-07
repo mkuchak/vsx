@@ -68,7 +68,12 @@ jobs:
     needs: ci
     runs-on: ubuntu-latest
     # Skip the release commit itself (belt-and-suspenders alongside [skip ci]).
-    if: ${{ !contains(github.event.head_commit.message, 'chore(release)') }}
+    # Narrowed to release-it's exact auto-commit shape (not a bare `contains`,
+    # which would also match a human commit that merely mentions
+    # "chore(release)" anywhere in its message/body). `|| ''` keeps this safe
+    # when head_commit is null (e.g. some non-branch-push event shapes).
+    if: "${{ !startsWith(github.event.head_commit.message || '', 'chore(release): v') }}"
+    timeout-minutes: 10
     permissions:
       # release-it pushes a commit + tag and creates the GitHub Release.
       contents: write
@@ -95,7 +100,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          before="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
+          before="$(git describe --tags --match='v*' --abbrev=0 2>/dev/null || echo '')"
           # .release-it.json sets git.requireCommits, which makes release-it FAIL
           # when there are no commits since the last tag. Gate on the commit count
           # so an empty push (e.g. a re-run) skips cleanly instead of failing.
@@ -112,7 +117,7 @@ jobs:
           bun run release
           # Detect whether a new tag actually landed rather than trusting exit code
           # alone — this is what `build` keys off of.
-          after="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
+          after="$(git describe --tags --match='v*' --abbrev=0 2>/dev/null || echo '')"
           if [ -n "$after" ] && [ "$after" != "$before" ]; then
             echo "Released $after"
             echo "released=true" >> "$GITHUB_OUTPUT"
@@ -129,6 +134,7 @@ jobs:
     # Only when a release was actually cut. When nothing is releasable this is
     # skipped (not failed).
     if: ${{ needs.release.outputs.released == 'true' }}
+    timeout-minutes: 20
     permissions:
       # Needed to upload assets onto the release.
       contents: write

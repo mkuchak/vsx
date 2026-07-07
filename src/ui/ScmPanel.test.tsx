@@ -357,14 +357,156 @@ test("onOpenDiff fires with the right path and kind for a modified file", async 
   await waitForText("tracked.txt")
   await settle()
 
+  // Select the modified file (row after the Changes header), press Enter.
+  testSetup.mockInput.pressArrow("down")
+  await settle()
+  testSetup.mockInput.pressEnter()
+  await settle()
+
+  // ScmPanel opens absolute paths; discoverRepositories realpath-resolves the root.
+  expect(diffs).toEqual([{ path: join(realpathSync(root), "tracked.txt"), kind: "unstaged" }])
+})
+
+test("'o' opens the plain file instead of a diff", async () => {
+  await baseline()
+  await write("tracked.txt", "two\n")
+
+  const opened: string[] = []
+  const diffs: Array<{ path: string; kind: "staged" | "unstaged" }> = []
+  testSetup = await render({
+    onOpenFile: (path) => opened.push(path),
+    onOpenDiff: (path, kind) => diffs.push({ path, kind }),
+  })
+  await waitForText("tracked.txt")
+  await settle()
+
   // Select the modified file (row after the Changes header), press 'o'.
   testSetup.mockInput.pressArrow("down")
   await settle()
   testSetup.mockInput.pressKey("o")
   await settle()
 
-  // ScmPanel opens absolute paths; discoverRepositories realpath-resolves the root.
-  expect(diffs).toEqual([{ path: join(realpathSync(root), "tracked.txt"), kind: "unstaged" }])
+  expect(opened).toEqual([join(realpathSync(root), "tracked.txt")])
+  expect(diffs).toEqual([])
+})
+
+test("clicking an untracked file opens a diff tab", async () => {
+  await baseline()
+  await write("untracked.txt", "new file\n")
+
+  const diffs: Array<{ path: string; kind: "staged" | "unstaged" }> = []
+  testSetup = await render({
+    onOpenDiff: (path, kind) => diffs.push({ path, kind }),
+  })
+  await waitForText("untracked.txt")
+  await settle()
+
+  const { x, y } = cellOf("untracked.txt", "untracked.txt")
+  await testSetup.mockMouse.click(x, y)
+  await settle()
+
+  expect(diffs).toEqual([
+    { path: join(realpathSync(root), "untracked.txt"), kind: "unstaged" },
+  ])
+})
+
+test("Enter on an untracked row opens a diff tab", async () => {
+  await baseline()
+  await write("untracked.txt", "new file\n")
+
+  const diffs: Array<{ path: string; kind: "staged" | "unstaged" }> = []
+  testSetup = await render({
+    onOpenDiff: (path, kind) => diffs.push({ path, kind }),
+  })
+  await waitForText("untracked.txt")
+  await settle()
+
+  // Rows: [Untracked header, untracked.txt]. Select the file, press Enter.
+  testSetup.mockInput.pressArrow("down")
+  await settle()
+  testSetup.mockInput.pressEnter()
+  await settle()
+
+  expect(diffs).toEqual([
+    { path: join(realpathSync(root), "untracked.txt"), kind: "unstaged" },
+  ])
+})
+
+test("clicking a merge-conflict row opens a diff tab", async () => {
+  await baseline()
+  await createConflict()
+
+  const diffs: Array<{ path: string; kind: "staged" | "unstaged" }> = []
+  testSetup = await render(
+    { onOpenDiff: (path, kind) => diffs.push({ path, kind }) },
+    WIDE,
+  )
+  await waitForText("conflict.txt")
+  await settle()
+
+  const { x, y } = cellOf("conflict.txt", "conflict.txt")
+  await testSetup.mockMouse.click(x, y)
+  await settle()
+
+  expect(diffs).toEqual([
+    { path: join(realpathSync(root), "conflict.txt"), kind: "unstaged" },
+  ])
+})
+
+async function createStagedRename() {
+  await baseline()
+  // `git mv` stages the rename atomically — no separate `add` needed, and no
+  // unstaged remainder is left behind.
+  await sh(["mv", "tracked.txt", "renamed.txt"])
+}
+
+test("clicking a renamed file's staged row includes oldPath", async () => {
+  await createStagedRename()
+
+  const diffs: Array<{ path: string; kind: "staged" | "unstaged"; oldPath?: string }> = []
+  testSetup = await render(
+    { onOpenDiff: (path, kind, oldPath) => diffs.push({ path, kind, oldPath }) },
+    WIDE,
+  )
+  await waitForText("renamed.txt")
+  await settle()
+
+  const { x, y } = cellOf("renamed.txt", "renamed.txt")
+  await testSetup.mockMouse.click(x, y)
+  await settle()
+
+  expect(diffs).toEqual([
+    {
+      path: join(realpathSync(root), "renamed.txt"),
+      kind: "staged",
+      oldPath: join(realpathSync(root), "tracked.txt"),
+    },
+  ])
+})
+
+test("Enter on a renamed file's staged row includes oldPath", async () => {
+  await createStagedRename()
+
+  const diffs: Array<{ path: string; kind: "staged" | "unstaged"; oldPath?: string }> = []
+  testSetup = await render({
+    onOpenDiff: (path, kind, oldPath) => diffs.push({ path, kind, oldPath }),
+  })
+  await waitForText("renamed.txt")
+  await settle()
+
+  // Rows: [group Staged, renamed.txt]. Select the file, press Enter.
+  testSetup.mockInput.pressArrow("down")
+  await settle()
+  testSetup.mockInput.pressEnter()
+  await settle()
+
+  expect(diffs).toEqual([
+    {
+      path: join(realpathSync(root), "renamed.txt"),
+      kind: "staged",
+      oldPath: join(realpathSync(root), "tracked.txt"),
+    },
+  ])
 })
 
 test("discarding a single tracked file confirms, then reverts it on disk", async () => {

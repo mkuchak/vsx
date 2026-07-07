@@ -22,7 +22,7 @@ export type ScmPanelProps = {
   workspaceRoot: string
   focused: boolean
   onOpenFile?: (path: string) => void
-  onOpenDiff?: (path: string, kind: "staged" | "unstaged") => void
+  onOpenDiff?: (path: string, kind: "staged" | "unstaged", oldPath?: string) => void
 }
 
 type GroupKey = "merge" | "staged" | "changes" | "untracked"
@@ -576,8 +576,12 @@ export function ScmPanel({
   const openDiffSelected = useCallback(() => {
     const row = selectedRow()
     if (!row || row.type !== "file") return
-    if (row.group !== "staged" && row.group !== "changes") return
-    onOpenDiff?.(join(row.repoRoot, row.file.path), row.group === "staged" ? "staged" : "unstaged")
+    const oldPath = row.file.oldPath ? join(row.repoRoot, row.file.oldPath) : undefined
+    onOpenDiff?.(
+      join(row.repoRoot, row.file.path),
+      row.group === "staged" ? "staged" : "unstaged",
+      oldPath,
+    )
   }, [selectedRow, onOpenDiff])
 
   const commitActive = useCallback(() => {
@@ -764,8 +768,10 @@ export function ScmPanel({
         break
       case "return":
       case "enter":
+        // Enter opens the diff (VSCode parity with mouse-click); 'o' opens the
+        // plain file. Non-file rows (dirs/groups) keep their own behavior.
         if (row?.type === "dir") toggleDir(row)
-        else openSelected()
+        else openDiffSelected()
         break
       case "space":
       case "+":
@@ -778,7 +784,7 @@ export function ScmPanel({
         discardSelected()
         break
       case "o":
-        openDiffSelected()
+        openSelected()
         break
     }
   })
@@ -841,7 +847,7 @@ type RepoSectionProps = {
   stageRow: (repoRoot: string, files: FileStatus[]) => void
   unstageRow: (repoRoot: string, files: FileStatus[]) => void
   discardRow: (repoRoot: string, files: FileStatus[]) => void
-  onOpenDiff?: (path: string, kind: "staged" | "unstaged") => void
+  onOpenDiff?: (path: string, kind: "staged" | "unstaged", oldPath?: string) => void
 }
 
 // One repo's commit box + resource groups. Memoized so another repo's async
@@ -959,7 +965,6 @@ const RepoSection = memo(function RepoSection({
         </box>
       )
     }
-    const diffable = row.group === "staged" || row.group === "changes"
     return (
       <box
         key={row.id}
@@ -971,11 +976,11 @@ const RepoSection = memo(function RepoSection({
         backgroundColor={bg}
         onMouseDown={() => {
           selectById(row.id)
-          if (diffable)
-            onOpenDiff?.(
-              join(repo.root, row.file.path),
-              row.group === "staged" ? "staged" : "unstaged",
-            )
+          onOpenDiff?.(
+            join(repo.root, row.file.path),
+            row.group === "staged" ? "staged" : "unstaged",
+            row.file.oldPath ? join(repo.root, row.file.oldPath) : undefined,
+          )
         }}
       >
         <text fg={theme.foreground}>{`${indent}  ${row.name}`}</text>

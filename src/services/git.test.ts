@@ -466,6 +466,31 @@ describe("show", () => {
     }
     expect(caught).toBeInstanceOf(GitError)
   })
+
+  test("returns '' for :0 on a conflicted (unmerged) path instead of throwing", async () => {
+    // Two branches edit the same line of the same file; merging leaves it
+    // unmerged, with no stage-0 entry in the index for that path.
+    await write("conflict.txt", "base\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "base"])
+
+    await sh(["checkout", "-q", "-b", "feature"])
+    await write("conflict.txt", "feature\n")
+    await sh(["commit", "-qam", "feature edit"])
+
+    await sh(["checkout", "-q", "main"])
+    await write("conflict.txt", "main\n")
+    await sh(["commit", "-qam", "main edit"])
+
+    const merge = Bun.spawn(["git", "merge", "feature"], {
+      cwd: root,
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    await merge.exited // non-zero on conflict, which is expected
+
+    expect(await git.show(":0", "conflict.txt")).toBe("")
+  })
 })
 
 describe("head", () => {

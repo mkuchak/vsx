@@ -464,6 +464,10 @@ function parseGrepZ(stdout: string): GrepMatch[] {
 function isPathMissing(stderr: string): boolean {
   return (
     /does not exist/.test(stderr) ||
-    /exists on disk, but not in/.test(stderr)
+    /exists on disk, but not in/.test(stderr) ||
+    // `git show :0:<path>` on an unmerged (conflicted) path has no stage-0
+    // entry and fails with "...is in the index, but not at stage 0" — treat
+    // that as missing so the merge-conflict diff falls back to HEAD.
+    /is in the index, but not at stage/.test(stderr)
   )
 }

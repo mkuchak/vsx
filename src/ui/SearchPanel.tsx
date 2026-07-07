@@ -6,12 +6,15 @@ import type { ReactNode } from "react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { workbenchStore } from "../model/workbench"
 import { searchWorkspace, type SearchResult } from "../services/search"
-import { theme } from "../theme"
+import { CURSOR_STYLE, theme } from "../theme"
 import { useCommands } from "../workbench/CommandsProvider"
 import { getEditorControls, requestGoto } from "../workbench/editorControls"
 import { useOverlay } from "../workbench/OverlayProvider"
 
 type Toggles = { matchCase: boolean; wholeWord: boolean; regex: boolean }
+
+/** Debounce before the query/toggles re-run the workspace search as you type. */
+const SEARCH_DEBOUNCE_MS = 250
 
 /** One toggle cell (Match Case / Whole Word / Regex), clickable to flip. */
 function ToggleCell({ label, active, onToggle }: { label: string; active: boolean; onToggle: () => void }) {
@@ -77,9 +80,12 @@ export type SearchPanelProps = {
 
 /**
  * VSCode "Search" view: a query input + match-case/whole-word/regex toggles over
- * a results tree grouped by file. Search runs on Enter (the Bun fallback scan can
- * be heavy — never per-keystroke); a stale run is cancelled via the service's
- * cooperative signal when a new one starts or the panel unmounts.
+ * a results tree grouped by file. Search runs as you type (VSCode parity — the
+ * user's call), debounced ~250ms so the heavier workspace scan fires once you
+ * pause rather than per-keystroke; toggling a mode re-runs on the same debounce.
+ * Enter bypasses the debounce for an immediate run (habit + a manual refresh). A
+ * stale run is cancelled via the service's cooperative signal when a newer one
+ * starts or the panel unmounts, so out-of-order results never flash.
  *
  * Focus model (a focused <input> swallows arrow keys): the input owns typing and
  * Enter (run search). ↓ or Tab from the input hands focus to the results LIST,
@@ -112,7 +118,10 @@ export function SearchPanel({ workspaceRoot, focused, maxResults }: SearchPanelP
   // whose results arrive after a newer run (or after unmount) is discarded.
   const signalRef = useRef<{ cancelled: boolean }>({ cancelled: false })
   const runIdRef = useRef(0)
-  const hasSearchedRef = useRef(false)
+  // The single pending debounced search from a query/toggle change. Held in a ref
+  // (not effect-local) so Enter can flush it: clearing it before an immediate run
+  // stops a late timer from re-spawning the same search a beat after Enter did.
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Live mirrors so the keymap layer + useKeyboard read current values without
   // re-subscribing every render.
@@ -142,7 +151,6 @@ export function SearchPanel({ workspaceRoot, focused, maxResults }: SearchPanelP
     const signal = { cancelled: false }
     signalRef.current = signal
     const runId = ++runIdRef.current
-    hasSearchedRef.current = true
 
     // Read the query + toggles at search START so a late result can't be run with
     // a query the user has since edited. Row highlighting comes straight from each
@@ -170,12 +178,25 @@ export function SearchPanel({ workspaceRoot, focused, maxResults }: SearchPanelP
       })
   }, [workspaceRoot, maxResults])
 
-  // Re-run on a toggle change, but only after the first manual search — toggling
-  // is a deliberate action (unlike typing), so mirroring VSCode's live re-run here
-  // is fine; optsRef is already updated by the time this effect runs.
+  const clearSearchTimer = useCallback(() => {
+    if (searchTimerRef.current) {
+      clearTimeout(searchTimerRef.current)
+      searchTimerRef.current = null
+    }
+  }, [])
+
+  // Search-as-you-type: re-run (debounced) whenever the query or a toggle changes.
+  // queryRef/optsRef are already updated by the time the timer fires. An empty query
+  // takes runSearch's clear-and-return path, so no git grep is spawned for "". This
+  // one effect subsumes the old toggle-only re-run — toggles are in its deps.
   useEffect(() => {
-    if (hasSearchedRef.current) runSearch()
-  }, [matchCase, wholeWord, regex, runSearch])
+    clearSearchTimer()
+    searchTimerRef.current = setTimeout(() => {
+      searchTimerRef.current = null
+      runSearch()
+    }, SEARCH_DEBOUNCE_MS)
+    return clearSearchTimer
+  }, [query, matchCase, wholeWord, regex, runSearch, clearSearchTimer])
 
   useEffect(() => {
     setSelectedIndex((i) => (rows.length === 0 ? 0 : Math.min(Math.max(0, i), rows.length - 1)))
@@ -247,8 +268,12 @@ export function SearchPanel({ workspaceRoot, focused, maxResults }: SearchPanelP
   useKeyboard((key) => {
     if (!focused || isOverlayOpen) return
     if (!listMode) {
-      // Input mode — only Enter is ours (run the search); everything else is typing.
-      if (key.name === "return" || key.name === "enter") runSearch()
+      // Input mode — only Enter is ours; everything else is typing. Enter forces
+      // an immediate run, flushing the pending debounce so it can't fire again.
+      if (key.name === "return" || key.name === "enter") {
+        clearSearchTimer()
+        runSearch()
+      }
       return
     }
     switch (key.name) {
@@ -299,6 +324,7 @@ export function SearchPanel({ workspaceRoot, focused, maxResults }: SearchPanelP
           placeholder="Search"
           flexGrow={1}
           backgroundColor={theme.background}
+          cursorStyle={CURSOR_STYLE}
         />
         <ToggleCell label="Aa" active={matchCase} onToggle={() => setMatchCase((v) => !v)} />
         <ToggleCell label="ab" active={wholeWord} onToggle={() => setWholeWord((v) => !v)} />

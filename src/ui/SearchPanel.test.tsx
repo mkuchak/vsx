@@ -152,6 +152,30 @@ async function search(query: string) {
   testSetup!.mockInput.pressEnter()
 }
 
+/** Type into the query WITHOUT Enter — the debounced search-as-you-type drives it. */
+async function typeQuery(query: string) {
+  await waitForInputFocus()
+  await testSetup!.mockInput.typeText(query)
+  await testSetup!.flush()
+}
+
+/** Backspace over the whole query, letting the input's onInput clear it. */
+async function clearQuery(len: number) {
+  for (let i = 0; i < len; i++) testSetup!.mockInput.pressBackspace()
+  await testSetup!.flush()
+}
+
+/** Flush/sleep until at least `n` searches are in flight (spy pushed their resolvers). */
+async function waitForPending(pending: unknown[], n: number, timeoutMs = 3000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    await testSetup!.flush()
+    if (pending.length >= n) return
+    await Bun.sleep(20)
+  }
+  throw new Error(`timed out waiting for ${n} pending searches (have ${pending.length})`)
+}
+
 /**
  * Type a query, flip one or more mode toggles (Aa / ab / .*) by clicking their
  * labels, THEN run. The toggles MUST come after typing: clicking a toggle first
@@ -471,3 +495,105 @@ test("opening a match on a non-ASCII line lands the caret at the match start", a
 
   documentRegistry.releaseDocument(join(root, "cafe.ts"))
 }, 15000)
+
+test("typing a query without Enter runs the search after the debounce", async () => {
+  await write("alpha.ts", "const needle = 1\nother\nneedle again\n")
+  await write("beta.ts", "no match here\n")
+
+  await render()
+  await typeQuery("needle") // no Enter — the debounce alone drives it
+  await waitFor("2 results in 1 file")
+
+  const f = frame()
+  expect(f).toContain("alpha.ts")
+  expect(f).not.toContain("beta.ts")
+  expect(f).toContain("const needle = 1")
+})
+
+test("editing the query re-runs and shows the new query's results", async () => {
+  await write("a.ts", "foo\nfoobar\n")
+
+  await render()
+  await typeQuery("foo")
+  await waitFor("2 results in 1 file") // "foo" hits both lines
+
+  await testSetup!.mockInput.typeText("bar") // → "foobar"
+  await testSetup!.flush()
+  await waitFor("1 result in 1 file") // only the "foobar" line survives
+  expect(frame()).toContain("foobar")
+})
+
+test("clearing the query clears the results and spawns no search for the empty query", async () => {
+  await write("a.ts", "needle here\n")
+
+  await render()
+  const spy = spyOn(searchService, "searchWorkspace") // calls through, but counts
+
+  await typeQuery("needle")
+  await waitFor("1 result in 1 file")
+  const callsAfterSearch = spy.mock.calls.length
+  expect(callsAfterSearch).toBeGreaterThan(0)
+
+  await clearQuery("needle".length)
+  // Results clear; give the debounce ample time to (not) fire for the empty query.
+  const deadline = Date.now() + 1500
+  while (Date.now() < deadline && frame().includes("result")) {
+    await testSetup!.flush()
+    await Bun.sleep(20)
+  }
+  expect(frame()).not.toContain("result")
+  // No new searchWorkspace call was made for the now-empty query.
+  expect(spy.mock.calls.length).toBe(callsAfterSearch)
+
+  spy.mockRestore()
+})
+
+test("toggling match-case after typing re-runs automatically (no Enter)", async () => {
+  await write("case.ts", "Needle upper\nneedle lower\n")
+
+  await render()
+  await typeQuery("needle")
+  await waitFor("2 results in 1 file") // case-insensitive default
+
+  // Click "Aa" — the debounced effect (toggles are in its deps) re-runs on its own.
+  const line0 = frame().split("\n")[0]
+  const aaX = line0.indexOf("Aa")
+  expect(aaX).toBeGreaterThanOrEqual(0)
+  await testSetup!.mockMouse.click(aaX, 0)
+  await waitFor("1 result in 1 file")
+  expect(frame()).toContain("needle lower")
+})
+
+test("a superseded debounced run's results never render (staleness holds while typing)", async () => {
+  // Drive the service manually so an earlier debounced run resolves AFTER a later
+  // one, proving the panel discards the stale result rather than flashing it.
+  const pending: Array<(r: SearchResult) => void> = []
+  const spy = spyOn(searchService, "searchWorkspace").mockImplementation(
+    () => new Promise<SearchResult>((resolve) => pending.push(resolve)),
+  )
+
+  await write("dummy.ts", "content\n")
+  await render()
+
+  await typeQuery("one")
+  await waitForPending(pending, 1) // debounce fired run #1
+  await testSetup!.mockInput.typeText("two") // → "onetwo"
+  await testSetup!.flush()
+  await waitForPending(pending, 2) // debounce fired run #2
+
+  const stale: SearchResult = {
+    files: [{ path: join(root, "STALE.ts"), matches: [{ line: 1, col: 1, length: 5, preview: "STALE-LINE" }] }],
+    truncated: false,
+  }
+  const fresh: SearchResult = {
+    files: [{ path: join(root, "FRESH.ts"), matches: [{ line: 1, col: 1, length: 5, preview: "FRESH-LINE" }] }],
+    truncated: false,
+  }
+  pending[0]!(stale) // resolve the older run first
+  pending[1]!(fresh)
+  await waitFor("FRESH.ts")
+
+  expect(frame()).not.toContain("STALE")
+  expect(frame()).toContain("FRESH.ts")
+  spy.mockRestore()
+})

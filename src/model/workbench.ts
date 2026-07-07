@@ -41,6 +41,12 @@ export interface DiffTab {
   path: string
   /** The real underlying file path (for documentRegistry lookups + labels). */
   filePath: string
+  /**
+   * For a rename/copy row, the file's path BEFORE the rename — ABSOLUTE, same
+   * convention as `filePath` (the two are compared/joined together when
+   * resolving the old side of a staged-rename diff). Undefined for a non-rename.
+   */
+  oldPath?: string
   diffKind: DiffKind
   repoRoot: string
   preview: boolean
@@ -417,10 +423,18 @@ export class WorkbenchStore {
    * is already open it is reused/activated regardless of preview status — VSCode
    * never opens two diff tabs for the same comparison.
    */
-  openDiff(path: string, diffKind: DiffKind, repoRoot: string, opts?: OpenDiffOptions): void {
+  openDiff(
+    path: string,
+    diffKind: DiffKind,
+    repoRoot: string,
+    opts?: OpenDiffOptions & { oldPath?: string },
+  ): void {
     this.state.focusArea = "editor"
     const preview = opts?.preview ?? true
     const group = this.activeGroup
+    // Identity is keyed on the NEW path only — a rename's oldPath is display/
+    // diff-resolution data, not identity, so re-opening the same rename (e.g.
+    // after further edits change oldPath's relevance) still dedups to one tab.
     const id = diffTabId(diffKind, repoRoot, path)
     const existing = group.tabs.find((tab) => tab.kind === "diff" && tab.path === id)
 
@@ -434,6 +448,7 @@ export class WorkbenchStore {
       kind: "diff",
       path: id,
       filePath: path,
+      oldPath: opts?.oldPath,
       diffKind,
       repoRoot,
       preview,

@@ -49,12 +49,13 @@ async function write(rel: string, content: string): Promise<void> {
 }
 
 /** Build a diff tab pointing at an ABSOLUTE file path under the repo. */
-function diffTab(rel: string, diffKind: "staged" | "unstaged"): DiffTab {
+function diffTab(rel: string, diffKind: "staged" | "unstaged", oldRel?: string): DiffTab {
   const filePath = join(root, rel)
   return {
     kind: "diff",
     path: `diff::${diffKind}::${root}::${filePath}`,
     filePath,
+    oldPath: oldRel ? join(root, oldRel) : undefined,
     diffKind,
     repoRoot: root,
     preview: false,
@@ -184,6 +185,30 @@ describe("resolveDiff content resolution", () => {
     const { oldCode, newCode } = await resolveDiff(git, diffTab("new.txt", "staged"))
     expect(oldCode).toBe("")
     expect(newCode).toBe("brand new\n")
+  })
+
+  test("staged rename with an edit: old = original content at oldPath, new = edited index blob", async () => {
+    await write("old.txt", "one\ntwo\nthree\n")
+    await sh(["add", "old.txt"])
+    await sh(["commit", "-qm", "init"])
+    await sh(["mv", "old.txt", "new.txt"])
+    await write("new.txt", "one\nTWO_EDITED\nthree\n")
+    await sh(["add", "new.txt"])
+
+    const { oldCode, newCode } = await resolveDiff(git, diffTab("new.txt", "staged", "old.txt"))
+    expect(oldCode).toBe("one\ntwo\nthree\n")
+    expect(newCode).toBe("one\nTWO_EDITED\nthree\n")
+
+    // The regression this guards: without oldPath threaded through, `old` was
+    // fetched from HEAD at the NEW path (empty, since HEAD only has the file
+    // under its old name), so every line — not just the edited one — read as
+    // added.
+    const { patch } = buildDiffPatch(oldCode, newCode, "new.txt")
+    const [file] = parsePatch(patch)
+    const addedLines = file.hunks.flatMap((h) => h.lines).filter((l) => l.startsWith("+"))
+    const removedLines = file.hunks.flatMap((h) => h.lines).filter((l) => l.startsWith("-"))
+    expect(addedLines).toEqual(["+TWO_EDITED"])
+    expect(removedLines).toEqual(["-two"])
   })
 
   test("deleted file (working tree gone) has empty new content", async () => {
@@ -555,6 +580,21 @@ describe("DiffPane rendering + interaction", () => {
 
     await waitForText("BETACHANGED") // the "after" side
     expect(testSetup!.captureCharFrame()).toContain("beta") // the "before" side
+  })
+
+  test("staged rename header shows 'oldname → newname'", async () => {
+    await write("old.txt", "one\ntwo\n")
+    await sh(["add", "old.txt"])
+    await sh(["commit", "-qm", "init"])
+    await sh(["mv", "old.txt", "new.txt"])
+
+    workbenchStore.openDiff(join(root, "new.txt"), "staged", root, {
+      preview: false,
+      oldPath: join(root, "old.txt"),
+    })
+    await renderActiveDiff()
+
+    await waitForText("old.txt → new.txt")
   })
 
   test("v toggles between split and unified view", async () => {

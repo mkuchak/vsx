@@ -353,10 +353,10 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
     controls.gotoLine(line, column)
   }
 
-  const openDiff = (path: string, kind: "staged" | "unstaged") => {
+  const openDiff = (path: string, kind: "staged" | "unstaged", oldPath?: string) => {
     const repo = activeRepoFor(path, repos)
     if (!repo) return
-    workbenchStore.openDiff(path, kind, repo.root, { preview: true })
+    workbenchStore.openDiff(path, kind, repo.root, { preview: true, oldPath })
   }
 
   const sidebarFocused = focusArea === "sidebar"

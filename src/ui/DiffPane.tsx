@@ -156,20 +156,27 @@ async function readWorkingTree(path: string): Promise<string> {
  * - unstaged: `old` = index (`:0`), falling back to HEAD when the file has no
  *   index entry at all (a never-staged new file). `new` = the live in-memory
  *   Document if one is open (so unsaved edits show) else the working-tree file.
- * - staged: `old` = HEAD, `new` = index (`:0`).
+ * - staged: `old` = HEAD, `new` = index (`:0`). For a rename/copy, HEAD has no
+ *   entry under the NEW path (it only knows the file under `oldPath`), so `old`
+ *   is fetched from HEAD at `oldPath` instead — otherwise `old` resolves to ""
+ *   and the whole file reads as added.
  */
 export async function resolveDiff(
   service: GitService,
   tab: DiffTab,
 ): Promise<{ oldCode: string; newCode: string }> {
-  const { filePath, diffKind } = tab
+  const { filePath, diffKind, oldPath } = tab
   const rel = relative(tab.repoRoot, filePath)
   if (diffKind === "staged") {
-    const oldCode = await service.show("HEAD", rel)
+    const oldRel = oldPath ? relative(tab.repoRoot, oldPath) : rel
+    const oldCode = await service.show("HEAD", oldRel)
     const newCode = await service.show(":0", rel)
     return { oldCode, newCode }
   }
 
+  // oldPath is irrelevant here: staging a rename already moves the index entry
+  // to the new path, so the unstaged "old" side (`:0` at the new path) is
+  // already correct with no rename-aware lookup needed.
   let oldCode = await service.show(":0", rel)
   if (oldCode === "") oldCode = await service.show("HEAD", rel)
   const live = documentRegistry.get(filePath)
@@ -380,7 +387,10 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
     )
   }
 
-  const name = basename(tab.filePath)
+  const name =
+    tab.kind === "diff" && tab.oldPath
+      ? `${basename(tab.oldPath)} → ${basename(tab.filePath)}`
+      : basename(tab.filePath)
   const headerLabel =
     tab.kind === "commitDiff"
       ? tab.label

@@ -197,6 +197,26 @@ describe("diff tabs", () => {
     expect(activePath(store)).toBe(diffTabs[0].path)
   })
 
+  test("openDiff persists oldPath on the resulting tab", () => {
+    const store = new WorkbenchStore()
+    store.openDiff("/repo/new.ts", "staged", "/repo", { oldPath: "/repo/old.ts" })
+
+    const tabs = store.getState().groups[0].tabs
+    const diff = tabs[0]
+    if (diff.kind !== "diff") throw new Error("expected diff tab")
+    expect(diff.oldPath).toBe("/repo/old.ts")
+  })
+
+  test("oldPath does not affect diff tab identity/dedup", () => {
+    const store = new WorkbenchStore()
+    store.openDiff("/repo/new.ts", "staged", "/repo", { preview: false, oldPath: "/repo/old.ts" })
+    store.openDiff("/repo/new.ts", "staged", "/repo", { preview: false })
+
+    const tabs = store.getState().groups[0].tabs
+    const diffTabs = tabs.filter((t) => t.kind === "diff")
+    expect(diffTabs).toHaveLength(1)
+  })
+
   test("dedup reuses a diff tab even when it is a permanent (non-preview) tab", () => {
     const store = new WorkbenchStore()
     store.openDiff("/repo/a.ts", "staged", "/repo", { preview: false })

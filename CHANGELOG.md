@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/mkuchak/vsx/compare/v0.3.0...v0.3.1) (2026-07-07)
+
+### Bug Fixes
+
+* **install:** fail-closed checksums, safe version pruning, bun fallback ([a594e99](https://github.com/mkuchak/vsx/commit/a594e99c24aab3dfa2a7dc2020246073d8428fb7))
+* **quick-open:** gate the frecency boost to label-tier matches ([b7de485](https://github.com/mkuchak/vsx/commit/b7de48554598e6595c5d9bd96590dcb3f83b4a39))
+* **release:** narrow the loop guard and gate on releasable commits ([83a51fd](https://github.com/mkuchak/vsx/commit/83a51fd956ef30addf67e4cc8a276a2d1624cec3))
+
 ## [0.3.0](https://github.com/mkuchak/vsx/compare/v0.2.1...v0.3.0) (2026-07-05)
 
 ### Features

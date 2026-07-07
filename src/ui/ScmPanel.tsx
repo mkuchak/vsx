@@ -2,7 +2,7 @@ import { useKeyboard } from "@opentui/react"
 import type { ScrollBoxRenderable } from "@opentui/core"
 import { join } from "node:path"
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { gitStatusColor, theme } from "../theme"
+import { CURSOR_STYLE, gitStatusColor, theme } from "../theme"
 import type { FileStatus, StatusResult } from "../services/git"
 import {
   discoverRepositories,
@@ -999,6 +999,7 @@ const RepoSection = memo(function RepoSection({
         onInput={(value) => onMessageInput(repo.root, value)}
         focused={inputFocused}
         placeholder="Message (Enter to commit)"
+        cursorStyle={CURSOR_STYLE}
       />
       {confirmActive ? (
         <text fg={theme.warning}>

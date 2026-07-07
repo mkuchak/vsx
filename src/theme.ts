@@ -1,4 +1,4 @@
-import { SyntaxStyle, type ThemeTokenStyle } from "@opentui/core"
+import { SyntaxStyle, type CursorStyleOptions, type ThemeTokenStyle } from "@opentui/core"
 
 /**
  * vsx theme — a VSCode "Dark+"-inspired palette shared across the whole workbench.
@@ -53,6 +53,17 @@ export const theme = {
 } as const
 
 export type Theme = typeof theme
+
+/**
+ * Shared cursor appearance for every `<textarea>`/`<input>` in the workbench —
+ * a thin bar (VSCode's default) instead of OpenTUI's block-cursor default.
+ * `EditBufferRenderable`/`InputRenderable` render this via the terminal's own
+ * hardware cursor (positioned + restyled on every focus/render), not a
+ * synthetic drawn cell — so this is genuinely the native cursor shape, and
+ * every text-input renderable needs it applied individually since each one's
+ * own `_cursorStyle` default otherwise wins on its next focus/render.
+ */
+export const CURSOR_STYLE: CursorStyleOptions = { style: "line", blinking: true }
 
 /** Status-letter -> color, matching VSCode's Resource.getStatusColor() mapping. */
 export function gitStatusColor(letter: string): string {

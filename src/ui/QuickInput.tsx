@@ -11,7 +11,7 @@ import { workbenchStore } from "../model/workbench"
 import { type CommandInfo, withMacSuper } from "../services/commands"
 import { isLabelMatch, scoreAndSort, type MatchRange } from "../services/fuzzy"
 import { enumerateFiles, listDir, type DirEntry } from "../services/workspace"
-import { theme } from "../theme"
+import { CURSOR_STYLE, theme } from "../theme"
 import { useCommands } from "../workbench/CommandsProvider"
 import { useOverlay } from "../workbench/OverlayProvider"
 
@@ -583,6 +583,7 @@ export function QuickInput({
           onInput={setQuery}
           placeholder="Go to file…"
           backgroundColor={theme.background}
+          cursorStyle={CURSOR_STYLE}
         />
         <scrollbox ref={scrollRef} height={10}>
           {results.map((item, index) => (

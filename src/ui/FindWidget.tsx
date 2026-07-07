@@ -6,7 +6,7 @@ import { documentRegistry } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
 import { withMacSuper } from "../services/commands"
 import { findMatches, type FindMatch } from "../services/findInFile"
-import { theme } from "../theme"
+import { CURSOR_STYLE, theme } from "../theme"
 import { useCommands } from "../workbench/CommandsProvider"
 import { getEditorControls } from "../workbench/editorControls"
 import { useOverlay } from "../workbench/OverlayProvider"
@@ -274,6 +274,7 @@ export function FindWidget() {
         placeholder="Find"
         width={24}
         backgroundColor={theme.background}
+        cursorStyle={CURSOR_STYLE}
       />
       <ToggleCell label="Aa" active={matchCase} onToggle={() => setMatchCase((v) => !v)} />
       <ToggleCell label="ab" active={wholeWord} onToggle={() => setWholeWord((v) => !v)} />

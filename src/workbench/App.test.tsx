@@ -304,25 +304,36 @@ test("Ctrl+V while Quick Open is open does not leak a paste into the editor unde
 })
 
 test("Enter while an overlay is open does not open the FileTree's selected row", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
-  await settle(testSetup)
-  await waitForText("hello.ts")
+  // Stubbed (not just XDG-isolated): this test's premise is an EMPTY Quick
+  // Open MRU list, which must hold regardless of whatever other tests in this
+  // file have already recorded into the shared per-process file-history store
+  // — stubbing removes that ordering dependency instead of relying on it
+  // being empty by chance (the previous, real-machine-writing version of this
+  // test was flaky for exactly that reason).
+  const { spy } = stubFileHistory()
+  try {
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    await settle(testSetup)
+    await waitForText("hello.ts")
 
-  // Select the hello.ts FILE row (the `.git` dir sorts first) so that an ungated
-  // FileTree Enter WOULD open it — the gate is what must stop that.
-  testSetup.mockInput.pressArrow("down")
-  await settle(testSetup, 100)
-  expect(activeTabPath()).toBeNull()
+    // Select the hello.ts FILE row (the `.git` dir sorts first) so that an ungated
+    // FileTree Enter WOULD open it — the gate is what must stop that.
+    testSetup.mockInput.pressArrow("down")
+    await settle(testSetup, 100)
+    expect(activeTabPath()).toBeNull()
 
-  // Quick Open opens over the still-"focused" Explorer; its empty MRU has no
-  // result to accept, so Enter must be a no-op AND the tree (gated on the open
-  // overlay) must NOT open its selected hello.ts row underneath.
-  testSetup.mockInput.pressKey("p", { ctrl: true })
-  await waitForText("Go to file")
-  testSetup.mockInput.pressEnter()
-  await settle(testSetup, 200)
+    // Quick Open opens over the still-"focused" Explorer; its empty MRU has no
+    // result to accept, so Enter must be a no-op AND the tree (gated on the open
+    // overlay) must NOT open its selected hello.ts row underneath.
+    testSetup.mockInput.pressKey("p", { ctrl: true })
+    await waitForText("Go to file")
+    testSetup.mockInput.pressEnter()
+    await settle(testSetup, 200)
 
-  expect(activeTabPath()).toBeNull()
+    expect(activeTabPath()).toBeNull()
+  } finally {
+    spy.mockRestore()
+  }
 })
 
 // The status bar shows "Ln <n>, Col <n>" only while the EDITOR area holds focus

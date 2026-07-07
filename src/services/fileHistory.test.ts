@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test"
 import * as fsp from "node:fs/promises"
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createFileHistory } from "./fileHistory"
@@ -55,6 +55,18 @@ describe("record + frecency ordering", () => {
     expect(fh.frecency(entry(now - DAY + 1), now)).toBe(20) // <1d → ×2
     expect(fh.frecency(entry(now - WEEK + 1), now)).toBe(5) // <1w → /2
     expect(fh.frecency(entry(now - WEEK - 1), now)).toBe(2.5) // else → /4
+  })
+
+  test("exact band boundaries fall to the LOWER multiplier (strict <, not <=)", () => {
+    const fh = createFileHistory({ baseDir })
+    const now = 100 * DAY
+    const entry = (lastAccess: number) => ({ path: "/x", score: 10, lastAccess })
+    // age === HOUR is NOT < HOUR, so it falls into the <DAY band (×2), not ×4.
+    expect(fh.frecency(entry(now - HOUR), now)).toBe(20)
+    // age === DAY is NOT < DAY, so it falls into the <WEEK band (/2), not ×2.
+    expect(fh.frecency(entry(now - DAY), now)).toBe(5)
+    // age === WEEK is NOT < WEEK, so it falls into the else band (/4), not /2.
+    expect(fh.frecency(entry(now - WEEK), now)).toBe(2.5)
   })
 })
 
@@ -144,9 +156,53 @@ describe("corruption tolerance", () => {
     expect(parsed.entries.map((e: { path: string }) => e.path)).toEqual(["/fresh"])
   })
 
-  test("wrong-shape file loads empty", () => {
+  test("wrong-shape file (entries not an array) loads empty", async () => {
+    await writeFile(filePath(), JSON.stringify({ version: 1, entries: "not-an-array" }))
     const fh = createFileHistory({ baseDir })
     expect(fh.top(10).length).toBe(0)
+  })
+
+  test("wrong version number loads empty", async () => {
+    const entries = [{ path: "/a", score: 1, lastAccess: 1000 }]
+    await writeFile(filePath(), JSON.stringify({ version: 2, entries }))
+    const fh = createFileHistory({ baseDir })
+    expect(fh.top(10).length).toBe(0)
+  })
+
+  test("missing version field loads empty", async () => {
+    const entries = [{ path: "/a", score: 1, lastAccess: 1000 }]
+    await writeFile(filePath(), JSON.stringify({ entries }))
+    const fh = createFileHistory({ baseDir })
+    expect(fh.top(10).length).toBe(0)
+  })
+
+  test("individually malformed entries are dropped, well-formed ones survive", async () => {
+    const entries = [
+      { path: "/good", score: 1, lastAccess: 1000 }, // valid
+      { path: 42, score: 1, lastAccess: 1000 }, // non-string path
+      { path: "/bad-score", score: "1", lastAccess: 1000 }, // score not a number
+      { path: "/bad-access", score: 1, lastAccess: "1000" }, // lastAccess not a number
+      { score: 1, lastAccess: 1000 }, // missing path
+      null,
+      "not-an-object",
+    ]
+    await writeFile(filePath(), JSON.stringify({ version: 1, entries }))
+    const fh = createFileHistory({ baseDir })
+    expect(fh.top(10).map((e) => e.path)).toEqual(["/good"])
+  })
+})
+
+describe("soft-fail on unwritable storage", () => {
+  test("record() + flush() resolve without throwing when baseDir is read-only", async () => {
+    await chmod(baseDir, 0o555)
+    try {
+      const fh = createFileHistory({ baseDir })
+      fh.record("/a", 1000)
+      await expect(fh.flush()).resolves.toBeUndefined()
+    } finally {
+      // Restore write permission so afterEach's rm(recursive) can clean up.
+      await chmod(baseDir, 0o755)
+    }
   })
 })
 

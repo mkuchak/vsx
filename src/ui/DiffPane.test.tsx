@@ -330,6 +330,120 @@ describe("DiffPane refreshes on external git changes via the shared watcher", ()
   })
 })
 
+describe("DiffPane reloads in the background without unmounting", () => {
+  test("a no-op reload keeps the scrollbox mounted, its scroll position, and never flashes Loading", async () => {
+    const base = Array.from({ length: 60 }, (_, i) => `line ${i}`).join("\n") + "\n"
+    await write("big.txt", base)
+    await sh(["add", "big.txt"])
+    await sh(["commit", "-qm", "init"])
+
+    // An open Document drives the "new" side of an unstaged diff, so a setText fires
+    // a deterministic live-edit reload (onDidChange -> reloadVersion bump).
+    const filePath = join(root, "big.txt")
+    const doc = await documentRegistry.openDocument(filePath)
+    const modified = base.replace("line 5", "LINE_FIVE_EDIT")
+    doc.setText(modified, "edit")
+
+    workbenchStore.openDiff(filePath, "unstaged", root, { preview: false })
+    await renderActiveDiff({ width: 80, height: 8 })
+    await waitForText("LINE_FIVE_EDIT")
+
+    const sb = scrollbox()
+    sb.scrollTop = 12
+    for (let i = 0; i < 4; i++) await testSetup!.flush()
+    const scrollBefore = sb.scrollTop
+    expect(scrollBefore).toBeGreaterThan(0)
+
+    // Re-resolving to identical content must be invisible: capture every frame
+    // across the reload and assert the loading placeholder never appears.
+    const frames: string[] = []
+    doc.setText(modified, "edit")
+    for (let i = 0; i < 8; i++) {
+      await testSetup!.flush()
+      frames.push(testSetup!.captureCharFrame())
+      await Bun.sleep(10)
+      await testSetup!.flush()
+      frames.push(testSetup!.captureCharFrame())
+    }
+
+    expect(frames.some((f) => f.includes("Loading"))).toBe(false)
+    const sbAfter = scrollbox()
+    expect(sbAfter).toBe(sb) // same scrollbox object — never unmounted
+    expect(sbAfter.scrollTop).toBe(scrollBefore) // scroll position preserved
+
+    documentRegistry.releaseDocument(filePath)
+  })
+
+  test("a live-edit reload to different content updates the rendered diff", async () => {
+    const base = "alpha\nbeta\ngamma\n"
+    await write("c.txt", base)
+    await sh(["add", "c.txt"])
+    await sh(["commit", "-qm", "init"])
+
+    const filePath = join(root, "c.txt")
+    const doc = await documentRegistry.openDocument(filePath)
+    doc.setText("alpha\nFIRST_EDIT\ngamma\n", "edit")
+
+    workbenchStore.openDiff(filePath, "unstaged", root, { preview: false })
+    await renderActiveDiff()
+    await waitForText("FIRST_EDIT")
+
+    doc.setText("alpha\nSECOND_EDIT\ngamma\n", "edit")
+    await waitForText("SECOND_EDIT")
+    expect(testSetup!.captureCharFrame()).not.toContain("FIRST_EDIT")
+
+    documentRegistry.releaseDocument(filePath)
+  })
+
+  test("switching to a different diff tab renders the new tab's content", async () => {
+    await write("a.txt", "alpha\nbeta\n")
+    await write("b.txt", "uno\ndos\n")
+    await sh(["add", "."])
+    await sh(["commit", "-qm", "init"])
+    await write("a.txt", "alpha\nA_EDIT\n")
+    await write("b.txt", "uno\nB_EDIT\n")
+
+    workbenchStore.openDiff(join(root, "a.txt"), "unstaged", root, { preview: false })
+    await renderActiveDiff()
+    await waitForText("A_EDIT")
+
+    // An identity change (new tab) is allowed to show the placeholder; what matters
+    // is that the new tab's content resolves and renders, replacing the old.
+    workbenchStore.openDiff(join(root, "b.txt"), "unstaged", root, { preview: false })
+    await waitForText("B_EDIT")
+    expect(testSetup!.captureCharFrame()).not.toContain("A_EDIT")
+  })
+
+  test("a background resolve error keeps the last-good diff visible", async () => {
+    const base = "alpha\nbeta\ngamma\n"
+    await write("d.txt", base)
+    await sh(["add", "d.txt"])
+    await sh(["commit", "-qm", "init"])
+
+    const filePath = join(root, "d.txt")
+    const doc = await documentRegistry.openDocument(filePath)
+    doc.setText("alpha\nGOOD_EDIT\ngamma\n", "edit")
+
+    workbenchStore.openDiff(filePath, "unstaged", root, { preview: false })
+    await renderActiveDiff()
+    await waitForText("GOOD_EDIT")
+
+    // Break the repo so the next reload's git lookup (old side) throws mid-flight.
+    await rm(join(root, ".git"), { recursive: true, force: true })
+    doc.setText("alpha\nWHILE_BROKEN\ngamma\n", "edit")
+
+    for (let i = 0; i < 10; i++) {
+      await testSetup!.flush()
+      await Bun.sleep(10)
+    }
+    const frame = testSetup!.captureCharFrame()
+    expect(frame).toContain("GOOD_EDIT") // last-good content stayed mounted
+    expect(frame).not.toContain("WHILE_BROKEN") // the failed resolve did not land
+
+    documentRegistry.releaseDocument(filePath)
+  })
+})
+
 describe("pickHunkTarget", () => {
   test("next moves to the following hunk and wraps", () => {
     expect(pickHunkTarget([0, 7, 20], 0, 1)).toBe(7)

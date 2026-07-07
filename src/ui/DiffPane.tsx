@@ -227,6 +227,12 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
   const [view, setView] = useState<DiffView>(lastView)
   const [reloadVersion, setReloadVersion] = useState(0)
   const sbRef = useRef<ScrollBoxRenderable | null>(null)
+  // The tab identity + content the currently-mounted `ready` view belongs to.
+  // Read inside the async resolve to tell a first/identity-change load (show the
+  // placeholder, surface errors) apart from a background re-resolve (keep the
+  // scrollbox mounted, skip no-op setState, swallow errors). `null` = nothing
+  // rendered yet for the active tab.
+  const readyRef = useRef<{ identity: string; oldCode: string; newCode: string } | null>(null)
 
   // The diff scrollbox loses native focus to an overlay's input; restore it on
   // overlay close when this pane is the focused one.
@@ -241,18 +247,45 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
   useEffect(() => {
     if (!tab) {
       setLoad({ kind: "empty" })
+      readyRef.current = null
       return
     }
     let cancelled = false
-    setLoad({ kind: "loading" })
+    const identity = tab.path
+    // Show the "Loading…" placeholder ONLY when nothing is rendered yet for THIS
+    // tab (initial mount or a switch to a different tab). A reloadVersion-only
+    // re-run — a live-Document edit or a git-watcher stale bump — keeps the current
+    // content (and thus the scrollbox) mounted, so it never flashes the placeholder
+    // and the native scroll position survives the reload untouched.
+    if (readyRef.current?.identity !== identity) {
+      setLoad({ kind: "loading" })
+      readyRef.current = null
+    }
     resolveDiffContent(new GitService(tab.repoRoot), tab)
       .then((res) => {
-        if (!cancelled) setLoad({ kind: "ready", ...res })
+        if (cancelled) return
+        const prev = readyRef.current
+        // An identical background re-resolve would still re-render, re-feed the
+        // `<diff>` renderable, and re-run the memoized Myers diff for nothing —
+        // skip the state update entirely when the content is unchanged.
+        if (
+          prev?.identity === identity &&
+          prev.oldCode === res.oldCode &&
+          prev.newCode === res.newCode
+        ) {
+          return
+        }
+        readyRef.current = { identity, ...res }
+        setLoad({ kind: "ready", ...res })
       })
       .catch((err) => {
-        if (!cancelled) {
-          setLoad({ kind: "error", message: err instanceof Error ? err.message : String(err) })
-        }
+        if (cancelled) return
+        // A background resolve failing for content we're already showing must NOT
+        // blank the view into the error screen — VSCode keeps the last-good diff
+        // visible. Only surface the error on an initial/identity-change load, where
+        // there is nothing rendered yet (readyRef was cleared above).
+        if (readyRef.current?.identity === identity) return
+        setLoad({ kind: "error", message: err instanceof Error ? err.message : String(err) })
       })
     return () => {
       cancelled = true

@@ -95,8 +95,20 @@ sha256_tool() {
 verify_checksum() {
   local dir="$1" artifact="$2" sums="$3" tool line
   tool="$(sha256_tool)" || die "no sha256 tool found (need sha256sum or shasum)."
-  line="$(grep " ${artifact}\$" "$sums" || true)"
+  # Literal suffix match via a case pattern (not grep as a regex) — `artifact`
+  # can contain dots that would otherwise act as regex wildcards.
+  line=""
+  while IFS= read -r candidate || [ -n "$candidate" ]; do
+    case "$candidate" in
+      *"  ${artifact}") line="$candidate" ;;
+    esac
+  done < "$sums"
   [ -n "$line" ] || return 1
+  # GNU `sha256sum -c` tolerates a malformed line (prints only a WARNING and
+  # exits 0); macOS `shasum -a 256 -c` rejects it (exits 1). Validate the hash
+  # shape ourselves first so both tools fail closed identically on a truncated
+  # or corrupted SHA256SUMS download.
+  [[ "$line" =~ ^[0-9a-f]{64}[[:space:]] ]] || return 1
   ( cd "$dir" && printf '%s\n' "$line" | $tool -c - >/dev/null 2>&1 )
 }
 
@@ -121,7 +133,7 @@ path_hint() {
 download() {
   local url="$1" dest="$2"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$dest"
+    curl --retry 2 -fsSL "$url" -o "$dest"
   elif command -v wget >/dev/null 2>&1; then
     wget -qO "$dest" "$url"
   else
@@ -133,7 +145,7 @@ download() {
 fetch() {
   local url="$1"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url"
+    curl --retry 2 -fsSL "$url"
   elif command -v wget >/dev/null 2>&1; then
     wget -qO- "$url"
   else
@@ -147,9 +159,19 @@ resolve_tag() {
     printf '%s\n' "$VSX_VERSION"
     return
   fi
-  local tag
-  tag="$(fetch "$API_LATEST" | parse_latest_tag)" \
-    || die "could not reach the GitHub API to find the latest release."
+  local raw fetch_status tag
+  # Not a `fetch ... | parse_latest_tag` pipeline: capturing fetch's own exit
+  # status separately (curl's 22 / wget's 8 both mean "server error", e.g. a
+  # 404) lets the private-repo/no-releases-yet case get its own message instead
+  # of the generic network-failure one.
+  raw="$(fetch "$API_LATEST")" && fetch_status=0 || fetch_status=$?
+  if [ "$fetch_status" -ne 0 ]; then
+    if [ "$fetch_status" -eq 22 ] || [ "$fetch_status" -eq 8 ]; then
+      die "could not determine the latest release tag (is the repo public yet?)."
+    fi
+    die "could not reach the GitHub API to find the latest release."
+  fi
+  tag="$(printf '%s' "$raw" | parse_latest_tag)"
   [ -n "$tag" ] || die "could not determine the latest release tag (is the repo public yet?)."
   printf '%s\n' "$tag"
 }
@@ -162,28 +184,34 @@ ensure_bun() {
     return
   fi
   step "Bun runtime not found — installing it (bun.sh/install)…" >&2
-  curl -fsSL https://bun.sh/install | bash >&2
+  curl --retry 2 -fsSL https://bun.sh/install | bash >&2
   local bun="${HOME}/.bun/bin/bun"
   [ -x "$bun" ] || die "Bun install did not produce ${bun}."
   printf '%s\n' "$bun"
 }
 
-# Keep only the current + previous version dirs under ~/.vsx, newest by version.
+# Keep the just-installed version PLUS the two newest OTHER version dirs under
+# ~/.vsx. `keep_version` is always excluded from the delete set — otherwise a
+# VSX_VERSION-pinned downgrade (installing an older release while newer ones
+# already sit on disk) would prune the very version it just symlinked to.
 prune_versions() {
+  local keep_version="$1"
   [ -d "$VSX_HOME" ] || return 0
   local names old dir
-  # Collect the version dir basenames (skip the reserved `support` dir), sort
-  # newest-first, then drop the two we keep and remove the rest.
+  # Collect the version dir basenames (skip the reserved `support` dir and the
+  # just-installed version), sort newest-first, then drop the two we keep and
+  # remove the rest.
   names=""
   for dir in "$VSX_HOME"/*/; do
     [ -d "$dir" ] || continue
     dir="$(basename -- "$dir")"
     [ "$dir" = "support" ] && continue
+    [ "$dir" = "$keep_version" ] && continue
     names+="${dir}"$'\n'
   done
   old="$(printf '%s' "$names" | sort -Vr | tail -n +3)"
   [ -n "$old" ] || return 0
-  while IFS= read -r dir; do
+  while IFS= read -r dir || [ -n "$dir" ]; do
     [ -n "$dir" ] || continue
     rm -rf -- "${VSX_HOME:?}/${dir}"
     info "pruned old version ${dir}"
@@ -238,6 +266,8 @@ main() {
   mkdir -p "$target"
   tar -xzf "${tmp}/${artifact}" -C "$target"
 
+  local bun_was_missing=false
+  command -v bun >/dev/null 2>&1 || bun_was_missing=true
   local bun
   bun="$(ensure_bun)"
 
@@ -248,7 +278,7 @@ main() {
   ln -sf "${target}/bin/vsx" "${VSX_INSTALL_DIR}/vsx"
   info "linked ${VSX_INSTALL_DIR}/vsx → ${target}/bin/vsx"
 
-  prune_versions
+  prune_versions "$version"
 
   step "vsx ${version} installed."
   info "location: ${target}"
@@ -261,6 +291,11 @@ main() {
       step "Add ${VSX_INSTALL_DIR} to your PATH:"
       info "$(path_hint "$VSX_INSTALL_DIR")" ;;
   esac
+
+  if [ "$bun_was_missing" = true ]; then
+    step "Bun was just installed — add it to your PATH too:"
+    info "$(path_hint "${HOME}/.bun/bin")"
+  fi
 }
 
 # Source guard: allows the test suite to source this file and call the pure

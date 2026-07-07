@@ -177,6 +177,46 @@ test("verify_checksum fails when the artifact has no line in SHA256SUMS", async 
   expect(code).not.toBe(0)
 })
 
+// GNU `sha256sum -c` tolerates a malformed line (prints only a WARNING, exits
+// 0); macOS `shasum -a 256 -c` rejects it (exits 1) — a truncated SHA256SUMS
+// download would install unverified on a GNU host without the fix. Shim
+// `sha256sum` to behave exactly as leniently as GNU coreutils would, so these
+// prove the NEW shape check catches it before the underlying tool is even
+// consulted (not incidentally, via whichever tool happens to be strict).
+test("verify_checksum fails closed on a truncated hash even if the underlying tool would tolerate it", async () => {
+  const dir = await mkdtemp(join(scratch, "sums-truncated-"))
+  const artifact = "vsx-9.9.9.tar.gz"
+  await writeFile(join(dir, artifact), "pretend tarball bytes\n")
+  const truncated = "a".repeat(63) // one hex char short of 64
+  await writeFile(join(dir, "SHA256SUMS"), `${truncated}  ${artifact}\n`)
+
+  const lenientBin = await mkdtemp(join(scratch, "bin-lenient-"))
+  await shim(lenientBin, "sha256sum", "exit 0") // simulates GNU's lenient pass
+
+  const { code } = await sh(`verify_checksum "${dir}" "${artifact}" "${dir}/SHA256SUMS"`, {
+    pathPrepend: lenientBin,
+  })
+  expect(code).not.toBe(0)
+})
+
+test("verify_checksum fails closed on a non-hex hash", async () => {
+  const dir = await mkdtemp(join(scratch, "sums-nonhex-"))
+  const artifact = "vsx-9.9.9.tar.gz"
+  await writeFile(join(dir, artifact), "pretend tarball bytes\n")
+  await writeFile(join(dir, "SHA256SUMS"), `${"g".repeat(64)}  ${artifact}\n`)
+  const { code } = await sh(`verify_checksum "${dir}" "${artifact}" "${dir}/SHA256SUMS"`)
+  expect(code).not.toBe(0)
+})
+
+test("verify_checksum fails closed on an empty SHA256SUMS file", async () => {
+  const dir = await mkdtemp(join(scratch, "sums-empty-"))
+  const artifact = "vsx-9.9.9.tar.gz"
+  await writeFile(join(dir, artifact), "pretend tarball bytes\n")
+  await writeFile(join(dir, "SHA256SUMS"), "")
+  const { code } = await sh(`verify_checksum "${dir}" "${artifact}" "${dir}/SHA256SUMS"`)
+  expect(code).not.toBe(0)
+})
+
 // ── path_hint: correct syntax per shell ──────────────────────────────────────
 
 test("path_hint emits fish syntax when SHELL is fish", async () => {
@@ -199,17 +239,77 @@ test("resolve_tag honors the VSX_VERSION override without touching the network",
   expect(stdout).toBe("v3.4.5")
 })
 
-// ── prune_versions keeps the two newest version dirs ─────────────────────────
+test("resolve_tag reports a repo-visibility hint on a 404 (curl exit 22)", async () => {
+  const bin = await mkdtemp(join(scratch, "bin-404-"))
+  await shim(bin, "curl", "exit 22")
+  const { code, stderr } = await sh("resolve_tag", { pathPrepend: bin })
+  expect(code).not.toBe(0)
+  expect(stderr).toContain("is the repo public yet?")
+})
 
-test("prune_versions keeps only the current + previous version dirs", async () => {
+test("resolve_tag reports a generic network error on other curl failures", async () => {
+  const bin = await mkdtemp(join(scratch, "bin-net-"))
+  await shim(bin, "curl", "exit 6") // couldn't resolve host
+  const { code, stderr } = await sh("resolve_tag", { pathPrepend: bin })
+  expect(code).not.toBe(0)
+  expect(stderr).toContain("could not reach the GitHub API")
+})
+
+// ── prune_versions: keeps the just-installed version + two newest others ────
+
+test("prune_versions keeps the just-installed version plus the two newest others", async () => {
   const home = await mkdtemp(join(scratch, "home-"))
   const vsxHome = join(home, ".vsx")
   for (const v of ["0.1.0", "0.2.0", "0.3.0", "0.10.0", "support"]) {
     await mkdir(join(vsxHome, v), { recursive: true })
   }
-  const { code } = await sh("prune_versions", { env: { HOME: home } })
+  // 0.10.0 is both the just-installed version and already the newest by
+  // version-sort — the common case: keep = {0.10.0} ∪ {0.3.0, 0.2.0}.
+  const { code } = await sh(`prune_versions "0.10.0"`, { env: { HOME: home } })
   expect(code).toBe(0)
   const survivors = (await Array.fromAsync(new Bun.Glob("*").scan({ cwd: vsxHome, onlyFiles: false }))).sort()
-  // Newest two by version-sort (0.10.0 > 0.3.0), plus the reserved support dir.
-  expect(survivors).toEqual(["0.10.0", "0.3.0", "support"])
+  expect(survivors).toEqual(["0.10.0", "0.2.0", "0.3.0", "support"])
+})
+
+test("prune_versions never prunes a pinned downgrade, even though it is the oldest dir on disk", async () => {
+  const home = await mkdtemp(join(scratch, "home-pin-"))
+  const vsxHome = join(home, ".vsx")
+  for (const v of ["0.1.0", "0.3.0", "0.4.0"]) {
+    await mkdir(join(vsxHome, v), { recursive: true })
+  }
+  // VSX_VERSION=v0.1.0 pinned a downgrade while 0.3.0/0.4.0 already exist. The
+  // regression: sort -Vr | tail -n +3 alone would prune 0.1.0 right after it
+  // was just symlinked, leaving a dangling install.
+  const { code } = await sh(`prune_versions "0.1.0"`, { env: { HOME: home } })
+  expect(code).toBe(0)
+  const survivors = (await Array.fromAsync(new Bun.Glob("*").scan({ cwd: vsxHome, onlyFiles: false }))).sort()
+  expect(survivors).toContain("0.1.0")
+})
+
+// ── piped-entry regression: `cat install.sh | bash` must run main() ─────────
+
+test("piped execution (curl | bash) runs main(), the exact BASH_SOURCE-guard regression", async () => {
+  const bin = await mkdtemp(join(scratch, "bin-piped-"))
+  await shim(bin, "uname", `case "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac`)
+  // No VSX_VERSION override, so main() reaches resolve_tag's network call;
+  // shimmed curl exits 22 (as a real 404 would) so nothing hits the real
+  // network, but main() must run far enough to get there.
+  await shim(bin, "curl", "exit 22")
+  const basePath = `${bin}:${process.env.PATH}`
+  const proc = Bun.spawn(["bash", "-c", `cat "${INSTALL_SH}" | bash`], {
+    env: { ...process.env, PATH: basePath },
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: "ignore",
+  })
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ])
+  // Before the BASH_SOURCE guard, `$0` is "bash" and `BASH_SOURCE[0]` is unset
+  // under a pipe, so main() would never fire and stdout would be silent.
+  expect(stdout).toContain("vsx installer")
+  expect(stdout).toContain("platform: darwin-arm64")
+  expect(stderr).toContain("is the repo public yet?")
 })

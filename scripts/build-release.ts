@@ -15,29 +15,13 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import pkg from "../package.json"
+import { LAUNCHER } from "./launcherTemplate"
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url))
 const DIST = join(ROOT, "dist")
 
 // Files/dirs copied verbatim into the package root.
 const PAYLOAD = ["src", "assets", "package.json", "bun.lock", "README.md"]
-
-// POSIX-sh launcher. Resolves its own real path (following the PATH symlink the
-// installer creates) so `../src/main.tsx` points inside ~/.vsx/<version>/, then
-// execs the packaged entry with the local bun runtime.
-const LAUNCHER = `#!/bin/sh
-# vsx launcher — installed at ~/.vsx/<version>/bin/vsx and symlinked onto PATH.
-target="$0"
-while [ -L "$target" ]; do
-  link=$(readlink "$target")
-  case "$link" in
-    /*) target="$link" ;;
-    *) target="$(dirname "$target")/$link" ;;
-  esac
-done
-dir=$(CDPATH= cd -- "$(dirname -- "$target")" && pwd)
-exec bun "$dir/../src/main.tsx" "$@"
-`
 
 async function mktemp(prefix: string): Promise<string> {
   const dir = join(tmpdir(), `${prefix}-${process.pid}-${Date.now()}`)

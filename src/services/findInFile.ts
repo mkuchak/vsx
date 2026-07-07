@@ -2,8 +2,10 @@
  * Pure in-document find engine: given a buffer's full text and a query, return
  * every match's [start, end) character offset range. Framework-free and
  * synchronous so the widget can recompute on every keystroke and the logic is
- * exhaustively unit-testable. Offsets are into the SAME string the editor buffer
- * exposes (ta.plainText), so they map straight to addHighlightByCharRange.
+ * exhaustively unit-testable. Offsets are JS string (UTF-16) offsets into the
+ * SAME string the editor buffer exposes (ta.plainText) — callers must convert
+ * via createNativeOffsetConverter (see ui/highlightOffsets.ts) before pushing
+ * them into addHighlightByCharRange.
  */
 
 export type FindOptions = {

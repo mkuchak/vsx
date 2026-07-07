@@ -1,11 +1,18 @@
 import {
   getTreeSitterClient,
+  RGBA,
   ScrollBarRenderable,
+  SliderRenderable,
+  TextareaRenderable,
   type MouseEvent as CoreMouseEvent,
+  type OptimizedBuffer,
+  type RenderContext,
+  type ScrollBarOptions,
   type ScrollBoxRenderable,
+  type SimpleHighlight,
   type SyntaxStyle,
   type TextareaAction,
-  type TextareaRenderable,
+  type TextareaOptions,
 } from "@opentui/core"
 import { extend, useKeyboard, useRenderer } from "@opentui/react"
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react"
@@ -16,7 +23,8 @@ import {
 } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
-import { getFindStyleIds, getSharedSyntaxStyle, theme } from "../theme"
+import { CURSOR_STYLE, getFindStyleIds, getSharedSyntaxStyle, theme } from "../theme"
+import { createNativeOffsetConverter } from "./highlightOffsets"
 import {
   consumePendingGoto,
   FIND_CURRENT_PRIORITY,
@@ -31,15 +39,183 @@ import { useOverlay, useOverlayFocusRestore } from "../workbench/OverlayProvider
 import { getLastRendererSelection } from "../workbench/rendererSelection"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
 
-// ScrollBarRenderable isn't in @opentui/react's default component catalogue, so
-// register it once at module load to make `<scrollbar>` a valid element. The
-// module augmentation gives it typed intrinsic props (orientation, trackOptions…).
+/**
+ * VSCode `scrollBeyondLastLine` for the editor. The stock
+ * `EditBufferRenderable.handleScroll` clamps wheel-down to
+ * `maxOffsetY = totalVirtualLines - viewport.height`, pinning the last line to the
+ * viewport bottom. This override lets the last line scroll all the way to the TOP
+ * row (`maxOffsetY = totalVirtualLineCount - 1`), leaving blank rows below.
+ * Everything else — scroll-up, horizontal scroll (only under wrap "none"), the
+ * per-tick `delta`, and `moveCursor: true` (which drags the caret with the view so
+ * the native cursor-driven re-derive keeps the overscrolled offset each frame) —
+ * matches the original exactly.
+ *
+ * `scrollMargin` defaults to 0 here (VSCode cursorSurroundingLines=0): with the
+ * stock 0.2 band the cursor-follow would push an overscrolled view back down every
+ * frame, undoing the overscroll (and the margin would keep the caret 20% off the
+ * edges when typing/navigating).
+ */
+class EditorTextareaRenderable extends TextareaRenderable {
+  // `focused` isn't a TextareaOption — the built-in <textarea> JSX type adds it and
+  // the reconciler applies it generically (focus()/blur() on any renderable). Widen
+  // the option type so our intrinsic element accepts `focused` too; the extra key is
+  // ignored by the base constructor and never reaches a setter.
+  constructor(ctx: RenderContext, options: TextareaOptions & { focused?: boolean }) {
+    super(ctx, { scrollMargin: 0, ...options })
+  }
+
+  /**
+   * Apply a wheel event to the viewport with the overscroll-aware clamp. Public so
+   * the gutter/scrollbar forward handlers (which receive scrolls the textarea's own
+   * hit-tested dispatch never sees) reuse the exact same behavior. `forceHorizontal`
+   * routes wheel up/down to left/right (the horizontal scrollbar's wheel); a Shift
+   * modifier does the same anywhere (VSCode/browser convention). Horizontal scroll
+   * stays gated on wrap "none" — the only mode the edit buffer scrolls horizontally.
+   */
+  applyScroll(event: CoreMouseEvent, forceHorizontal = false): void {
+    if (!event.scroll) return
+    let direction = event.scroll.direction
+    const delta = event.scroll.delta
+    if ((forceHorizontal || event.modifiers.shift) && (direction === "up" || direction === "down")) {
+      direction = direction === "up" ? "left" : "right"
+    }
+    const view = this.editorView
+    const viewport = view.getViewport()
+    if (direction === "up") {
+      const newOffsetY = Math.max(0, viewport.offsetY - delta)
+      view.setViewport(viewport.offsetX, newOffsetY, viewport.width, viewport.height, true)
+      this.requestRender()
+    } else if (direction === "down") {
+      // Overscroll only extends the range when the content actually overflows: an
+      // overflowing buffer can scroll until the last line hits the TOP row
+      // (offsetY = total - 1); a buffer that fits the viewport doesn't scroll at all
+      // (matching VSCode — no phantom scroll/scrollbar for short files).
+      const total = view.getTotalVirtualLineCount()
+      const maxOffsetY = total > viewport.height ? total - 1 : 0
+      const newOffsetY = Math.min(viewport.offsetY + delta, maxOffsetY)
+      view.setViewport(viewport.offsetX, newOffsetY, viewport.width, viewport.height, true)
+      this.requestRender()
+    } else if (this.wrapMode === "none") {
+      // This editor re-derives BOTH offsets from the caret each render, so the
+      // horizontal offset needs the same caret-drag the vertical wheel relies on:
+      // move the caret's COLUMN by the same delta so it keeps its screen column and
+      // the caret-visibility re-derive leaves offsetX where we put it. (moveCursor=true
+      // only drags the ROW, not the column — verified against 0.4.2 — so setViewport
+      // alone snaps offsetX straight back; that is exactly why the stock horizontal
+      // wheel "sometimes doesn't work depending on where the cursor is".) setCursor
+      // clamps the column to the caret's line, so how far a wheel can scroll still
+      // tracks that line's width — the inherent caret coupling, now driven not fought.
+      const cursor = view.getCursor()
+      const newOffsetX =
+        direction === "left" ? Math.max(0, viewport.offsetX - delta) : viewport.offsetX + delta
+      const newCol = direction === "left" ? Math.max(0, cursor.col - delta) : cursor.col + delta
+      view.setViewport(newOffsetX, viewport.offsetY, viewport.width, viewport.height, false)
+      this.setCursor(cursor.row, newCol)
+      this.requestRender()
+    }
+  }
+
+  protected override handleScroll(event: CoreMouseEvent): void {
+    this.applyScroll(event)
+    // Stop the wheel bubbling to the gutter parent, whose onMouseScroll ALSO forwards
+    // scrolls here — without this a wheel directly over the text would scroll twice
+    // (once natively here, once via the forwarder). See EditorTextarea's <line-number>.
+    event.stopPropagation()
+  }
+}
+
+/** A fully transparent bg so a half-block glyph composites over the pane beneath it. */
+const TRANSPARENT = RGBA.fromValues(0, 0, 0, 0)
+
+/**
+ * The [startX, endX] cell range the horizontal slider's thumb covers, recomputed from
+ * the slider's public state. Mirrors OpenTUI's own SliderRenderable geometry
+ * (getVirtualThumbSize/Start → realStartCell/realEndCell in renderHorizontal), minus
+ * the sub-cell ▌▐ end-cap finesse — with half-HEIGHT glyphs there's no quarter-block
+ * to express a partial end cap, so thumb ends stay cell-granular.
+ */
+function thumbCellRange(slider: SliderRenderable): { startX: number; endX: number } {
+  const width = slider.width
+  const virtualTrackSize = width * 2
+  const range = slider.max - slider.min
+
+  let virtualThumbSize: number
+  if (range === 0) {
+    virtualThumbSize = virtualTrackSize
+  } else {
+    const viewportSize = Math.max(1, slider.viewPortSize)
+    const contentSize = range + viewportSize
+    if (contentSize <= viewportSize) {
+      virtualThumbSize = virtualTrackSize
+    } else {
+      const thumbRatio = viewportSize / contentSize
+      virtualThumbSize = Math.max(1, Math.min(Math.floor(virtualTrackSize * thumbRatio), virtualTrackSize))
+    }
+  }
+
+  const virtualThumbStart =
+    range === 0 ? 0 : Math.round(((slider.value - slider.min) / range) * (virtualTrackSize - virtualThumbSize))
+  const virtualThumbEnd = virtualThumbStart + virtualThumbSize
+  return {
+    startX: Math.max(0, Math.floor(virtualThumbStart / 2)),
+    endX: Math.min(width - 1, Math.ceil(virtualThumbEnd / 2) - 1),
+  }
+}
+
+/**
+ * Replacement horizontal render for the slider (bound as `this`). Paints EVERY cell of
+ * the 1-row bar as `▄` — the bottom half-block — instead of the stock full-block `█`
+ * body + solid track fillRect: the thumb's `▄` is in the thumb color, the track's `▄`
+ * is in the track color, both over a transparent bg so the pane shows through the TOP
+ * half. That makes the bar read half-a-row tall, giving visual parity with the 1-COLUMN
+ * vertical bar (a terminal cell is ~2:1 tall:wide, so a full-height horizontal row looks
+ * ~2× thicker than the vertical bar). Vertical sliders are never patched, so their
+ * render is untouched.
+ */
+function renderThinHorizontal(this: SliderRenderable, buffer: OptimizedBuffer): void {
+  const { startX, endX } = thumbCellRange(this)
+  const trackColor = this.backgroundColor
+  const thumbColor = this.foregroundColor
+  for (let realX = 0; realX < this.width; realX++) {
+    const fg = realX >= startX && realX <= endX ? thumbColor : trackColor
+    for (let y = 0; y < this.height; y++) {
+      buffer.setCellWithAlphaBlending(this.x + realX, this.y + y, "▄", fg, TRANSPARENT)
+    }
+  }
+}
+
+/**
+ * A ScrollBar whose horizontal thumb/track render half-a-row tall (see
+ * {@link renderThinHorizontal}). ScrollBarRenderable builds its Slider internally, so
+ * rather than reconstruct it (duplicating the min/max/value/onChange/mouse wiring) the
+ * least-invasive seam is to instance-patch the already-wired slider's `renderSelf` —
+ * that changes ONLY how the thumb paints, reusing every other behavior intact.
+ */
+class ThinHScrollBarRenderable extends ScrollBarRenderable {
+  constructor(ctx: RenderContext, options: ScrollBarOptions) {
+    super(ctx, options)
+    if (this.orientation === "horizontal") {
+      ;(this.slider as unknown as { renderSelf: (buffer: OptimizedBuffer) => void }).renderSelf =
+        renderThinHorizontal
+    }
+  }
+}
+
+// None of these are in @opentui/react's default component catalogue, so register them
+// once at module load to make the elements valid. The module augmentation gives them
+// typed intrinsic props.
 declare module "@opentui/react" {
   interface OpenTUIComponents {
     scrollbar: typeof ScrollBarRenderable
+    "thin-hscrollbar": typeof ThinHScrollBarRenderable
+    "editor-textarea-input": typeof EditorTextareaRenderable
   }
 }
-extend({ scrollbar: ScrollBarRenderable })
+extend({
+  scrollbar: ScrollBarRenderable,
+  "thin-hscrollbar": ThinHScrollBarRenderable,
+  "editor-textarea-input": EditorTextareaRenderable,
+})
 
 export type CursorPosition = { line: number; column: number }
 
@@ -79,6 +255,58 @@ function resolveStyleId(syntaxStyle: SyntaxStyle, scopeName: string): number | n
 }
 
 /**
+ * `TreeSitterClient.highlightOnce` can hand back multiple captures spanning the
+ * exact same `[start, end)` range — predicate-gated nvim-treesitter captures
+ * (e.g. `(#lua-match? @type "^%u")`) leak through the worker unfiltered, so a
+ * plain identifier like `hello` in `function hello() {}` can get `variable`,
+ * `type`, `constant`, AND `function` all on the same span. Pushing every one of
+ * those into `addHighlightByCharRange` at the same (default) priority leaves the
+ * visually-winning color to an UNDEFINED native tie-break: empirically, the
+ * native edit buffer does NOT reliably resolve equal-priority overlapping spans
+ * on an identical range to either the first- or the last-added one (verified
+ * with a throwaway probe against `EditBuffer`/`captureSpans` — the "winner"
+ * varied with unrelated factors like styleId, not emission order), so relying
+ * on native tie-break here would be fragile.
+ *
+ * OpenTUI's read-only `<code>` path (`treeSitterToTextChunks` in
+ * `@opentui/core`) sidesteps this by resolving overlaps in JS: it sorts the
+ * active captures by specificity (dot-segment count via `getSpecificity`) and
+ * applies the most specific one last, breaking ties by emission index (later
+ * wins). This mirrors that same rule, but only for EXACT duplicate ranges —
+ * captures with different `[start, end)` bounds are left untouched and can
+ * still legitimately overlap (nested spans), which is unrelated to this bug.
+ */
+function dedupeHighlightsByRange(highlights: SimpleHighlight[]): SimpleHighlight[] {
+  const winners = new Map<string, { highlight: SimpleHighlight; specificity: number; index: number }>()
+  highlights.forEach((highlight, index) => {
+    const [start, end, scopeName] = highlight
+    const key = `${start}:${end}`
+    const specificity = scopeName.split(".").length
+    const existing = winners.get(key)
+    if (
+      existing === undefined ||
+      specificity > existing.specificity ||
+      (specificity === existing.specificity && index > existing.index)
+    ) {
+      winners.set(key, { highlight, specificity, index })
+    }
+  })
+  return [...winners.values()].map((w) => w.highlight)
+}
+
+/**
+ * Not a real `TextareaAction` — deliberately absent from the native
+ * `buildActionHandlers()` map (verified against the installed @opentui/core:
+ * `handleKeyPress` looks up `this._actionHandlers.get(action)`, finds nothing,
+ * and returns without side effects). Used below to fully disable the native
+ * word-forward/backward bindings for Option/Ctrl+Left/Right, whose
+ * `getNextWordBoundary`/`getPrevWordBoundary` land one character past the
+ * true word boundary (see `nextWordBoundary`/`prevWordBoundary`, which
+ * replace them).
+ */
+const DISABLE_NATIVE_ACTION = "vsx-disabled-noop" as TextareaAction
+
+/**
  * The textarea's built-in undo/redo default to Ctrl+- / Ctrl+. (and super+z on
  * mac); add the familiar Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z. Merged over the
  * upstream defaults, so all built-in selection/word-nav bindings still apply.
@@ -87,6 +315,7 @@ const EXTRA_KEY_BINDINGS: {
   name: string
   ctrl?: boolean
   shift?: boolean
+  meta?: boolean
   action: TextareaAction
 }[] = [
   { name: "z", ctrl: true, action: "undo" },
@@ -106,6 +335,36 @@ const EXTRA_KEY_BINDINGS: {
   { name: "e", ctrl: true, action: "visual-line-end" },
   { name: "a", ctrl: true, shift: true, action: "select-visual-line-home" },
   { name: "e", ctrl: true, shift: true, action: "select-visual-line-end" },
+  // Disable the native meta+d/meta+backspace word-delete bindings (they share
+  // getNextWordBoundary/getPrevWordBoundary with the word-nav actions above, so
+  // the same off-by-one/multi-space bugs apply) — see the dedicated useKeyboard
+  // handler below that replaces them with nextWordBoundary/prevWordBoundary.
+  // ctrl+w and ctrl+backspace natively bind the same delete-word-backward action
+  // and are equally buggy, but are deliberately left untouched: this task only
+  // covers the Option+Backspace / Option+D convention.
+  { name: "d", meta: true, action: DISABLE_NATIVE_ACTION },
+  { name: "backspace", meta: true, action: DISABLE_NATIVE_ACTION },
+  // Disable the native word-forward/backward bindings for Option/Ctrl+Left/Right
+  // (plain move and shift-select) — see DISABLE_NATIVE_ACTION and the dedicated
+  // useKeyboard handler below that replaces them with correct word-motion.
+  { name: "right", meta: true, action: DISABLE_NATIVE_ACTION },
+  { name: "left", meta: true, action: DISABLE_NATIVE_ACTION },
+  { name: "right", ctrl: true, action: DISABLE_NATIVE_ACTION },
+  { name: "left", ctrl: true, action: DISABLE_NATIVE_ACTION },
+  { name: "right", meta: true, shift: true, action: DISABLE_NATIVE_ACTION },
+  { name: "left", meta: true, shift: true, action: DISABLE_NATIVE_ACTION },
+  { name: "right", ctrl: true, shift: true, action: DISABLE_NATIVE_ACTION },
+  { name: "left", ctrl: true, shift: true, action: DISABLE_NATIVE_ACTION },
+  // Option-as-Meta terminals (Terminal.app default, iTerm2 "Esc+", Alacritty/
+  // Ghostty option-as-alt) send ESC b / ESC f for Option+Left/Right instead of
+  // CSI `ESC[1;3D` — the parser turns those into {name:"b"/"f", meta:true},
+  // which OpenTUI's own defaults bind to the SAME buggy native word-forward/
+  // backward as meta+left/right. Disable them too so the word-nav handler below
+  // (which now also recognizes meta+b/f) is what fires there.
+  { name: "b", meta: true, action: DISABLE_NATIVE_ACTION },
+  { name: "f", meta: true, action: DISABLE_NATIVE_ACTION },
+  { name: "b", meta: true, shift: true, action: DISABLE_NATIVE_ACTION },
+  { name: "f", meta: true, shift: true, action: DISABLE_NATIVE_ACTION },
 ]
 
 /**
@@ -151,6 +410,58 @@ function wordRangeAt(line: string, col: number): { start: number; end: number } 
   while (start > 0 && charClass(line[start - 1]) === cls) start--
   while (end < line.length && charClass(line[end]) === cls) end++
   return { start, end }
+}
+
+/**
+ * The position one step past the end of the next word/punctuation run,
+ * skipping any whitespace immediately ahead first — VSCode's Option+Right /
+ * Ctrl+Right convention (`getNextWordBoundary` on the native `EditBuffer`
+ * does NOT implement this correctly: verified it only advances one character
+ * past the first word/whitespace transition rather than skipping the whole
+ * whitespace run, e.g. landing mid-gap on "hello    world" instead of at
+ * "world"'s start — see the word-nav useKeyboard handler that uses this).
+ * Treats a line boundary as whitespace, so a jump at end-of-line crosses to
+ * the next line, mirroring VSCode.
+ */
+function nextWordBoundary(lines: string[], row: number, col: number): { row: number; col: number } {
+  let r = row
+  let c = col
+  while (true) {
+    const line = lines[r] ?? ""
+    if (c >= line.length) {
+      if (r + 1 >= lines.length) return { row: r, col: line.length }
+      r++
+      c = 0
+      continue
+    }
+    if (charClass(line[c]) !== "space") break
+    c++
+  }
+  const line = lines[r] ?? ""
+  const cls = charClass(line[c])
+  while (c < line.length && charClass(line[c]) === cls) c++
+  return { row: r, col: c }
+}
+
+/** The mirror image of {@link nextWordBoundary}, for Option+Left / Ctrl+Left. */
+function prevWordBoundary(lines: string[], row: number, col: number): { row: number; col: number } {
+  let r = row
+  let c = col
+  while (true) {
+    if (c <= 0) {
+      if (r <= 0) return { row: 0, col: 0 }
+      r--
+      c = (lines[r] ?? "").length
+      continue
+    }
+    const line = lines[r] ?? ""
+    if (charClass(line[c - 1]) !== "space") break
+    c--
+  }
+  const line = lines[r] ?? ""
+  const cls = charClass(line[c - 1])
+  while (c > 0 && charClass(line[c - 1]) === cls) c--
+  return { row: r, col: c }
 }
 
 type LoadState =
@@ -309,7 +620,7 @@ type EditorTextareaProps = {
 function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChange }: EditorTextareaProps) {
   const renderer = useRenderer()
   const { isOverlayOpen } = useOverlay()
-  const taRef = useRef<TextareaRenderable | null>(null)
+  const taRef = useRef<EditorTextareaRenderable | null>(null)
   const vScrollRef = useRef<ScrollBarRenderable | null>(null)
   const hScrollRef = useRef<ScrollBarRenderable | null>(null)
   const docRef = useRef(doc)
@@ -357,10 +668,26 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
           if (!editBuffer) return
           const syntaxStyle = getSharedSyntaxStyle()
           editBuffer.removeHighlightsByRef(HIGHLIGHT_REF)
-          for (const [start, end, scopeName] of result.highlights ?? []) {
+          // highlightOnce's spans are JS string (UTF-16) offsets; the highlight API
+          // wants display-width columns excluding newlines — convert per span.
+          const toNative = createNativeOffsetConverter(text)
+          // TreeSitterClient.highlightOnce can emit multiple overlapping captures
+          // for the exact same range (predicate-gated nvim-treesitter captures
+          // leak through the worker unfiltered — e.g. an identifier can get
+          // "variable", "type", "constant", AND "function" all spanning the same
+          // [start, end)). Deduping to one winner per range up front means only
+          // ONE addHighlightByCharRange call is ever made per range, so the
+          // native buffer's undefined tie-break for equal-priority overlapping
+          // spans never comes into play.
+          for (const [start, end, scopeName] of dedupeHighlightsByRange(result.highlights ?? [])) {
             const styleId = resolveStyleId(syntaxStyle, scopeName)
             if (styleId === null) continue
-            editBuffer.addHighlightByCharRange({ start, end, styleId, hlRef: HIGHLIGHT_REF })
+            editBuffer.addHighlightByCharRange({
+              start: toNative(start),
+              end: toNative(end),
+              styleId,
+              hlRef: HIGHLIGHT_REF,
+            })
           }
         })
         .catch(() => {
@@ -413,6 +740,20 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
    */
   const lastCaretRef = useRef<{ row: number; col: number } | null>(null)
   const lastSelectionRef = useRef<{ start: number; end: number } | null>(null)
+
+  /**
+   * The offset the LAST Option/Ctrl+Shift+Left/Right word-nav press set as the
+   * moving (focus) end of the selection. `ta.setSelection()` does not move the
+   * native caret `editorView.getCursor()` reads, so a chained press can't rely
+   * on that to find where the previous press left off — this ref is the only
+   * record of it. Only trusted if it still matches one end of the LIVE
+   * selection (guards against a stale value from an unrelated mouse/click
+   * selection change in between); otherwise the next press starts fresh from
+   * the caret. Stored as the raw (possibly leftward) focus offset even though
+   * the live selection is always written in sorted (min, max) order — the
+   * match above is against whichever end it lands on, so sort order is moot.
+   */
+  const wordNavFocusRef = useRef<number | null>(null)
 
   // Status-bar hookup: report the 1-based line/column on every content- or
   // cursor-change. `editorView.getCursor()` is 0-based logical row/col. Always
@@ -504,25 +845,37 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
     const ta = taRef.current
     if (!ta) return
     switch (key.name) {
-      case "c":
+      case "c": {
         // Prefer the focused buffer's own selection; otherwise fall back to the
         // last renderer-level selection (a drag over a diff/preview/panel that
         // never lands in an edit buffer). Copy-on-select usually already wrote
         // that text — this re-copy is harmless and idempotent.
-        if (ta.hasSelection()) {
-          void clipboard.write(ta.getSelectedText(), renderer)
+        //
+        // hasSelection() alone is NOT a reliable "there's text to copy" check: a
+        // reversed offset range (start > end — can come from anywhere a
+        // setSelection call isn't sorted) is stored verbatim, paints nothing,
+        // and getSelectedText() returns "", yet hasSelection() still reports
+        // true. Reading getSelectedText() up front and gating on non-empty text
+        // means that pathological state falls through to the renderer-selection
+        // fallback instead of clobbering the clipboard with "".
+        const selectedText = ta.hasSelection() ? ta.getSelectedText() : ""
+        if (selectedText !== "") {
+          void clipboard.write(selectedText, renderer)
         } else {
           const rendererSelection = getLastRendererSelection()
           if (rendererSelection) void clipboard.write(rendererSelection, renderer)
         }
         break
-      case "x":
-        if (ta.hasSelection()) {
-          void clipboard.write(ta.getSelectedText(), renderer)
+      }
+      case "x": {
+        const selectedText = ta.hasSelection() ? ta.getSelectedText() : ""
+        if (selectedText !== "") {
+          void clipboard.write(selectedText, renderer)
           ta.deleteSelection()
           syncFromBuffer()
         }
         break
+      }
       case "v":
         void pasteFromClipboard()
         break
@@ -595,6 +948,162 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
     reportCursorRef.current()
   })
 
+  // Option/Ctrl+Left/Right word navigation (plain move and Shift-select),
+  // replacing the native word-forward/backward actions disabled above via
+  // DISABLE_NATIVE_ACTION.
+  //
+  // Option-as-Meta terminals send ESC b / ESC f for Option+Left/Right, which
+  // parse to {name:"b"/"f", meta:true} rather than {name:"left"/"right"} — so
+  // b/f are accepted here as direction aliases, but ONLY when key.meta is set
+  // (ctrl+b / ctrl+f must NOT trigger word-nav; they're unrelated bindings).
+  // Deliberately unsupported (explicit product decision, not a bug to fix): a
+  // SHIFTED Option+Left/Right on these terminals sends `ESC B` / `ESC F`, which
+  // this parser turns into {name:"left"/"right", meta:true, shift:false,
+  // option:false} — the shift flag is lost entirely, so shift+option+arrow acts
+  // as a plain (non-selecting) word move there. Terminals wanting shift-select
+  // word-nav need CSI/kitty keyboard encoding enabled.
+  useKeyboard((key) => {
+    if (isOverlayOpen) return
+    if (!focusedRef.current) return
+    const isRight = key.name === "right" || (key.meta && key.name === "f")
+    const isLeft = key.name === "left" || (key.meta && key.name === "b")
+    if (!isRight && !isLeft) return
+    if (!key.meta && !key.ctrl) return
+    const ta = taRef.current
+    if (!ta) return
+
+    const lines = ta.plainText.split("\n")
+
+    if (key.shift) {
+      const selection = ta.getSelection()
+      const hasLiveSelection = selection !== null && selection.end > selection.start
+      const remembered = wordNavFocusRef.current
+      // Continue a chained press only if the live selection still has our last
+      // focus offset as one of its ends; otherwise (first press of a new
+      // selection, or the selection moved via a click/drag in between) start
+      // fresh from the caret.
+      const continuingChain =
+        hasLiveSelection && remembered !== null && (remembered === selection!.start || remembered === selection!.end)
+      const cursor = ta.editorView.getCursor()
+      const focusPos = continuingChain ? ta.editBuffer.offsetToPosition(remembered!) : cursor
+      if (!focusPos) return
+      const anchorOffset = continuingChain
+        ? remembered === selection!.start
+          ? selection!.end
+          : selection!.start
+        : ta.editBuffer.positionToOffset(cursor.row, cursor.col)
+      const target = isRight
+        ? nextWordBoundary(lines, focusPos.row, focusPos.col)
+        : prevWordBoundary(lines, focusPos.row, focusPos.col)
+      const focusOffset = ta.editBuffer.positionToOffset(target.row, target.col)
+      // setSelection does NOT normalize a reversed range (verified against the
+      // native buffer): start > end paints nothing and getSelectedText() returns
+      // "", yet hasSelection() still reports true — an invisible empty selection.
+      // Selecting leftward puts focusOffset < anchorOffset, so sort explicitly;
+      // wordNavFocusRef still stores the raw (unsorted) focus, since the chained-
+      // press check above only cares which live-selection END it matches.
+      ta.setSelection(Math.min(anchorOffset, focusOffset), Math.max(anchorOffset, focusOffset))
+      wordNavFocusRef.current = focusOffset
+    } else {
+      const cursor = ta.editorView.getCursor()
+      const target = isRight
+        ? nextWordBoundary(lines, cursor.row, cursor.col)
+        : prevWordBoundary(lines, cursor.row, cursor.col)
+      ta.editorView.resetSelection()
+      ta.setCursor(target.row, target.col)
+      wordNavFocusRef.current = null
+    }
+    reportCursorRef.current()
+  })
+
+  // Option+Backspace / Option+D word-delete (VSCode convention), replacing the
+  // native meta+backspace/meta+d delete-word-backward/forward actions disabled
+  // above via DISABLE_NATIVE_ACTION — those share the same buggy boundary
+  // functions as the native word-nav actions the handler above replaces.
+  useKeyboard((key) => {
+    if (isOverlayOpen) return
+    if (!focusedRef.current) return
+    if (!key.meta) return
+    if (key.name !== "backspace" && key.name !== "d") return
+    const ta = taRef.current
+    if (!ta) return
+
+    // A non-empty selection is already active: VSCode deletes just that,
+    // ignoring word boundaries entirely.
+    if (ta.hasSelection() && ta.getSelectedText() !== "") {
+      ta.deleteSelection()
+      syncFromBuffer()
+      reportCursorRef.current()
+      return
+    }
+
+    const lines = ta.plainText.split("\n")
+    const cursor = ta.editorView.getCursor()
+    const cursorOffset = ta.editBuffer.positionToOffset(cursor.row, cursor.col)
+    const boundary =
+      key.name === "backspace"
+        ? prevWordBoundary(lines, cursor.row, cursor.col)
+        : nextWordBoundary(lines, cursor.row, cursor.col)
+    const boundaryOffset = ta.editBuffer.positionToOffset(boundary.row, boundary.col)
+    // There's no TextareaAction for an arbitrary-range delete (same gap the
+    // Ctrl+X handler works around above): select the [cursor, boundary) span,
+    // then deleteSelection(). Same reversed-range hazard as every other
+    // setSelection call in this file (backward delete puts boundaryOffset <
+    // cursorOffset) — sort explicitly before handing it to setSelection.
+    ta.setSelection(Math.min(cursorOffset, boundaryOffset), Math.max(cursorOffset, boundaryOffset))
+    ta.deleteSelection()
+    syncFromBuffer()
+    reportCursorRef.current()
+  })
+
+  /**
+   * A plain nav key (no shift/ctrl/meta/super/option) with an active selection
+   * collapses the caret to the selection's edge — VSCode convention — instead
+   * of moving relative to wherever the native caret happens to sit.
+   *
+   * OpenTUI has TWO selection stores. Native shift+arrow / mouse-drag
+   * selections live in the renderer coordinator's `currentSelection`, and
+   * native plain-move handlers clear it via `_ctx.clearSelection()`. But
+   * `ta.setSelection(start, end)` — the offset API used everywhere else in
+   * this file (word-nav shift-select, clicks, find-widget reveal) — never
+   * populates that store, so those selections survive a plain arrow forever;
+   * the highlight just stays painted. `hasSelection()` also lies true for an
+   * empty inverted range (see the clipboard-guard comment above), so gate on
+   * non-empty `getSelectedText()` too.
+   */
+  useKeyboard((key) => {
+    if (isOverlayOpen) return
+    if (!focusedRef.current) return
+    if (key.shift || key.ctrl || key.meta || key.super || key.option) return
+    if (!CURSOR_NAV_KEYS.has(key.name)) return
+    const ta = taRef.current
+    if (!ta) return
+    if (!ta.hasSelection() || ta.getSelectedText() === "") return
+
+    const selection = ta.getSelection()
+    if (!selection) return
+    const startPos = ta.editBuffer.offsetToPosition(selection.start)
+    const endPos = ta.editBuffer.offsetToPosition(selection.end)
+    if (!startPos || !endPos) return
+    const isBackward = key.name === "left" || key.name === "up" || key.name === "home" || key.name === "pageup"
+    const edge = isBackward ? startPos : endPos
+
+    // ta.clearSelection() is the only method that resets BOTH the offset slot
+    // (editorView.resetSelection) and the local/native slot (resetLocalSelection)
+    // AND clears the renderer coordinator's currentSelection (via its own
+    // `_ctx.clearSelection()` call) — the stale anchor a later native
+    // shift+arrow would otherwise extend from if only the offset slot were reset.
+    ta.clearSelection()
+    ta.setCursor(edge.row, edge.col)
+    // Left/Right: the collapse IS the whole move (VSCode convention), so consume
+    // the key — otherwise the native handler would move one more step past the
+    // edge we just landed on. Up/Down/Home/End/PageUp/PageDown: let native
+    // motion continue from the now-collapsed caret (e.g. Down still moves a
+    // line, it doesn't just collapse in place).
+    if (key.name === "left" || key.name === "right") key.preventDefault()
+    reportCursorRef.current()
+  })
+
   // Belt-and-suspenders cursor reporting for keys the native onCursorChange path
   // misses (vertical/page/home-end navigation, and undo/redo which reposition the
   // caret). queueMicrotask defers past the synchronous key dispatch so the
@@ -647,10 +1156,13 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
         eb.removeHighlightsByRef(FIND_MATCH_REF)
         eb.removeHighlightsByRef(FIND_CURRENT_REF)
         findMatchesRef.current = matches
+        // findInFile's matches are JS string offsets into ta.plainText, same space
+        // as tree-sitter's spans — same conversion applies before the highlight API.
+        const toNative = createNativeOffsetConverter(ta.plainText)
         for (const m of matches) {
           eb.addHighlightByCharRange({
-            start: m.start,
-            end: m.end,
+            start: toNative(m.start),
+            end: toNative(m.end),
             styleId: match,
             hlRef: FIND_MATCH_REF,
             priority: FIND_MATCH_PRIORITY,
@@ -659,8 +1171,8 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
         const cur = matches[currentIdx]
         if (cur) {
           eb.addHighlightByCharRange({
-            start: cur.start,
-            end: cur.end,
+            start: toNative(cur.start),
+            end: toNative(cur.end),
             styleId: current,
             hlRef: FIND_CURRENT_REF,
             priority: FIND_CURRENT_PRIORITY,
@@ -739,11 +1251,33 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
   const handleMouseDown = useCallback((event: CoreMouseEvent) => {
     const ta = taRef.current
     if (!ta) return
-    // The renderer's selection machinery services this same mousedown BEFORE this
-    // handler and has already moved the buffer cursor to the clicked cell via native
-    // (wrap-aware) hit-testing. Read that position instead of re-deriving
-    // screen→content coordinates, which would be wrong under wrapMode "word".
-    const { row, col } = ta.editBuffer.getCursorPosition()
+    const viewport = ta.editorView.getViewport()
+    // A click BELOW the last content line is a complete no-op in the native
+    // hit-testing (the caret doesn't move and getCursorPosition() stays STALE), so
+    // detect it and derive the target ourselves — VSCode drops the caret on the last
+    // line at the clicked column. This is common now that Task 1 lets blank space sit
+    // below the content. The clicked VIRTUAL row is `event.y - ta.y + offsetY` (same
+    // screen→content math handleMouseDrag uses); at/beyond the whole-buffer virtual
+    // total it's a below-content click.
+    let row: number
+    let col: number
+    const clickedVirtualRow = event.y - ta.y + viewport.offsetY
+    if (clickedVirtualRow >= ta.editorView.getTotalVirtualLineCount()) {
+      row = Math.max(0, ta.lineCount - 1)
+      const lineLen = (ta.plainText.split("\n")[row] ?? "").length
+      // ta.x already excludes the gutter; add the horizontal scroll only under wrap
+      // "none" (the sole mode with offsetX). Under word wrap the last logical line may
+      // span several visual rows — clamping the raw click x to the line length keeps
+      // this a simple, VSCode-close first pass rather than resolving the exact visual row.
+      const clickedCol = event.x - ta.x + (ta.wrapMode === "none" ? viewport.offsetX : 0)
+      col = Math.max(0, Math.min(clickedCol, lineLen))
+    } else {
+      // In-content click: the renderer's selection machinery services this same
+      // mousedown BEFORE this handler and has already moved the buffer cursor to the
+      // clicked cell via native (wrap-aware) hit-testing. Read that position instead
+      // of re-deriving screen→content coordinates, which would be wrong under wrap "word".
+      ;({ row, col } = ta.editBuffer.getCursorPosition())
+    }
 
     // Shift+click extends the selection from the pre-click caret (or the far end
     // of an existing selection) to the clicked cell — VSCode semantics. Never
@@ -884,6 +1418,21 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
     multiClickGesture.current = null
   }, [])
 
+  // Wheel routing (OpenTUI dispatches scroll hit-test-first and only bubbles to
+  // PARENTS, and only the textarea has a scroll handler — so a wheel over the gutter
+  // or either scrollbar does nothing on its own). Forward those to the textarea's
+  // overscroll-aware applyScroll. The textarea's own handleScroll calls
+  // stopPropagation, so a wheel directly over the text never reaches the gutter
+  // forwarder below (no double-scroll). Shift→horizontal is handled inside applyScroll.
+  const forwardScroll = useCallback((event: CoreMouseEvent) => {
+    taRef.current?.applyScroll(event)
+  }, [])
+  // The horizontal bar maps a plain vertical wheel to horizontal scroll — where users
+  // most expect the wheel to move the content sideways.
+  const forwardScrollHorizontal = useCallback((event: CoreMouseEvent) => {
+    taRef.current?.applyScroll(event, true)
+  }, [])
+
   // Apply the workbench word-wrap setting to the live buffer. `wrapMode` is a
   // runtime setter on the edit buffer (drives editorView.setWrapMode and marks
   // layout dirty, no remount), so a toggle re-lays-out the current text in place.
@@ -931,7 +1480,14 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
     }
 
     if (vBar) {
-      const total = view.getTotalVirtualLineCount()
+      // Overscroll allowance (VSCode scrollBeyondLastLine): an overflowing buffer now
+      // scrolls until the last line sits at the TOP row (max offsetY = total - 1).
+      // ScrollBar clamps scrollPosition to `scrollSize - viewportSize`, so pad
+      // scrollSize by `height - 1` for the thumb to reach that max instead of the old
+      // bottom-pinned `total - height`. Only when the content overflows — a buffer
+      // that fits keeps scrollSize == total so the bar still auto-hides.
+      const totalLines = view.getTotalVirtualLineCount()
+      const total = totalLines + (totalLines > vp.height ? vp.height - 1 : 0)
       if (vBar.scrollSize !== total) vBar.scrollSize = total
       if (vBar.viewportSize !== vp.height) vBar.viewportSize = vp.height
       if (vBar.scrollPosition !== vp.offsetY) vBar.scrollPosition = vp.offsetY
@@ -975,8 +1531,14 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
       {/* row: [ gutter+textarea column (+ horizontal bar), vertical bar ] */}
       <box flexDirection="row" flexGrow={1}>
         <box flexDirection="column" flexGrow={1}>
-          <line-number flexGrow={1} minWidth={gutterMinWidth} fg={theme.dimForeground} bg={theme.background}>
-            <textarea
+          <line-number
+            flexGrow={1}
+            minWidth={gutterMinWidth}
+            fg={theme.dimForeground}
+            bg={theme.background}
+            onMouseScroll={forwardScroll}
+          >
+            <editor-textarea-input
               id="editor-textarea"
               ref={taRef}
               focused={focused}
@@ -990,17 +1552,19 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
               flexGrow={1}
               textColor={theme.foreground}
               backgroundColor={theme.background}
+              cursorStyle={CURSOR_STYLE}
             />
           </line-number>
           {/* Horizontal wheel-scroll only works with wrap off, so the bar is
               meaningful (and shown) only then. */}
           {wordWrap === "none" && (
-            <scrollbar
+            <thin-hscrollbar
               id="editor-hscrollbar"
               ref={hScrollRef}
               orientation="horizontal"
               height={1}
               flexShrink={0}
+              onMouseScroll={forwardScrollHorizontal}
               trackOptions={{
                 backgroundColor: theme.scrollbarTrack,
                 foregroundColor: theme.scrollbarThumb,
@@ -1014,6 +1578,7 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
           orientation="vertical"
           width={1}
           flexShrink={0}
+          onMouseScroll={forwardScroll}
           trackOptions={{
             width: 1,
             backgroundColor: theme.scrollbarTrack,

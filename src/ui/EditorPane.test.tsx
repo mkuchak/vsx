@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   getTreeSitterClient,
+  RGBA,
   type ScrollBarRenderable,
   type SimpleHighlight,
   type TextareaRenderable,
@@ -13,10 +14,11 @@ import { testRender } from "@opentui/react/test-utils"
 import { documentRegistry } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
+import { getSharedSyntaxStyle, theme } from "../theme"
 import { CommandsProvider, useCommands } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
 import { handleRendererSelection } from "../workbench/rendererSelection"
-import { getEditorControls } from "../workbench/editorControls"
+import { FIND_CURRENT_REF, FIND_MATCH_REF, getEditorControls } from "../workbench/editorControls"
 import type { CommandRegistry } from "../services/commands"
 import { EditorPane } from "./EditorPane"
 
@@ -588,6 +590,48 @@ test("resolves the markup and extended Dark+ scopes added for the new grammars",
   expect(spy.added.every((h) => typeof h.styleId === "number")).toBe(true)
 })
 
+test("dedupes overlapping same-range captures, keeping only the last-emitted scope", async () => {
+  // highlightOnce can hand back multiple captures spanning the EXACT same range
+  // (predicate-gated nvim-treesitter captures leaking through unfiltered). All
+  // three scopes here are zero-dot (equal specificity), so per the <code>-path
+  // ordering rule (most specific wins, ties broken by later emission index) the
+  // LAST one — "function" — must be the only span pushed for [0, 5).
+  const highlights: SimpleHighlight[] = [
+    [0, 5, "variable"],
+    [0, 5, "type"],
+    [0, 5, "function"],
+  ]
+  mockHighlightOnce(async () => ({ highlights }))
+
+  const file = join(dir, "dup.ts")
+  await writeFile(file, "hello\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("hello")
+
+  const syntaxStyle = getSharedSyntaxStyle()
+  const functionStyleId = syntaxStyle.getStyleId("function")!
+  expect(functionStyleId).not.toBeNull()
+
+  const spy = spyOnHighlights()
+
+  // Trigger a fresh debounced pass and let it settle.
+  await testSetup.mockInput.typeText("x")
+  await testSetup.flush()
+  await Bun.sleep(300)
+  await testSetup.flush()
+
+  // Exactly ONE span pushed for the duplicated [0, 5) range, and it resolves to
+  // "function" (the last-emitted of the three equally-specific captures) — not
+  // "variable" or "type", and not three separate (undefined-tie-break) spans.
+  expect(spy.added.length).toBe(1)
+  expect(spy.added[0]!.start).toBe(0)
+  expect(spy.added[0]!.end).toBe(5)
+  expect(spy.added[0]!.styleId).toBe(functionStyleId)
+  expect(spy.added[0]!.hlRef).toBe(1)
+})
+
 test("a rapid burst of edits settles on the FINAL text, ignoring stale results", async () => {
   // Hand out manually-resolved promises so we can force out-of-order resolution:
   // an earlier (stale) request resolving AFTER a newer one must not win.
@@ -669,6 +713,105 @@ test("a rejected highlight parse never crashes the editor and typing still works
 
   expect(doc.getText()).toContain("Q")
   expect(testSetup.captureCharFrame()).toContain("const ok")
+})
+
+/**
+ * REGRESSION (native highlight offset drift, task #102): the tests above stub
+ * out `addHighlightByCharRange` as a pure recorder via `spyOnHighlights()`, and
+ * every fixture they use is single-line — so the JS-offset-vs-native-column gap
+ * (native columns exclude newlines, flat across the whole document) is zero by
+ * construction and these tests would have passed even with the pre-fix code
+ * (raw JS offsets pushed straight into the highlight API). This test does NOT
+ * stub the mutator: it lets a genuinely multi-line highlight span reach the
+ * REAL native EditBuffer, then reads back `getLineHighlights` per line — the
+ * only place the drift is observable. Before the fix, the block comment's span
+ * (which should stop at the end of line 1) bled one extra character onto line 2.
+ */
+test("a highlight spanning multiple lines lands on the correct native columns of EACH line", async () => {
+  // "/*x\ny*/" is the block comment: JS offsets [0, 7). Line 0 is "/*x" (native
+  // width 3), line 1 is "y*/" (native width 3), line 2 is "const a = 1" and must
+  // receive NO part of the comment highlight.
+  const text = "/*x\ny*/\nconst a = 1\n"
+  expect(text.slice(0, 7)).toBe("/*x\ny*/")
+  mockHighlightOnce(async () => ({ highlights: [[0, 7, "comment"]] }))
+
+  const file = join(dir, "multiline-hl.ts")
+  await writeFile(file, text)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("const a")
+
+  // Trigger a fresh debounced highlight pass against the REAL buffer (no spy).
+  // Type at the END of the last line so the edit can't shift any offset the
+  // comment span (JS [0, 7), lines 0-1 only) depends on.
+  const ta = getTextarea()
+  ta.setCursor(2, "const a = 1".length)
+  await testSetup.flush()
+  await testSetup.mockInput.typeText(" ")
+  await testSetup.flush()
+  await Bun.sleep(300)
+  await testSetup.flush()
+
+  const eb = getEditBuffer()
+  const onLine = (row: number) => eb.getLineHighlights(row).filter((h) => h.hlRef === 1) // HIGHLIGHT_REF
+
+  // Line 0 "/*x": the whole line is commented, native columns [0, 3).
+  const line0 = onLine(0)
+  expect(line0.length).toBe(1)
+  expect(line0[0]).toMatchObject({ start: 0, end: 3 })
+
+  // Line 1 "y*/": the whole line is commented too, native columns [0, 3) — NOT
+  // shifted right by the one preceding newline.
+  const line1 = onLine(1)
+  expect(line1.length).toBe(1)
+  expect(line1[0]).toMatchObject({ start: 0, end: 3 })
+
+  // Line 2 "const a = 1": the comment ends at the end of line 1, so this line
+  // must carry NO comment highlight. Pre-fix, the raw JS end offset (7) spilled
+  // one native column onto this line's "c" (native [0, 1)) because it never
+  // subtracted the newline that had already passed.
+  expect(onLine(2)).toEqual([])
+})
+
+/**
+ * REGRESSION (native highlight offset drift, task #102): same class of bug as
+ * above but through the find-widget's `setFindMatches` control — before the
+ * fix, a find match on line 2+ drifted right by one native column per
+ * preceding line, same as syntax highlights.
+ */
+test("a find match on a line past the first lands on the correct native columns (no rightward drift)", async () => {
+  const text = "one\ntwo\nthree needle four\n"
+  const jsStart = text.indexOf("needle")
+  const jsEnd = jsStart + "needle".length
+  expect([jsStart, jsEnd]).toEqual([14, 20])
+
+  const file = join(dir, "find-drift.ts")
+  await writeFile(file, text)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("three needle four")
+
+  const groupId = workbenchStore.getState().activeGroupId
+  getEditorControls(groupId)!.setFindMatches([{ start: jsStart, end: jsEnd }], 0)
+  await testSetup.flush()
+
+  const eb = getEditBuffer()
+  // "needle" sits on line 2 (0-based), after two preceding newlines that must
+  // be subtracted: correct native columns are [6, 12) ("three " is 6 wide).
+  // Pre-fix (raw JS offsets), this would land at [8, 14) — drifted right by 2.
+  const matchOnLine2 = eb.getLineHighlights(2).filter((h) => h.hlRef === FIND_MATCH_REF)
+  expect(matchOnLine2.length).toBe(1)
+  expect(matchOnLine2[0]).toMatchObject({ start: 6, end: 12 })
+
+  const currentOnLine2 = eb.getLineHighlights(2).filter((h) => h.hlRef === FIND_CURRENT_REF)
+  expect(currentOnLine2.length).toBe(1)
+  expect(currentOnLine2[0]).toMatchObject({ start: 6, end: 12 })
+
+  // Nothing bled onto the earlier lines.
+  expect(eb.getLineHighlights(0).filter((h) => h.hlRef === FIND_MATCH_REF)).toEqual([])
+  expect(eb.getLineHighlights(1).filter((h) => h.hlRef === FIND_MATCH_REF)).toEqual([])
 })
 
 /** HOME, then N shift-rights: selects the first N chars of the first line. */
@@ -770,6 +913,74 @@ test("Ctrl+X copies the selection and removes it from the document", async () =>
   expect(writeSpy).toHaveBeenCalledTimes(1)
   expect(writeSpy.mock.calls[0][0]).toBe("abc")
   expect(doc.getText()).toBe("def\n")
+})
+
+/**
+ * REGRESSION: OpenTUI's offset `setSelection(start, end)` does no normalization
+ * — a reversed range (start > end) is stored verbatim, paints nothing, and
+ * `getSelectedText()` returns "", yet `hasSelection()` still reports true. The
+ * clipboard handler used to gate on `hasSelection()` alone, so this state made
+ * Ctrl+C clobber the clipboard with "" and made Ctrl+X a silent no-op cut.
+ */
+test("Ctrl+C with a reversed (pathological) selection does not clobber the clipboard", async () => {
+  const writeSpy = spyClipboardWrite()
+  const file = join(dir, "reversed-copy.ts")
+  await writeFile(file, "abcdef\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("abcdef")
+
+  const ta = getTextarea()
+  ta.setSelection(10, 4) // reversed: hasSelection() true, getSelectedText() ""
+  expect(ta.hasSelection()).toBe(true)
+  expect(ta.getSelectedText()).toBe("")
+
+  testSetup.mockInput.pressKey("c", { ctrl: true })
+  await testSetup.flush()
+
+  expect(writeSpy).not.toHaveBeenCalled()
+})
+
+test("Ctrl+C with a reversed selection falls back to the cached renderer selection", async () => {
+  const writeSpy = spyClipboardWrite()
+  const file = join(dir, "reversed-fallback.ts")
+  await writeFile(file, "abcdef\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("abcdef")
+
+  handleRendererSelection({ getSelectedText: () => "from the diff pane" })
+  writeSpy.mockClear()
+
+  const ta = getTextarea()
+  ta.setSelection(10, 4) // reversed → empty text, same pathological state
+  testSetup.mockInput.pressKey("c", { ctrl: true })
+  await testSetup.flush()
+
+  expect(writeSpy).toHaveBeenCalledTimes(1)
+  expect(writeSpy.mock.calls[0][0]).toBe("from the diff pane")
+})
+
+test("Ctrl+X with a reversed selection is a no-op: no clipboard write, no deletion", async () => {
+  const writeSpy = spyClipboardWrite()
+  const file = join(dir, "reversed-cut.ts")
+  await writeFile(file, "abcdef\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("abcdef")
+
+  const doc = documentRegistry.get(file)!
+  const ta = getTextarea()
+  ta.setSelection(10, 4) // reversed: hasSelection() true, getSelectedText() ""
+
+  testSetup.mockInput.pressKey("x", { ctrl: true })
+  await testSetup.flush()
+
+  expect(writeSpy).not.toHaveBeenCalled()
+  expect(doc.getText()).toBe("abcdef\n")
 })
 
 test("Ctrl+V replaces the active selection with the clipboard text", async () => {
@@ -985,6 +1196,87 @@ test("click positions the caret in a split's non-focused pane", async () => {
   const ta2 = getPaneTextarea("pane-2")
   await clickCell(5, 1, 1, ta2) // inside "line two"
   expect(ta2.editorView.getCursor()).toEqual({ row: 1, col: 5 })
+})
+
+test("clicking below the content places the caret on the last line at the clicked column", async () => {
+  const file = join(dir, "below-col.ts")
+  // No trailing newline: the last line ("second line") carries text.
+  await writeFile(file, "hello world\nsecond line")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("second line")
+
+  // Click well below the two content rows, at a column within the last line's width.
+  await clickCell(3, 6)
+  const ta = getTextarea()
+  expect(ta.editorView.getCursor()).toEqual({ row: 1, col: 3 })
+})
+
+test("clicking below the content past the last line's width clamps the caret to end of line", async () => {
+  const file = join(dir, "below-end.ts")
+  await writeFile(file, "hello world\nsecond line") // last line length 11
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("second line")
+
+  // x=20 is past the last line's 11 columns → clamp to end of line.
+  await clickCell(20, 6)
+  const ta = getTextarea()
+  expect(ta.editorView.getCursor()).toEqual({ row: 1, col: 11 })
+})
+
+test("shift+clicking below the content extends the selection to the clamped last-line position", async () => {
+  const file = join(dir, "below-shift.ts")
+  await writeFile(file, "hello world\nsecond line")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("second line")
+
+  const ta = getTextarea()
+  // Caret upstream at (0, 2), then shift+click below content at column 6 of the last line.
+  await clickCell(2, 0)
+  await testSetup.mockMouse.click(ta.x + 6, ta.y + 6, 0, { modifiers: { shift: true } })
+  await testSetup.flush()
+
+  // Selection runs from the caret to (1, 6): "llo world\nsecond".
+  expect(ta.hasSelection()).toBe(true)
+  expect(ta.getSelectedText()).toBe("llo world\nsecond")
+})
+
+test("clicking below the content of a file ending in a newline lands on the empty last line without crashing", async () => {
+  const file = join(dir, "below-empty.ts")
+  await writeFile(file, "abc\n") // trailing newline → empty last line
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("abc")
+
+  await clickCell(5, 6)
+  const ta = getTextarea()
+  // Last (empty) line, column clamped to 0.
+  expect(ta.editorView.getCursor()).toEqual({ row: 1, col: 0 })
+})
+
+test("clicking below a wrapped last line lands on the last logical line, no out-of-range setCursor", async () => {
+  const file = join(dir, "below-wrap.ts")
+  // A 120-col last line wraps across several visual rows under the default word wrap.
+  await writeFile(file, `short\n${"x".repeat(120)}`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("short")
+
+  // Click below every visual row of the wrapped last line.
+  await clickCell(10, 10)
+  const ta = getTextarea()
+  const cursor = ta.editorView.getCursor()
+  // The last LOGICAL line (row 1); the simplified clamp maps the raw click x to a
+  // column within the 120-char line (no crash / no out-of-range).
+  expect(cursor.row).toBe(1)
+  expect(cursor.col).toBe(10)
 })
 
 /**
@@ -1685,6 +1977,333 @@ test("the horizontal scrollbar sizes to the document-wide width when the widest 
   expect(hbar!.scrollSize).toBeGreaterThan(hbar!.viewportSize)
 })
 
+/** Per-column foreground colors for a captured row (all glyphs here are width 1). */
+function rowForegrounds(line: { spans: { text: string; fg: RGBA }[] }): RGBA[] {
+  const out: RGBA[] = []
+  for (const span of line.spans) for (let i = 0; i < span.text.length; i++) out.push(span.fg)
+  return out
+}
+
+/** Per-column glyphs for a captured row. */
+function rowChars(line: { spans: { text: string }[] }): string[] {
+  const out: string[] = []
+  for (const span of line.spans) for (const ch of span.text) out.push(ch)
+  return out
+}
+
+function rgbEquals(a: RGBA, hex: string): boolean {
+  const [r, g, b] = a.toInts()
+  const [er, eg, eb] = RGBA.fromHex(hex).toInts()
+  return r === er && g === eg && b === eb
+}
+
+test("the horizontal scrollbar renders as thin bottom-half blocks, unlike the full-block vertical bar", async () => {
+  const file = join(dir, "thin-hbar.ts")
+  // Wide AND tall: both bars get a thumb (horizontal from the 120-col lines, vertical
+  // from the 60 rows).
+  const wide = "x".repeat(120)
+  await writeFile(file, `${Array.from({ length: 60 }, () => wide).join("\n")}\n`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render({ wordWrap: "none" })
+  await waitForText("xxx")
+
+  const deadline = Date.now() + 3000
+  let hbar = getScrollbar("editor-hscrollbar")
+  while (Date.now() < deadline && !(hbar && hbar.scrollSize === 120)) {
+    await testSetup.flush()
+    await Bun.sleep(30)
+    hbar = getScrollbar("editor-hscrollbar")
+  }
+  const vbar = getScrollbar("editor-vscrollbar")!
+  expect(hbar!.scrollSize).toBeGreaterThan(hbar!.viewportSize)
+
+  const frame = testSetup.captureSpans()
+
+  // --- horizontal bar row: every cell is the bottom-half block "▄", never "█" ---
+  const hChars = rowChars(frame.lines[hbar!.y]).slice(hbar!.x, hbar!.x + hbar!.width)
+  expect(hChars.length).toBeGreaterThan(0)
+  expect(hChars.every((ch) => ch === "▄")).toBe(true)
+  expect(hChars).not.toContain("█")
+
+  // Thumb cells carry the thumb color, track cells the track color — both as the
+  // half-block's foreground.
+  const hFg = rowForegrounds(frame.lines[hbar!.y]).slice(hbar!.x, hbar!.x + hbar!.width)
+  expect(hFg.some((fg) => rgbEquals(fg, theme.scrollbarThumb))).toBe(true)
+  expect(hFg.some((fg) => rgbEquals(fg, theme.scrollbarTrack))).toBe(true)
+
+  // --- vertical bar is untouched: its thumb is the full block "█" ---
+  const vColChars = frame.lines.map((line) => rowChars(line)[vbar.x]).filter(Boolean)
+  expect(vColChars).toContain("█")
+  expect(vColChars).not.toContain("▄")
+})
+
+test("scrolling horizontally moves the thin horizontal scrollbar's thumb", async () => {
+  const file = join(dir, "thin-hbar-move.ts")
+  const wide = "x".repeat(120)
+  await writeFile(file, `${Array.from({ length: 5 }, () => wide).join("\n")}\n`)
+  workbenchStore.openFile(file)
+
+  testSetup = await render({ wordWrap: "none" })
+  await waitForText("xxx")
+
+  const deadline = Date.now() + 3000
+  let hbar = getScrollbar("editor-hscrollbar")
+  while (Date.now() < deadline && !(hbar && hbar.scrollSize === 120)) {
+    await testSetup.flush()
+    await Bun.sleep(30)
+    hbar = getScrollbar("editor-hscrollbar")
+  }
+
+  const ta = getTextarea()
+  const thumbStart = () => {
+    const fg = rowForegrounds(testSetup.captureSpans().lines[hbar!.y])
+    return fg.findIndex((c) => rgbEquals(c, theme.scrollbarThumb))
+  }
+  const before = thumbStart()
+  expect(before).toBeGreaterThanOrEqual(0)
+
+  // Scroll the viewport right (moving the caret pulls the horizontal viewport with it);
+  // the per-frame sync repositions the thumb.
+  ta.setCursor(0, 110)
+  const moveDeadline = Date.now() + 3000
+  while (Date.now() < moveDeadline && thumbStart() <= before) {
+    await testSetup.flush()
+    await Bun.sleep(30)
+  }
+  expect(thumbStart()).toBeGreaterThan(before)
+})
+
+/** Renders a wrap-off editor over content both wider and taller than the viewport. */
+async function renderWideTall() {
+  const file = join(dir, "wheel-route.ts")
+  await writeFile(file, `${Array.from({ length: 40 }, () => "x".repeat(120)).join("\n")}\n`)
+  workbenchStore.openFile(file)
+  testSetup = await render({ wordWrap: "none" })
+  await waitForText("xxx")
+  // Let the per-frame sync size both bars from the document extent.
+  const deadline = Date.now() + 3000
+  let hbar = getScrollbar("editor-hscrollbar")
+  while (Date.now() < deadline && !(hbar && hbar.scrollSize === 120)) {
+    await testSetup.flush()
+    await Bun.sleep(30)
+    hbar = getScrollbar("editor-hscrollbar")
+  }
+  return getTextarea()
+}
+
+test("wheel routing: scrolling over the gutter scrolls the editor vertically", async () => {
+  const ta = await renderWideTall()
+  expect(ta.editorView.getViewport().offsetY).toBe(0)
+
+  // x within the gutter (columns before the textarea's own origin ta.x).
+  await wheel(1, ta.y + 3, "down", 3)
+  expect(ta.editorView.getViewport().offsetY).toBeGreaterThan(0)
+})
+
+test("wheel routing: scrolling over the vertical scrollbar scrolls the editor vertically", async () => {
+  const ta = await renderWideTall()
+  const vbar = getScrollbar("editor-vscrollbar")!
+  expect(ta.editorView.getViewport().offsetY).toBe(0)
+
+  await wheel(vbar.x, vbar.y + 3, "down", 3)
+  expect(ta.editorView.getViewport().offsetY).toBeGreaterThan(0)
+})
+
+test("wheel routing: scrolling over the horizontal scrollbar scrolls the editor horizontally", async () => {
+  const ta = await renderWideTall()
+  const hbar = getScrollbar("editor-hscrollbar")!
+  expect(ta.editorView.getViewport().offsetX).toBe(0)
+
+  // A plain vertical wheel over the horizontal bar maps to horizontal scroll.
+  await wheel(hbar.x + 10, hbar.y, "down", 8)
+  expect(ta.editorView.getViewport().offsetX).toBeGreaterThan(0)
+})
+
+test("wheel routing: scrolling directly over the text scrolls exactly one increment (no double-scroll)", async () => {
+  const ta = await renderWideTall()
+  expect(ta.editorView.getViewport().offsetY).toBe(0)
+
+  // ONE wheel tick over the textarea. The textarea handles it and stops propagation,
+  // so the gutter's forwarder never re-applies it — offsetY advances by a single tick.
+  await testSetup.mockMouse.scroll(ta.x + 5, ta.y + 3, "down")
+  await testSetup.flush()
+  expect(ta.editorView.getViewport().offsetY).toBe(1)
+})
+
+test("wheel routing: shift+wheel over the text scrolls horizontally", async () => {
+  const ta = await renderWideTall()
+  expect(ta.editorView.getViewport().offsetX).toBe(0)
+
+  for (let i = 0; i < 8; i++) {
+    await testSetup.mockMouse.scroll(ta.x + 5, ta.y + 3, "down", { modifiers: { shift: true } })
+    await testSetup.flush()
+  }
+  expect(ta.editorView.getViewport().offsetX).toBeGreaterThan(0)
+  // Vertical position is untouched — shift routed the wheel to the horizontal axis.
+  expect(ta.editorView.getViewport().offsetY).toBe(0)
+})
+
+/**
+ * Scroll the wheel `times` over the given absolute cell, flushing after each tick
+ * so the per-frame viewport sync runs between ticks.
+ */
+async function wheel(x: number, y: number, direction: "up" | "down", times: number) {
+  for (let i = 0; i < times; i++) {
+    await testSetup.mockMouse.scroll(x, y, direction)
+    await testSetup.flush()
+  }
+}
+
+/**
+ * Wheels down over the textarea until offsetY stops advancing (or a hard cap). The
+ * wheel drags the caret with the view (moveCursor=true), which parks it on the last
+ * line — so the stable max lands the last line one row below the literal top (its
+ * one line of caret context stays above it), not at row 0. That's the reachable
+ * overscroll extent via the wheel; blank rows still fill everything below the last line.
+ */
+async function wheelToBottom(ta: TextareaRenderable) {
+  let last = -1
+  for (let i = 0; i < 400 && ta.editorView.getViewport().offsetY !== last; i++) {
+    last = ta.editorView.getViewport().offsetY
+    await testSetup.mockMouse.scroll(ta.x + 5, ta.y + 3, "down")
+    await testSetup.flush()
+  }
+}
+
+/** Rows of the captured frame that still carry file content ("line N"). */
+function contentRows() {
+  return testSetup
+    .captureCharFrame()
+    .split("\n")
+    .filter((l: string) => l.includes("line "))
+}
+
+test("scroll-beyond-last-line: wheel-down past the old bottom-pin keeps scrolling, painting blank rows below the last line", async () => {
+  const file = join(dir, "overscroll-past.ts")
+  // 60 lines, NO trailing newline so the last line ("line 60") carries text.
+  await writeFile(file, Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n"))
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("line 1")
+
+  const ta = getTextarea()
+  const h = ta.editorView.getViewport().height
+  const total = ta.editorView.getTotalVirtualLineCount()
+  const stockMax = total - h // the old bottom-pinned clamp
+
+  await wheelToBottom(ta)
+
+  // The view scrolled strictly past the stock clamp — the last line is no longer
+  // pinned to the viewport bottom (that pinning is exactly what scroll-beyond-last-line
+  // removes).
+  expect(ta.editorView.getViewport().offsetY).toBeGreaterThan(stockMax)
+
+  // The last line is on screen and the mid-document lines have scrolled away; the
+  // rows below the last line are blank (only "line 60" and its single context line
+  // above it still carry content).
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("line 60")
+  expect(frame).not.toContain("line 30")
+  expect(contentRows().length).toBeLessThanOrEqual(3)
+})
+
+test("scroll-beyond-last-line: continued wheel-down parks the last line near the top with blanks below", async () => {
+  const file = join(dir, "overscroll-top.ts")
+  await writeFile(file, Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n"))
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("line 1")
+
+  const ta = getTextarea()
+  await wheelToBottom(ta)
+
+  // At the overscroll max the last line sits in the top rows of the textarea with the
+  // rest of the viewport blank below it.
+  const rows = testSetup.captureCharFrame().split("\n") as string[]
+  const lastLineRow = rows.findIndex((l) => l.includes("line 60"))
+  expect(lastLineRow).toBeGreaterThanOrEqual(0)
+  expect(lastLineRow).toBeLessThanOrEqual(1) // top of the textarea (row 0 or its 1 context row)
+  // Every row below the last line is blank of content.
+  expect(rows.slice(lastLineRow + 1).some((l) => l.includes("line "))).toBe(false)
+})
+
+test("scroll-beyond-last-line: wheel-up from an overscrolled view returns to the top normally", async () => {
+  const file = join(dir, "overscroll-up.ts")
+  await writeFile(file, Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n"))
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("line 1")
+
+  const ta = getTextarea()
+  await wheelToBottom(ta)
+  expect(ta.editorView.getViewport().offsetY).toBeGreaterThan(0)
+
+  // Wheel back up until it settles: the view returns to the top (offsetY 0),
+  // unaffected by having been in the overscroll region.
+  let last = -1
+  for (let i = 0; i < 200 && ta.editorView.getViewport().offsetY !== last; i++) {
+    last = ta.editorView.getViewport().offsetY
+    if (last === 0) break
+    await testSetup.mockMouse.scroll(ta.x + 5, ta.y + 3, "up")
+    await testSetup.flush()
+  }
+  expect(ta.editorView.getViewport().offsetY).toBe(0)
+  expect(testSetup.captureCharFrame()).toContain("line 1")
+})
+
+test("scroll-beyond-last-line: typing while overscrolled keeps the caret visible (no wild snap)", async () => {
+  const file = join(dir, "overscroll-type.ts")
+  await writeFile(file, Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n"))
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("line 1")
+
+  const ta = getTextarea()
+  await wheelToBottom(ta)
+  const before = ta.editorView.getViewport().offsetY
+  expect(before).toBeGreaterThan(0)
+
+  // Type a char: the wheel dragged the caret onto the last line, so the insert lands
+  // there and the view does NOT snap back to the top — the caret's line stays on screen.
+  await testSetup.mockInput.typeText("Z")
+  await testSetup.flush()
+
+  expect(ta.editorView.getViewport().offsetY).toBeGreaterThan(0)
+  expect(testSetup.captureCharFrame()).toContain("Zline 60")
+})
+
+test("scroll-beyond-last-line: the vertical scrollbar's scrollSize includes the overscroll allowance", async () => {
+  const file = join(dir, "overscroll-bar.ts")
+  await writeFile(file, Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n"))
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("line 1")
+
+  const ta = getTextarea()
+  const h = ta.editorView.getViewport().height
+  const total = ta.editorView.getTotalVirtualLineCount()
+
+  // The per-frame sync sizes the bar; it overflows, so scrollSize carries the
+  // `height - 1` overscroll pad on top of the line total (thumb can reach total - 1).
+  const deadline = Date.now() + 3000
+  let vbar = getScrollbar("editor-vscrollbar")
+  while (Date.now() < deadline && !(vbar && vbar.scrollSize === total + h - 1)) {
+    await testSetup.flush()
+    await Bun.sleep(30)
+    vbar = getScrollbar("editor-vscrollbar")
+  }
+  expect(vbar!.scrollSize).toBe(total + h - 1)
+  // The pad lets the max thumb position reach the overscroll max, not the old
+  // bottom-pinned `total - height`.
+  expect(vbar!.scrollSize - vbar!.viewportSize).toBe(total - 1)
+})
+
 test("switching tabs before the initial open resolves does not leak a refcount", async () => {
   const a = join(dir, "race-a.ts")
   const b = join(dir, "race-b.ts")
@@ -1703,4 +2322,161 @@ test("switching tabs before the initial open resolves does not leak a refcount",
 
   expect(documentRegistry.get(a)).toBeUndefined()
   expect(documentRegistry.get(b)).toBeDefined()
+})
+
+/**
+ * REGRESSION: OpenTUI has TWO selection stores. Native plain-move handlers
+ * only clear the renderer coordinator's `currentSelection` (populated by
+ * native shift+arrow / mouse-drag); a selection made through the offset API
+ * (`ta.setSelection(...)`) — which is how EVERY producer below builds its
+ * selection — never populates that store, so a plain arrow used to leave the
+ * highlight painted forever. Each test below creates a selection the same way
+ * its feature's own test does, presses ONE plain arrow, and asserts the
+ * selection is fully gone with the caret collapsed to the correct edge
+ * (VSCode convention: Left/Up → start, Right/Down → end).
+ */
+test("plain right after a shift+click selection collapses to the selection's end", async () => {
+  const file = join(dir, "shift-click-collapse.ts")
+  await writeFile(file, "hello world\nsecond line\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("second line")
+
+  const ta = getTextarea()
+  await clickCell(2, 0)
+  await testSetup.mockMouse.click(ta.x + 6, ta.y + 1, 0, { modifiers: { shift: true } })
+  await testSetup.flush()
+  expect(ta.getSelectedText()).toBe("llo world\nsecond")
+
+  const selection = ta.getSelection()!
+  const endPos = ta.editBuffer.offsetToPosition(selection.end)!
+
+  testSetup.mockInput.pressArrow("right")
+  await testSetup.flush()
+
+  expect(ta.hasSelection()).toBe(false)
+  expect(ta.editorView.getCursor()).toEqual(endPos)
+})
+
+test("plain left after a double-click word selection collapses to the word's start", async () => {
+  const file = join(dir, "dbl-collapse.ts")
+  await writeFile(file, "hello world\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("hello world")
+
+  await clickCell(8, 0, 2) // inside "world"
+  const ta = getTextarea()
+  expect(ta.getSelectedText()).toBe("world")
+
+  testSetup.mockInput.pressArrow("left")
+  await testSetup.flush()
+
+  expect(ta.hasSelection()).toBe(false)
+  expect(ta.editorView.getCursor()).toEqual({ row: 0, col: 6 }) // start of "world"
+})
+
+test("plain right after a triple-click line selection collapses to just past the trailing newline", async () => {
+  const file = join(dir, "tri-collapse.ts")
+  await writeFile(file, "alpha\nbravo\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("alpha")
+
+  await clickCell(2, 0, 3)
+  const ta = getTextarea()
+  expect(ta.getSelectedText()).toBe("alpha\n")
+
+  testSetup.mockInput.pressArrow("right")
+  await testSetup.flush()
+
+  expect(ta.hasSelection()).toBe(false)
+  expect(ta.editorView.getCursor()).toEqual({ row: 1, col: 0 })
+})
+
+test("plain left after a double-click-drag word extension collapses to the extended selection's start", async () => {
+  const file = join(dir, "dbl-drag-collapse.ts")
+  await writeFile(file, "alpha bravo charlie delta\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("alpha bravo charlie")
+
+  const ta = getTextarea()
+  const mm = testSetup.mockMouse
+  // Real double-click-drag: click, press-and-hold (arms the word gesture on
+  // "bravo"), drag into "charlie", release — same sequence as the existing
+  // "double-click then drag extends the selection word-wise" test.
+  await mm.click(ta.x + 8, ta.y + 0)
+  await mm.pressDown(ta.x + 8, ta.y + 0)
+  await mm.emitMouseEvent("drag", ta.x + 15, ta.y + 0)
+  await mm.release(ta.x + 15, ta.y + 0)
+  await testSetup.flush()
+  expect(ta.getSelectedText()).toBe("bravo charlie")
+
+  testSetup.mockInput.pressArrow("left")
+  await testSetup.flush()
+
+  expect(ta.hasSelection()).toBe(false)
+  expect(ta.editorView.getCursor()).toEqual({ row: 0, col: 6 }) // start of "bravo"
+})
+
+test("plain right after a find-widget match reveal dismisses the selection", async () => {
+  const file = join(dir, "find-reveal-collapse.ts")
+  await writeFile(file, "hello needle world\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("hello needle world")
+
+  // Single-line fixture: revealMatch hands its match offsets straight to
+  // setSelection without the native-column conversion the syntax/find
+  // highlight paths use, so JS offsets and native offsets coincide here.
+  const groupId = workbenchStore.getState().activeGroupId
+  const jsStart = "hello ".length
+  const jsEnd = jsStart + "needle".length
+  const controls = getEditorControls(groupId)!
+  controls.setFindMatches([{ start: jsStart, end: jsEnd }], 0)
+  controls.revealMatch(0)
+  await testSetup.flush()
+
+  const ta = getTextarea()
+  expect(ta.getSelectedText()).toBe("needle")
+
+  testSetup.mockInput.pressArrow("right")
+  await testSetup.flush()
+
+  expect(ta.hasSelection()).toBe(false)
+  expect(ta.editorView.getCursor()).toEqual({ row: 0, col: jsEnd })
+})
+
+test("after collapsing a double-click word selection, option+shift+right starts a fresh selection from the caret", async () => {
+  const file = join(dir, "dbl-then-wordnav.ts")
+  await writeFile(file, "alpha bravo charlie\n")
+  workbenchStore.openFile(file)
+
+  testSetup = await render()
+  await waitForText("alpha bravo charlie")
+
+  await clickCell(8, 0, 2) // select "bravo"
+  const ta = getTextarea()
+  expect(ta.getSelectedText()).toBe("bravo")
+
+  testSetup.mockInput.pressArrow("right") // collapse to end of "bravo"
+  await testSetup.flush()
+  expect(ta.hasSelection()).toBe(false)
+  const collapsedCursor = ta.editorView.getCursor()
+
+  testSetup.mockInput.pressArrow("right", { meta: true, shift: true })
+  await testSetup.flush()
+
+  // A fresh selection starting exactly at the collapsed caret — not a range
+  // stretching back to "bravo"'s original (now-stale) anchor.
+  expect(ta.getSelectedText()).toBe(" charlie")
+  const selection = ta.getSelection()!
+  const startPos = ta.editBuffer.offsetToPosition(selection.start)!
+  expect(startPos).toEqual(collapsedCursor)
 })

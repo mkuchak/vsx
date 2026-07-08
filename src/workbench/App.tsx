@@ -225,7 +225,7 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
         id: "workbench.quit",
         title: "Quit vsx",
         category: "Workbench",
-        keybinding: "ctrl+q",
+        keybinding: ["ctrl+q", "ctrl+alt+q"],
         run: () => {
           // Best-effort: persist the frecency ranking before teardown, but never
           // block quitting for long on a slow cache write — race the flush

@@ -957,3 +957,17 @@ test("quitting flushes the file history before teardown", async () => {
     spy.mockRestore()
   }
 })
+
+test("ctrl+alt+q also quits (alternate chord for hosts that swallow ctrl+q)", async () => {
+  const { flush, spy } = stubFileHistory()
+  try {
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    await settle(testSetup)
+
+    testSetup.mockInput.pressKey("q", { ctrl: true, meta: true })
+
+    expect(flush).toHaveBeenCalledTimes(1)
+  } finally {
+    spy.mockRestore()
+  }
+})

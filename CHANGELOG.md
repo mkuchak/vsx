@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.2](https://github.com/mkuchak/vsx/compare/v0.3.1...v0.3.2) (2026-07-08)
+
+### Features
+
+* **diff:** compute intra-line emphasis ranges via char-level diffing ([ce1efc4](https://github.com/mkuchak/vsx/commit/ce1efc4b9afc6c58efdbb6df9ab62183b05a02d9))
+* **diff:** render intra-line emphasis in the diff view ([97f85a6](https://github.com/mkuchak/vsx/commit/97f85a6d39ec2da87b2aefb340f80c192a96170b))
+* **diff:** resolve true rename deltas via oldPath threading ([26eff6f](https://github.com/mkuchak/vsx/commit/26eff6f12c7cd426b111d6c856eac7624b0e3cf8))
+* **editor:** overhaul text selection, navigation, and scrolling behavior ([fe069c3](https://github.com/mkuchak/vsx/commit/fe069c3df1efac8ff20e398c734af496ffe83a45))
+* **search:** search the workspace as you type ([7868acb](https://github.com/mkuchak/vsx/commit/7868acb529f7895f6890ea70b1e19bd9987cae55))
+* **ui:** rename SCM tab to Source and reorder sidebar tabs ([6562cd6](https://github.com/mkuchak/vsx/commit/6562cd63070f7bb888dbde50714d763f5a3bcb82))
+* **ui:** use a thin bar cursor across all text inputs ([036961d](https://github.com/mkuchak/vsx/commit/036961d7d0cb305bea833b65f2ec96f5c82e59dc))
+
+### Bug Fixes
+
+* **diff:** reload DiffPane in the background without unmounting content ([bd2a6f0](https://github.com/mkuchak/vsx/commit/bd2a6f03b1591f0ffb8604d45af9e12ca57c0867))
+* **editor:** convert highlight offsets to OpenTUI's native column space ([c158499](https://github.com/mkuchak/vsx/commit/c1584995889380e14baf2f1d4277b639ffc0fae5))
+* **git:** spawn git with GIT_OPTIONAL_LOCKS=0 to stop watcher feedback loops ([f1c5db9](https://github.com/mkuchak/vsx/commit/f1c5db9c99f85f109a85bb0d4e2f5c1f770c7122))
+* **scm:** open diffs for every row kind and swap Enter/o ([a0dd3ca](https://github.com/mkuchak/vsx/commit/a0dd3ca2621ee80cc20e807b9e2b5cd3361ec939))
+
 ## [0.3.1](https://github.com/mkuchak/vsx/compare/v0.3.0...v0.3.1) (2026-07-07)
 
 ### Bug Fixes

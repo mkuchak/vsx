@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url"
 import { createCliRenderer } from "@opentui/core"
 import { createRoot } from "@opentui/react"
 import pkg from "../package.json"
-import { isVersionRequested, resolveWorkspaceArg } from "./cli"
+import { isUpdateRequested, isVersionRequested, resolveWorkspaceArg } from "./cli"
 import { registerBundledGrammars } from "./grammars"
 import { App } from "./workbench/App"
 
@@ -12,6 +12,32 @@ import { App } from "./workbench/App"
 if (isVersionRequested(process.argv)) {
   console.log(`vsx ${pkg.version}`)
   process.exit(0)
+}
+
+// `vsx update` re-runs the hosted installer (install.sh is not shipped inside
+// the release tarball, so we fetch the canonical copy). It is idempotent: it
+// no-ops when already on the latest release and otherwise installs the new
+// version and repoints the symlink. Runs after --version but BEFORE
+// resolveWorkspaceArg so `update` is not mistaken for a filesystem path, and
+// before any renderer/tree-sitter/worker setup to stay lightweight.
+if (isUpdateRequested(process.argv)) {
+  const proc = Bun.spawn(
+    [
+      "bash",
+      "-c",
+      "curl -fsSL https://raw.githubusercontent.com/mkuchak/vsx/main/install.sh | bash",
+    ],
+    { stdio: ["inherit", "inherit", "inherit"] },
+  )
+  const code = await proc.exited
+  if (code === 0) {
+    console.log("vsx: update complete — restart vsx for the new version to take effect.")
+  } else {
+    console.error(
+      "vsx: update failed — check your network, and note the vsx repo must be public (or a GH token configured) for self-update.",
+    )
+  }
+  process.exit(code)
 }
 
 // Point OpenTUI's tree-sitter client at our worker shim, which works around a

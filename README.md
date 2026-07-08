@@ -34,7 +34,10 @@ bun link                 # exposes `vsx` on your PATH
 vsx ../some/project      # open a folder as the workspace
 vsx ../some/file.ts      # open a file (its parent dir becomes the workspace)
 vsx                      # open the current directory
+vsx update               # self-update to the latest release (re-runs the hosted install.sh)
 ```
+
+`vsx update` re-runs the hosted `install.sh` (which isn't shipped inside the release tarball). It is idempotent — no-ops when you're already on the latest release, otherwise installs the new version and repoints the symlink. The update takes effect the **next** time you launch `vsx`, since the running process keeps its current binary. To open a file literally named `update`, use `vsx ./update`.
 
 Requires Bun (the reference runtime for OpenTUI). Node 26.3+ can run the non-renderer parts, but the renderer itself needs Bun's native bindings.
 

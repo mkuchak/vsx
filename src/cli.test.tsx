@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { basename, join, resolve } from "node:path"
 import { testRender } from "@opentui/react/test-utils"
 import pkg from "../package.json"
-import { isVersionRequested, resolveWorkspaceArg } from "./cli"
+import { isUpdateRequested, isVersionRequested, resolveWorkspaceArg } from "./cli"
 import { documentRegistry } from "./model/documents"
 import { workbenchStore } from "./model/workbench"
 import { App } from "./workbench/App"
@@ -79,6 +79,18 @@ test("absent version flags are not recognized", () => {
   expect(isVersionRequested(argv())).toBe(false)
   expect(isVersionRequested(argv("somedir"))).toBe(false)
   expect(isVersionRequested(argv("--foo"))).toBe(false)
+})
+
+test("the bare `update` subcommand is recognized", () => {
+  expect(isUpdateRequested(argv("update"))).toBe(true)
+  expect(isUpdateRequested(argv("--foo", "update"))).toBe(true)
+})
+
+test("`update` is not recognized as a path, flag, or trailing positional", () => {
+  expect(isUpdateRequested(argv("./update"))).toBe(false)
+  expect(isUpdateRequested(argv("--update"))).toBe(false)
+  expect(isUpdateRequested(argv("somedir", "update"))).toBe(false)
+  expect(isUpdateRequested(argv())).toBe(false)
 })
 
 test("the printed version string matches the package version", () => {

@@ -13,6 +13,17 @@ export function isVersionRequested(argv: string[]): boolean {
 }
 
 /**
+ * Whether the first positional argument is the bare `update` subcommand, which
+ * re-runs the hosted installer to self-update. Only the exact token `update`
+ * matches, so `vsx ./update` still opens a file literally named `update`, and
+ * `update` appearing after another positional is treated as a path, not a verb.
+ */
+export function isUpdateRequested(argv: string[]): boolean {
+  const first = argv.slice(2).find((entry) => !entry.startsWith("-"))
+  return first === "update"
+}
+
+/**
  * Resolve the optional workspace positional (VSCode's `code <dir|file>`).
  * `argv` is `process.argv`, so the first non-flag entry after the binary and
  * script path (index >= 2) is the workspace. Flags (leading `-`) are ignored.

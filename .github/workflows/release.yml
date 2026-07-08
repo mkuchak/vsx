@@ -23,6 +23,9 @@ name: Release
 on:
   push:
     branches: [main]
+  # Manual re-run path to recover a half-finished release (e.g. a tag/commit that
+  # landed locally with [skip ci] so CI never built + published its artifacts).
+  workflow_dispatch:
 
 # Queue stacked pushes instead of racing the version bump — two concurrent
 # release-it runs would fight over the tag/commit. Never cancel an in-flight
@@ -72,7 +75,9 @@ jobs:
     # which would also match a human commit that merely mentions
     # "chore(release)" anywhere in its message/body). `|| ''` keeps this safe
     # when head_commit is null (e.g. some non-branch-push event shapes).
-    if: "${{ !startsWith(github.event.head_commit.message || '', 'chore(release): v') }}"
+    # A manual workflow_dispatch has no head_commit, so it always proceeds —
+    # that's the whole point of the manual re-run path.
+    if: "${{ github.event_name == 'workflow_dispatch' || !startsWith(github.event.head_commit.message || '', 'chore(release): v') }}"
     timeout-minutes: 10
     permissions:
       # release-it pushes a commit + tag and creates the GitHub Release.

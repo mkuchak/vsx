@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.3](https://github.com/mkuchak/vsx/compare/v0.3.2...v0.3.3) (2026-07-08)
+
+### Features
+
+* **cli:** add vsx update subcommand ([d48cfac](https://github.com/mkuchak/vsx/commit/d48cfac4bb3e3928a332d662062dcfd8cf4e0a59))
+* **keybinding:** add ctrl+alt+q as alternate quit chord ([ef5d125](https://github.com/mkuchak/vsx/commit/ef5d12595789575a6b701675e3919978b63b20b4))
+
 ## [0.3.2](https://github.com/mkuchak/vsx/compare/v0.3.1...v0.3.2) (2026-07-08)
 
 ### Features

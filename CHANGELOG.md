@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.4](https://github.com/mkuchak/vsx/compare/v0.3.3...v0.3.4) (2026-07-08)
+
+### Features
+
+* **statusbar:** add quit button cell with hover/pressed states ([acc0adf](https://github.com/mkuchak/vsx/commit/acc0adf84c827f55417d74de962011f13b4a8e44))
+* **workbench:** confirm before quitting via status bar button ([ac6b3db](https://github.com/mkuchak/vsx/commit/ac6b3db7d1ef4d18e17e510a9d0cf76c31c9d74a))
+
 ## [0.3.3](https://github.com/mkuchak/vsx/compare/v0.3.2...v0.3.3) (2026-07-08)
 
 ### Features

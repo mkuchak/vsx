@@ -50,6 +50,11 @@ export const theme = {
   diffAddedSign: "#73c991",
   diffRemovedSign: "#f14c4c",
   diffLineNumberForeground: "#858585",
+  // Intra-line emphasis (VSCode diffEditor.{inserted,removed}TextBackground):
+  // a stronger, more saturated tint than the whole-line background above, applied
+  // only to the changed character ranges within a modified line.
+  diffAddedEmphasisBackground: "#4b6f44",
+  diffRemovedEmphasisBackground: "#7a2222",
 } as const
 
 export type Theme = typeof theme

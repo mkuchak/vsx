@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { detectLanguage, documentRegistry } from "../model/documents"
 import type { CommitDiffTab, DiffTab } from "../model/workbench"
 import { GitService } from "../services/git"
+import "./IntralineDiffRenderable"
 import { getSharedSyntaxStyle, theme } from "../theme"
 import { useOverlay, useOverlayFocusRestore } from "../workbench/OverlayProvider"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
@@ -415,7 +416,7 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
       </box>
       {hasChanges ? (
         <scrollbox ref={sbRef} focused={focused} flexGrow={1}>
-          <diff
+          <intraline-diff
             diff={patch}
             view={view}
             showLineNumbers
@@ -429,6 +430,8 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
             addedSignColor={theme.diffAddedSign}
             removedSignColor={theme.diffRemovedSign}
             lineNumberFg={theme.diffLineNumberForeground}
+            addedEmphasisBg={theme.diffAddedEmphasisBackground}
+            removedEmphasisBg={theme.diffRemovedEmphasisBackground}
           />
         </scrollbox>
       ) : (

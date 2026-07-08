@@ -1,3 +1,4 @@
+import { RGBA, type CapturedFrame, type CapturedLine } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import { parsePatch } from "diff"
@@ -8,6 +9,7 @@ import { join } from "node:path"
 import { documentRegistry } from "../model/documents"
 import { workbenchStore, type DiffTab } from "../model/workbench"
 import { GitService } from "../services/git"
+import { theme } from "../theme"
 import { CommandsProvider } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
 import { WatchersProvider } from "../workbench/watchers"
@@ -147,6 +149,49 @@ async function waitForText(text: string, timeoutMs = 4000) {
     await Bun.sleep(20)
   }
   throw new Error(`timed out waiting for "${text}"\n${setup.captureCharFrame()}`)
+}
+
+/** Per-column glyphs for a captured row. */
+function rowChars(line: CapturedLine): string[] {
+  const out: string[] = []
+  for (const span of line.spans) for (const ch of span.text) out.push(ch)
+  return out
+}
+
+/** Per-column background colors for a captured row (all glyphs here are width 1). */
+function rowBackgrounds(line: CapturedLine): RGBA[] {
+  const out: RGBA[] = []
+  for (const span of line.spans) for (let i = 0; i < span.text.length; i++) out.push(span.bg)
+  return out
+}
+
+function rgbEquals(a: RGBA, hex: string): boolean {
+  const [r, g, b] = a.toInts()
+  const [er, eg, eb] = RGBA.fromHex(hex).toInts()
+  return r === er && g === eg && b === eb
+}
+
+/**
+ * Poll `captureSpans()` until `predicate` matches a frame, returning that frame.
+ * Intra-line emphasis is applied via `onChunks`, which only runs inside the async
+ * syntax-highlight pipeline — a cold tree-sitter worker can take several seconds
+ * to initialize the first time it's exercised in a test run, so this needs a much
+ * longer bound than `waitForText`'s (plain content renders immediately via
+ * `drawUnstyledText`, well before any highlighting completes).
+ */
+async function waitForSpans(
+  predicate: (frame: CapturedFrame) => boolean,
+  timeoutMs = 20000,
+): Promise<CapturedFrame> {
+  const setup = testSetup!
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    await setup.flush()
+    const frame = setup.captureSpans()
+    if (predicate(frame)) return frame
+    await Bun.sleep(50)
+  }
+  throw new Error(`timed out waiting for a span condition\n${setup.captureCharFrame()}`)
 }
 
 describe("resolveDiff content resolution", () => {
@@ -712,4 +757,186 @@ describe("DiffPane rendering + interaction", () => {
       expect(await pressAndRead("p")).toBe(offsets[0])
     })
   }
+})
+
+describe("DiffPane intra-line emphasis", () => {
+  type Row = { chars: string; bgs: RGBA[] }
+
+  function findRow(frame: CapturedFrame, ...needles: string[]): Row | null {
+    const line = frame.lines.find((l) => {
+      const s = rowChars(l).join("")
+      return needles.every((n) => s.includes(n))
+    })
+    if (!line) return null
+    return { chars: rowChars(line).join(""), bgs: rowBackgrounds(line) }
+  }
+
+  test("split view: a single-token change emphasizes only the changed token on each side", async () => {
+    await write("a.ts", "const a = 1\n")
+    await sh(["add", "a.ts"])
+    await sh(["commit", "-qm", "init"])
+    await write("a.ts", "const a = 2\n")
+
+    workbenchStore.openDiff(join(root, "a.ts"), "unstaged", root, { preview: false })
+    await renderActiveDiff()
+    await waitForText("const a = 2")
+    await ensureView("split")
+
+    // Split view renders the paired removed/added lines on one shared row.
+    const frame = await waitForSpans((f) => {
+      const row = findRow(f, "const a = 1", "const a = 2")
+      return row !== null && rgbEquals(row.bgs[row.chars.indexOf("= 1") + 2], theme.diffRemovedEmphasisBackground)
+    })
+
+    const row = findRow(frame, "const a = 1", "const a = 2")!
+    const removedDigitIdx = row.chars.indexOf("= 1") + 2
+    const addedDigitIdx = row.chars.lastIndexOf("= 2") + 2
+    expect(rgbEquals(row.bgs[removedDigitIdx], theme.diffRemovedEmphasisBackground)).toBe(true)
+    expect(rgbEquals(row.bgs[addedDigitIdx], theme.diffAddedEmphasisBackground)).toBe(true)
+
+    // The rest of each line keeps only the plain whole-line tint, not the emphasis bg.
+    const removedWordIdx = row.chars.indexOf("const a = 1")
+    const addedWordIdx = row.chars.lastIndexOf("const a = 2")
+    expect(rgbEquals(row.bgs[removedWordIdx], theme.diffRemovedBackground)).toBe(true)
+    expect(rgbEquals(row.bgs[addedWordIdx], theme.diffAddedBackground)).toBe(true)
+  }, 25000)
+
+  test("unified view: the '-' row and '+' row each carry the same emphasis on their own row", async () => {
+    await write("a.ts", "const a = 1\n")
+    await sh(["add", "a.ts"])
+    await sh(["commit", "-qm", "init"])
+    await write("a.ts", "const a = 2\n")
+
+    workbenchStore.openDiff(join(root, "a.ts"), "unstaged", root, { preview: false })
+    await renderActiveDiff()
+    await waitForText("const a = 2")
+    await ensureView("unified")
+
+    const frame = await waitForSpans((f) => {
+      const removedRow = findRow(f, "const a = 1")
+      return (
+        removedRow !== null &&
+        rgbEquals(removedRow.bgs[removedRow.chars.indexOf("= 1") + 2], theme.diffRemovedEmphasisBackground)
+      )
+    })
+
+    const removedRow = findRow(frame, "const a = 1")!
+    const addedRow = findRow(frame, "const a = 2")!
+    const removedDigitIdx = removedRow.chars.indexOf("= 1") + 2
+    const addedDigitIdx = addedRow.chars.indexOf("= 2") + 2
+    expect(rgbEquals(removedRow.bgs[removedDigitIdx], theme.diffRemovedEmphasisBackground)).toBe(true)
+    expect(rgbEquals(addedRow.bgs[addedDigitIdx], theme.diffAddedEmphasisBackground)).toBe(true)
+
+    const removedWordIdx = removedRow.chars.indexOf("const a = 1")
+    const addedWordIdx = addedRow.chars.indexOf("const a = 2")
+    expect(rgbEquals(removedRow.bgs[removedWordIdx], theme.diffRemovedBackground)).toBe(true)
+    expect(rgbEquals(addedRow.bgs[addedWordIdx], theme.diffAddedBackground)).toBe(true)
+  }, 25000)
+
+  test("a pure insertion (no removed counterpart) shows no emphasis — only the plain added tint", async () => {
+    await write("a.ts", "alpha\ngamma\n")
+    await sh(["add", "a.ts"])
+    await sh(["commit", "-qm", "init"])
+    await write("a.ts", "alpha\nBETA_NEW_LINE\ngamma\n")
+
+    workbenchStore.openDiff(join(root, "a.ts"), "unstaged", root, { preview: false })
+    await renderActiveDiff()
+    await waitForText("BETA_NEW_LINE")
+    await ensureView("split")
+
+    // Wait for the pipeline to apply the plain added tint (proving `onChunks` —
+    // which emphasis would also ride — has had a chance to run at least once)
+    // before asserting that no emphasis background appears anywhere on the line.
+    const frame = await waitForSpans((f) => {
+      const row = findRow(f, "BETA_NEW_LINE")
+      return row !== null && rgbEquals(row.bgs[row.chars.indexOf("BETA_NEW_LINE")], theme.diffAddedBackground)
+    })
+
+    const row = findRow(frame, "BETA_NEW_LINE")!
+    const start = row.chars.indexOf("BETA_NEW_LINE")
+    for (let i = start; i < start + "BETA_NEW_LINE".length; i++) {
+      expect(rgbEquals(row.bgs[i], theme.diffAddedBackground)).toBe(true)
+      expect(rgbEquals(row.bgs[i], theme.diffAddedEmphasisBackground)).toBe(false)
+    }
+  }, 25000)
+
+  test("a mostly-rewritten line (over the similarity guard) shows no emphasis on either side", async () => {
+    await write("a.ts", "hello world foo bar\n")
+    await sh(["add", "a.ts"])
+    await sh(["commit", "-qm", "init"])
+    await write("a.ts", "zzzz yyyy xxxx wwww\n")
+
+    workbenchStore.openDiff(join(root, "a.ts"), "unstaged", root, { preview: false })
+    await renderActiveDiff()
+    await waitForText("zzzz yyyy xxxx wwww")
+    await ensureView("split")
+
+    const frame = await waitForSpans((f) => {
+      const row = findRow(f, "hello world foo bar", "zzzz yyyy xxxx wwww")
+      return row !== null && rgbEquals(row.bgs[row.chars.indexOf("hello")], theme.diffRemovedBackground)
+    })
+
+    const row = findRow(frame, "hello world foo bar", "zzzz yyyy xxxx wwww")!
+    const removedStart = row.chars.indexOf("hello world foo bar")
+    const addedStart = row.chars.lastIndexOf("zzzz yyyy xxxx wwww")
+    for (let i = removedStart; i < removedStart + "hello world foo bar".length; i++) {
+      expect(rgbEquals(row.bgs[i], theme.diffRemovedBackground)).toBe(true)
+      expect(rgbEquals(row.bgs[i], theme.diffRemovedEmphasisBackground)).toBe(false)
+    }
+    for (let i = addedStart; i < addedStart + "zzzz yyyy xxxx wwww".length; i++) {
+      expect(rgbEquals(row.bgs[i], theme.diffAddedBackground)).toBe(true)
+      expect(rgbEquals(row.bgs[i], theme.diffAddedEmphasisBackground)).toBe(false)
+    }
+  }, 25000)
+
+  test("toggling split<->unified (v) keeps emphasis correct in both views", async () => {
+    await write("a.ts", "const a = 1\n")
+    await sh(["add", "a.ts"])
+    await sh(["commit", "-qm", "init"])
+    await write("a.ts", "const a = 2\n")
+
+    workbenchStore.openDiff(join(root, "a.ts"), "unstaged", root, { preview: false })
+    await renderActiveDiff()
+    await waitForText("const a = 2")
+    await ensureView("split")
+
+    const assertSplit = (frame: CapturedFrame) => {
+      const row = findRow(frame, "const a = 1", "const a = 2")!
+      expect(rgbEquals(row.bgs[row.chars.indexOf("= 1") + 2], theme.diffRemovedEmphasisBackground)).toBe(true)
+      expect(rgbEquals(row.bgs[row.chars.lastIndexOf("= 2") + 2], theme.diffAddedEmphasisBackground)).toBe(true)
+    }
+    const assertUnified = (frame: CapturedFrame) => {
+      const removedRow = findRow(frame, "const a = 1")!
+      const addedRow = findRow(frame, "const a = 2")!
+      expect(rgbEquals(removedRow.bgs[removedRow.chars.indexOf("= 1") + 2], theme.diffRemovedEmphasisBackground)).toBe(
+        true,
+      )
+      expect(rgbEquals(addedRow.bgs[addedRow.chars.indexOf("= 2") + 2], theme.diffAddedEmphasisBackground)).toBe(true)
+    }
+
+    const splitFrame = await waitForSpans((f) => {
+      const row = findRow(f, "const a = 1", "const a = 2")
+      return row !== null && rgbEquals(row.bgs[row.chars.indexOf("= 1") + 2], theme.diffRemovedEmphasisBackground)
+    })
+    assertSplit(splitFrame)
+
+    testSetup!.mockInput.pressKey("v")
+    await waitForText("Unified")
+    const unifiedFrame = await waitForSpans((f) => {
+      const removedRow = findRow(f, "const a = 1")
+      return (
+        removedRow !== null &&
+        rgbEquals(removedRow.bgs[removedRow.chars.indexOf("= 1") + 2], theme.diffRemovedEmphasisBackground)
+      )
+    })
+    assertUnified(unifiedFrame)
+
+    testSetup!.mockInput.pressKey("v")
+    await waitForText("Split")
+    const splitFrame2 = await waitForSpans((f) => {
+      const row = findRow(f, "const a = 1", "const a = 2")
+      return row !== null && rgbEquals(row.bgs[row.chars.indexOf("= 1") + 2], theme.diffRemovedEmphasisBackground)
+    })
+    assertSplit(splitFrame2)
+  }, 30000)
 })

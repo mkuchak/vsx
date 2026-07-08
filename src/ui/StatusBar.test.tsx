@@ -127,6 +127,73 @@ test("omits the ☰ affordance when no onToggleSidebar handler is provided", asy
   expect(testSetup.captureCharFrame()).not.toContain("☰")
 })
 
+function findCell(setup: Awaited<ReturnType<typeof testRender>>, id: string) {
+  let cell: { x: number; y: number } | null = null
+  const walk = (node: { id?: string; x?: number; y?: number; getChildren: () => unknown[] }) => {
+    if (node.id === id) cell = node as { x: number; y: number }
+    for (const child of node.getChildren()) walk(child as typeof node)
+  }
+  walk(setup.renderer.root as unknown as { getChildren: () => unknown[] })
+  return cell as { x: number; y: number } | null
+}
+
+test("renders a clickable ⏻ affordance that fires onQuit on a left-button click", async () => {
+  let quit = 0
+  testSetup = await testRender(
+    <StatusBar workspaceRoot={root} cursor={null} onQuit={() => quit++} />,
+    { width: 80, height: 3 },
+  )
+  await testSetup.renderOnce()
+  expect(testSetup.captureCharFrame()).toContain("⏻")
+
+  const cell = findCell(testSetup, "statusbar-quit-button")
+  expect(cell).not.toBeNull()
+
+  await testSetup.mockMouse.pressDown(cell!.x, cell!.y)
+  await testSetup.mockMouse.release(cell!.x, cell!.y)
+  expect(quit).toBe(1)
+})
+
+test("omits the ⏻ affordance when no onQuit handler is provided", async () => {
+  testSetup = await testRender(<StatusBar workspaceRoot={root} cursor={null} />, {
+    width: 80,
+    height: 3,
+  })
+  await testSetup.renderOnce()
+  expect(testSetup.captureCharFrame()).not.toContain("⏻")
+})
+
+test("does not fire onQuit on a right-button click", async () => {
+  let quit = 0
+  testSetup = await testRender(
+    <StatusBar workspaceRoot={root} cursor={null} onQuit={() => quit++} />,
+    { width: 80, height: 3 },
+  )
+  await testSetup.renderOnce()
+  const cell = findCell(testSetup, "statusbar-quit-button")
+  expect(cell).not.toBeNull()
+
+  await testSetup.mockMouse.pressDown(cell!.x, cell!.y, 2)
+  await testSetup.mockMouse.release(cell!.x, cell!.y, 2)
+  expect(quit).toBe(0)
+})
+
+test("does not fire onQuit when the pointer leaves the cell before release", async () => {
+  let quit = 0
+  testSetup = await testRender(
+    <StatusBar workspaceRoot={root} cursor={null} onQuit={() => quit++} />,
+    { width: 80, height: 3 },
+  )
+  await testSetup.renderOnce()
+  const cell = findCell(testSetup, "statusbar-quit-button")
+  expect(cell).not.toBeNull()
+
+  await testSetup.mockMouse.pressDown(cell!.x, cell!.y)
+  await testSetup.mockMouse.moveTo(0, 0)
+  await testSetup.mockMouse.release(0, 0)
+  expect(quit).toBe(0)
+})
+
 test("shows 'no repository' when the workspace has no git repo", async () => {
   const bare = await mkdtemp(join(tmpdir(), "vsx-statusbar-norepo-"))
   try {

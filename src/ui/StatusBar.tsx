@@ -1,3 +1,4 @@
+import type { MouseEvent as TuiMouseEvent } from "@opentui/core"
 import { useEffect, useRef, useState } from "react"
 import { documentRegistry } from "../model/documents"
 import { theme } from "../theme"
@@ -6,6 +7,8 @@ import type { HeadInfo } from "../services/git"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
 import { useWorkbenchWatchers } from "../workbench/watchers"
 import type { CursorPosition } from "./EditorPane"
+
+const MOUSE_BUTTON_LEFT = 0
 
 export type StatusBarProps = {
   workspaceRoot: string
@@ -16,6 +19,8 @@ export type StatusBarProps = {
   onToggleSidebar?: () => void
   /** When an overlay owns the screen, the ☰ click is inert (mirrors Ctrl+B's dispatch gate). */
   overlayOpen?: boolean
+  /** Renders a discreet ⏻ cell at the far right; fires on a completed left-click. */
+  onQuit?: () => void
 }
 
 /**
@@ -31,6 +36,7 @@ export function StatusBar({
   message,
   onToggleSidebar,
   overlayOpen,
+  onQuit,
 }: StatusBarProps) {
   const state = useWorkbenchStore()
   const group = state.groups.find((g) => g.id === state.activeGroupId)
@@ -43,6 +49,14 @@ export function StatusBar({
   const [repos, setRepos] = useState<RepoInfo[]>([])
   const [head, setHead] = useState<HeadInfo | null>(null)
   const [dirtyCount, setDirtyCount] = useState(0)
+  const [quitHovered, setQuitHovered] = useState(false)
+  const [quitPressed, setQuitPressed] = useState(false)
+  // Source of truth for whether mouse-up should fire onQuit: a ref (not the
+  // `quitPressed` state above) because no render happens between the down and up
+  // events the renderer dispatches, so a handler reading state alone would close
+  // over the pre-press value (the same stale-closure hazard SplitDivider's
+  // `lastDown` ref sidesteps).
+  const quitArmedRef = useRef(false)
   const mountedRef = useRef(true)
 
   useEffect(() => {
@@ -113,6 +127,28 @@ export function StatusBar({
     onToggleSidebar?.()
   }
 
+  const handleQuitMouseDown = (event: TuiMouseEvent) => {
+    // Quitting must only ever be armed by a left-click; a right-click must not
+    // trigger it (and mouse-down never fires onQuit directly — see mouse-up below,
+    // so a drag-off can abort a quit that's destructive to fire early).
+    if (event.button !== MOUSE_BUTTON_LEFT) return
+    quitArmedRef.current = true
+    setQuitPressed(true)
+  }
+
+  const handleQuitMouseUp = () => {
+    if (quitArmedRef.current) onQuit?.()
+    quitArmedRef.current = false
+    setQuitPressed(false)
+  }
+
+  const handleQuitMouseOut = () => {
+    // Dragging off the cell before release aborts the quit.
+    quitArmedRef.current = false
+    setQuitPressed(false)
+    setQuitHovered(false)
+  }
+
   return (
     <box
       height={1}
@@ -145,6 +181,25 @@ export function StatusBar({
         </text>
       ) : language ? (
         <text fg={theme.statusBarForeground}>{language}</text>
+      ) : null}
+      {onQuit ? (
+        <box
+          id="statusbar-quit-button"
+          paddingLeft={1}
+          paddingRight={1}
+          backgroundColor={quitHovered || quitPressed ? theme.error : theme.statusBarBackground}
+          onMouseDown={handleQuitMouseDown}
+          onMouseUp={handleQuitMouseUp}
+          onMouseOver={() => setQuitHovered(true)}
+          onMouseOut={handleQuitMouseOut}
+        >
+          {/* Non-selectable: a bare click would otherwise start a renderer text
+              selection whose empty mouse-up wipes the Ctrl+C copy cache
+              (rendererSelection.ts) — the same cache global Ctrl+C copies from. */}
+          <text fg={theme.statusBarForeground} selectable={false}>
+            ⏻
+          </text>
+        </box>
       ) : null}
     </box>
   )

@@ -29,7 +29,7 @@ import { SidebarFooter } from "../ui/SidebarFooter"
 import { SidebarTabs, type SidebarView } from "../ui/SidebarTabs"
 import { applyArmedDrag, disarmDrag, endArmedDrag } from "../ui/dragManager"
 import { SplitDivider } from "../ui/SplitDivider"
-import { StatusBar } from "../ui/StatusBar"
+import { StatusBar, type StatusBarProps } from "../ui/StatusBar"
 
 /**
  * The assembled vsx workbench: sidebar (Explorer / Source Control / History,
@@ -436,7 +436,7 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
             <FindWidget />
           </box>
         </box>
-        <StatusBar
+        <StatusBarWithQuit
           workspaceRoot={workspaceRoot}
           cursor={editorFocused && activeTabIsFile ? cursor : null}
           onToggleSidebar={toggleSidebar}
@@ -454,6 +454,32 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
  * Cancel prompt and maps the chosen button back to the store's choice union.
  * Must render inside ModalProvider so useConfirm resolves.
  */
+/**
+ * Bridges the status bar's ⏻ button to the root modal host: a click raises a
+ * "Quit vsx?" confirmation, and only on confirm does it run workbench.quit —
+ * the keyboard chords (ctrl+q / ctrl+alt+q) bypass this entirely and keep
+ * quitting immediately. Routes through executeCommand rather than calling
+ * renderer.destroy() directly so the command's frecency-flush-before-teardown
+ * still runs. Must render inside ModalProvider so useConfirm resolves.
+ */
+function StatusBarWithQuit(props: Omit<StatusBarProps, "onQuit">) {
+  const confirm = useConfirm()
+  const commands = useCommands()
+
+  const handleQuit = useCallback(async () => {
+    const choice = await confirm({
+      message: "Quit vsx?",
+      buttons: [
+        { id: "quit", label: "Quit", isDefault: true },
+        { id: "cancel", label: "Cancel" },
+      ],
+    })
+    if (choice === "quit") commands.executeCommand("workbench.quit")
+  }, [confirm, commands])
+
+  return <StatusBar {...props} onQuit={handleQuit} />
+}
+
 function DirtyCloseWiring() {
   const confirm = useConfirm()
 

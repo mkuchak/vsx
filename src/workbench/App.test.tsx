@@ -971,3 +971,77 @@ test("ctrl+alt+q also quits (alternate chord for hosts that swallow ctrl+q)", as
     spy.mockRestore()
   }
 })
+
+test("ctrl+q keeps quitting immediately, with no confirm dialog", async () => {
+  const { flush, spy } = stubFileHistory()
+  try {
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    await settle(testSetup)
+
+    testSetup.mockInput.pressKey("q", { ctrl: true })
+    await settle(testSetup, 100)
+
+    expect(testSetup.captureCharFrame()).not.toContain("Quit vsx?")
+    expect(flush).toHaveBeenCalledTimes(1)
+  } finally {
+    spy.mockRestore()
+  }
+})
+
+test("clicking the status-bar ⏻ button opens a confirm dialog without quitting yet", async () => {
+  const { flush, spy } = stubFileHistory()
+  try {
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    await settle(testSetup)
+
+    const quitCell = findById("statusbar-quit-button")!
+    expect(quitCell).not.toBeNull()
+    await testSetup.mockMouse.click(quitCell.x, quitCell.y)
+    await settle(testSetup, 100)
+
+    expect(testSetup.captureCharFrame()).toContain("Quit vsx?")
+    expect(flush).not.toHaveBeenCalled()
+  } finally {
+    spy.mockRestore()
+  }
+})
+
+test("confirming the quit dialog runs workbench.quit", async () => {
+  const { flush, spy } = stubFileHistory()
+  try {
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    await settle(testSetup)
+
+    const quitCell = findById("statusbar-quit-button")!
+    await testSetup.mockMouse.click(quitCell.x, quitCell.y)
+    await waitForText("Quit vsx?")
+
+    // "Quit" is the default (destructive-but-deliberate) button; Enter confirms it.
+    testSetup.mockInput.pressEnter()
+    await settle(testSetup, 100)
+
+    expect(flush).toHaveBeenCalledTimes(1)
+  } finally {
+    spy.mockRestore()
+  }
+})
+
+test("cancelling the quit dialog closes it and the app keeps running", async () => {
+  const { flush, spy } = stubFileHistory()
+  try {
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    await settle(testSetup)
+
+    const quitCell = findById("statusbar-quit-button")!
+    await testSetup.mockMouse.click(quitCell.x, quitCell.y)
+    await waitForText("Quit vsx?")
+
+    testSetup.mockInput.pressEscape()
+    await waitForTextGone("Quit vsx?")
+
+    expect(flush).not.toHaveBeenCalled()
+    expect(testSetup.captureCharFrame()).toContain("hello.ts")
+  } finally {
+    spy.mockRestore()
+  }
+})

@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.5](https://github.com/mkuchak/vsx/compare/v0.3.4...v0.3.5) (2026-07-09)
+
+### Features
+
+* **diff:** add horizontal scrollbars to the diff panes ([c8216aa](https://github.com/mkuchak/vsx/commit/c8216aac5c90456d0dbbd56194e5727492387b3c))
+
+### Bug Fixes
+
+* **installer:** resolve releases via github.com redirect, not the API ([8c16725](https://github.com/mkuchak/vsx/commit/8c16725fe9d3ae99181432d6585cd17f4da066b2))
+* **scm:** truncate long filenames instead of wrapping them invisible ([2a1cebb](https://github.com/mkuchak/vsx/commit/2a1cebb56711854777339f2b35a466e5d917fba6))
+
 ## [0.3.4](https://github.com/mkuchak/vsx/compare/v0.3.3...v0.3.4) (2026-07-08)
 
 ### Features

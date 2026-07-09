@@ -833,6 +833,15 @@ export function ScmPanel({
 
 const EMPTY_ROWS: SelRow[] = []
 
+// Every sidebar row is height={1}, so a label must never wrap. OpenTUI <text>
+// defaults to wrapMode "word" (inherited from TextBufferRenderable), so a label
+// wider than its row — e.g. a long filename in the 32-col sidebar — word-wraps
+// the unbreakable name onto line 2, which the 1-row box clips, leaving a blank
+// row. Both props are required: `wrapMode: "none"` keeps the label on one line
+// and `truncate` adds the middle ellipsis; truncate alone still lets word-wrap
+// win, and wrapMode alone hard-clips at the edge with no ellipsis.
+const ROW_LABEL_TRUNCATE = { wrapMode: "none", truncate: true } as const
+
 type RepoSectionProps = {
   repo: RepoInfo
   rows: SelRow[]
@@ -912,7 +921,7 @@ const RepoSection = memo(function RepoSection({
           backgroundColor={bg}
           onMouseDown={() => selectById(row.id)}
         >
-          <text fg={theme.foreground}>{row.label}</text>
+          <text fg={theme.foreground} {...ROW_LABEL_TRUNCATE}>{row.label}</text>
           <box flexGrow={1} />
           {selected ? renderActions(row.group, row.files) : null}
           <text fg={theme.dimForeground}>{`(${row.files.length})`}</text>
@@ -932,7 +941,11 @@ const RepoSection = memo(function RepoSection({
           backgroundColor={bg}
           onMouseDown={() => selectById(row.id)}
         >
-          <text fg={theme.dimForeground}>
+          {/* Only wrapMode "none" (not truncate): this row is a whole sentence
+              that already opens with "…", so a middle ellipsis would mangle it into
+              a confusing double-ellipsis. A hard clip keeps the readable start
+              (count + reason) on one line. */}
+          <text fg={theme.dimForeground} wrapMode="none">
             {`…and ${row.hiddenCount} more files (group too large to display)`}
           </text>
         </box>
@@ -956,7 +969,7 @@ const RepoSection = memo(function RepoSection({
             toggleDir(row)
           }}
         >
-          <text fg={theme.foreground}>
+          <text fg={theme.foreground} {...ROW_LABEL_TRUNCATE}>
             {`${indent}${row.expanded ? "▾ " : "▸ "}${row.name}`}
           </text>
           <box flexGrow={1} />
@@ -983,10 +996,20 @@ const RepoSection = memo(function RepoSection({
           )
         }}
       >
-        <text fg={theme.foreground}>{`${indent}  ${row.name}`}</text>
+        <text fg={theme.foreground} {...ROW_LABEL_TRUNCATE}>
+          {`${indent}  ${row.name}`}
+        </text>
         <box flexGrow={1} />
         {selected ? renderActions(row.group, [row.file]) : null}
-        <text fg={gitStatusColor(row.file.statusLetter)}>{row.file.statusLetter}</text>
+        {/* The badge carries its own leading gap and never shrinks, so a truncated
+            label cannot butt against it. Two details are load-bearing: flexShrink={0}
+            (yoga spreads the row overflow across every child, so a shrinkable gap
+            from marginRight, minWidth, or an empty box rounds away to nothing) and
+            the U+00A0 gap char (an ordinary leading space is trimmed to zero width
+            by the text buffer, but a non-breaking space survives). */}
+        <text fg={gitStatusColor(row.file.statusLetter)} flexShrink={0}>
+          {`\u00A0${row.file.statusLetter}`}
+        </text>
         <text fg={theme.dimForeground}> </text>
       </box>
     )
@@ -996,7 +1019,9 @@ const RepoSection = memo(function RepoSection({
     <box flexDirection="column" width="100%">
       {showRepoHeader ? (
         <box height={1} paddingLeft={1}>
-          <text fg={theme.foreground}>{basename(repo.root)}</text>
+          <text fg={theme.foreground} {...ROW_LABEL_TRUNCATE}>
+            {basename(repo.root)}
+          </text>
         </box>
       ) : null}
       <input

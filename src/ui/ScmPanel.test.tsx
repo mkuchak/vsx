@@ -820,6 +820,33 @@ test("nested paths render as an expanded directory tree with indented leaves", a
   expect(indentOf(helperLine!)).toBeGreaterThan(indentOf(utilLine!))
 })
 
+test("a filename too wide for the sidebar truncates instead of vanishing", async () => {
+  // Regression: OpenTUI <text> defaults to wrapMode "word", so a filename wider
+  // than its height={1} row word-wrapped the unbreakable name onto a clipped
+  // second line, leaving a BLANK row. The fix (wrapMode "none" + truncate) keeps
+  // it on one line with a middle ellipsis. Nest a 26-char basename two dirs deep
+  // and render narrow (32 cols) so its ~32-col label overflows the row.
+  const path = "src/ui/IntralineDiffRenderable.ts"
+  await writeDeep(path, "one\n")
+  await sh(["add", "-A"])
+  await sh(["commit", "-q", "-m", "base"])
+  await writeDeep(path, "two\n") // now a worktree modification → "M" under Changes
+
+  testSetup = await render(undefined, { width: 32, height: 20 })
+  await waitForText("Intral")
+  await settle()
+
+  const frame = testSetup.captureCharFrame()
+  // The row is not blank: a leading fragment of the name is visible...
+  expect(frame).toContain("Intral")
+  // ...and it was truncated, not shown whole (the full name can't fit the row).
+  expect(frame).not.toContain("IntralineDiffRenderable.ts")
+  // The status letter still shares the (truncated) name's line — the label and
+  // badge don't collapse into a blank row.
+  const nameLine = frame.split("\n").find((l) => l.includes("Intral"))
+  expect(nameLine).toContain("M")
+})
+
 test("collapsing a directory hides its descendants; expanding restores them", async () => {
   await baseline()
   await writeDeep("src/app.ts", "x\n")

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.6](https://github.com/mkuchak/vsx/compare/v0.3.5...v0.3.6) (2026-07-09)
+
+### Bug Fixes
+
+* **repos:** don't crash repo discovery when a scanned dir vanishes ([adde1fb](https://github.com/mkuchak/vsx/commit/adde1fbab7089498aef6996c403cc74e198d8857))
+
 ## [0.3.5](https://github.com/mkuchak/vsx/compare/v0.3.4...v0.3.5) (2026-07-09)
 
 ### Features

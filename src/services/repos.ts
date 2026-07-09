@@ -15,11 +15,23 @@ const SKIP_DIRS = new Set(["node_modules"])
 const WATCH_DEBOUNCE_MS = 150
 
 async function spawnGit(cwd: string, args: string[]): Promise<string | null> {
-  const proc = Bun.spawn(["git", ...args], {
-    cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-  })
+  const spawn = () =>
+    Bun.spawn(["git", ...args], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+  let proc: ReturnType<typeof spawn>
+  try {
+    proc = spawn()
+  } catch {
+    // Bun.spawn throws ENOENT (attributed to `git`) both when git is missing
+    // AND when `cwd` vanished between discovery and spawn — e.g. a watcher
+    // refresh racing a directory delete. Every discoverRepositories call site
+    // is fire-and-forget (`void …`), so a throw here becomes an unhandled
+    // rejection; "couldn't run git" must resolve like "git failed": null.
+    return null
+  }
   const [out, , code] = await Promise.all([
     Bun.readableStreamToText(proc.stdout),
     Bun.readableStreamToText(proc.stderr),

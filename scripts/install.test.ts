@@ -1,8 +1,8 @@
 // Hermetic tests for the pure helpers in install.sh. Each case sources the
 // script (its `[[ BASH_SOURCE == $0 ]]` guard keeps `main` from running) and
 // invokes one function, so nothing here hits the network or the real filesystem
-// beyond a scratch tmpdir. Network paths in install.sh (download/fetch/API) are
-// deliberately thin wrappers and are not exercised here.
+// beyond a scratch tmpdir. Network paths in install.sh (download/probe_redirect)
+// are deliberately thin wrappers and are only exercised through curl shims.
 import { afterAll, beforeAll, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
@@ -85,30 +85,24 @@ test("detect_platform rejects an unknown architecture", async () => {
   expect(stderr).toContain("architecture")
 })
 
-// ── parse_latest_tag: tag_name out of a canned GitHub API JSON fixture ───────
+// ── parse_tag_from_release_url: tag out of the /releases/latest redirect ─────
 
-test("parse_latest_tag extracts tag_name from a release JSON payload", async () => {
-  const json = JSON.stringify({
-    url: "https://api.github.com/repos/mkuchak/vsx/releases/1",
-    tag_name: "v1.2.3",
-    name: "v1.2.3",
-    draft: false,
-  })
-  const fixture = join(scratch, "release.json")
-  await writeFile(fixture, json)
-  const { code, stdout } = await sh(`parse_latest_tag < "${fixture}"`)
+test("parse_tag_from_release_url extracts the tag from a redirect target", async () => {
+  const { code, stdout } = await sh(
+    'parse_tag_from_release_url "https://github.com/mkuchak/vsx/releases/tag/v1.2.3"',
+  )
   expect(code).toBe(0)
   expect(stdout).toBe("v1.2.3")
 })
 
-test("parse_latest_tag takes the first tag_name when several appear", async () => {
-  // GitHub embeds tag_name inside author/uploader sub-objects too; the release
-  // one is first, so head -n1 must win.
-  const json = `{"tag_name": "v0.1.0", "assets": [{"tag_name": "ignored"}]}`
-  const fixture = join(scratch, "release-multi.json")
-  await writeFile(fixture, json)
-  const { stdout } = await sh(`parse_latest_tag < "${fixture}"`)
-  expect(stdout).toBe("v0.1.0")
+test("parse_tag_from_release_url echoes nothing for a non-tag URL", async () => {
+  // A repo with no published releases serves /releases/latest directly (404,
+  // no redirect) — the effective URL is still the /releases/latest one.
+  const { code, stdout } = await sh(
+    'parse_tag_from_release_url "https://github.com/mkuchak/vsx/releases/latest"',
+  )
+  expect(code).toBe(0)
+  expect(stdout).toBe("")
 })
 
 // ── tag_to_version / parse_version_output / idempotence logic ────────────────
@@ -239,20 +233,40 @@ test("resolve_tag honors the VSX_VERSION override without touching the network",
   expect(stdout).toBe("v3.4.5")
 })
 
-test("resolve_tag reports a repo-visibility hint on a 404 (curl exit 22)", async () => {
-  const bin = await mkdtemp(join(scratch, "bin-404-"))
-  await shim(bin, "curl", "exit 22")
-  const { code, stderr } = await sh("resolve_tag", { pathPrepend: bin })
-  expect(code).not.toBe(0)
-  expect(stderr).toContain("is the repo public yet?")
+test("resolve_tag parses the tag from the releases/latest redirect", async () => {
+  const bin = await mkdtemp(join(scratch, "bin-redirect-"))
+  await shim(bin, "curl", 'printf "200 https://github.com/mkuchak/vsx/releases/tag/v9.9.9"')
+  const { code, stdout } = await sh("resolve_tag", { pathPrepend: bin })
+  expect(code).toBe(0)
+  expect(stdout).toBe("v9.9.9")
 })
 
-test("resolve_tag reports a generic network error on other curl failures", async () => {
+test("resolve_tag reports missing releases on a 404 (none published / repo moved)", async () => {
+  const bin = await mkdtemp(join(scratch, "bin-404-"))
+  await shim(bin, "curl", 'printf "404 https://github.com/mkuchak/vsx/releases/latest"')
+  const { code, stderr } = await sh("resolve_tag", { pathPrepend: bin })
+  expect(code).not.toBe(0)
+  expect(stderr).toContain("no release found")
+})
+
+test("resolve_tag surfaces an unexpected HTTP status distinctly (the rate-limit regression)", async () => {
+  // The API-based resolver died on api.github.com's 403 once the caller IP's
+  // unauthenticated quota was drained; the website endpoint shouldn't ever 403,
+  // but if GitHub answers anything unexpected the message must name the status
+  // instead of blaming the network or the repo's visibility.
+  const bin = await mkdtemp(join(scratch, "bin-403-"))
+  await shim(bin, "curl", 'printf "403 https://github.com/mkuchak/vsx/releases/latest"')
+  const { code, stderr } = await sh("resolve_tag", { pathPrepend: bin })
+  expect(code).not.toBe(0)
+  expect(stderr).toContain("HTTP 403")
+})
+
+test("resolve_tag reports a generic network error when curl itself fails", async () => {
   const bin = await mkdtemp(join(scratch, "bin-net-"))
   await shim(bin, "curl", "exit 6") // couldn't resolve host
   const { code, stderr } = await sh("resolve_tag", { pathPrepend: bin })
   expect(code).not.toBe(0)
-  expect(stderr).toContain("could not reach the GitHub API")
+  expect(stderr).toContain("could not reach github.com")
 })
 
 // ── prune_versions: keeps the just-installed version + two newest others ────
@@ -291,10 +305,10 @@ test("prune_versions never prunes a pinned downgrade, even though it is the olde
 test("piped execution (curl | bash) runs main(), the exact BASH_SOURCE-guard regression", async () => {
   const bin = await mkdtemp(join(scratch, "bin-piped-"))
   await shim(bin, "uname", `case "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac`)
-  // No VSX_VERSION override, so main() reaches resolve_tag's network call;
-  // shimmed curl exits 22 (as a real 404 would) so nothing hits the real
-  // network, but main() must run far enough to get there.
-  await shim(bin, "curl", "exit 22")
+  // No VSX_VERSION override, so main() reaches resolve_tag's network probe;
+  // the shimmed curl answers a canned 404 so nothing hits the real network,
+  // but main() must run far enough to get there.
+  await shim(bin, "curl", 'printf "404 https://github.com/mkuchak/vsx/releases/latest"')
   const basePath = `${bin}:${process.env.PATH}`
   const proc = Bun.spawn(["bash", "-c", `cat "${INSTALL_SH}" | bash`], {
     env: { ...process.env, PATH: basePath },
@@ -311,5 +325,5 @@ test("piped execution (curl | bash) runs main(), the exact BASH_SOURCE-guard reg
   // under a pipe, so main() would never fire and stdout would be silent.
   expect(stdout).toContain("vsx installer")
   expect(stdout).toContain("platform: darwin-arm64")
-  expect(stderr).toContain("is the repo public yet?")
+  expect(stderr).toContain("no release found")
 })

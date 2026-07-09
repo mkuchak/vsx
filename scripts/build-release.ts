@@ -20,8 +20,10 @@ import { LAUNCHER } from "./launcherTemplate"
 const ROOT = fileURLToPath(new URL("..", import.meta.url))
 const DIST = join(ROOT, "dist")
 
-// Files/dirs copied verbatim into the package root.
-const PAYLOAD = ["src", "assets", "package.json", "bun.lock", "README.md"]
+// Files/dirs copied verbatim into the package root. install.sh ships so `vsx
+// update` can run its own local installer copy instead of fetching the script
+// from the repo's main branch (see the update block in src/main.tsx).
+const PAYLOAD = ["src", "assets", "package.json", "bun.lock", "README.md", "install.sh"]
 
 async function mktemp(prefix: string): Promise<string> {
   const dir = join(tmpdir(), `${prefix}-${process.pid}-${Date.now()}`)
@@ -83,6 +85,13 @@ async function smokeTest(tarball: string, version: string): Promise<void> {
       throw new Error(`smoke test failed: expected "${expected}", got "${out}"`)
     }
     console.log(`  ✓ launcher printed "${out}"`)
+
+    // `vsx update` resolves ../install.sh relative to src/main.tsx — a missing
+    // copy silently degrades every install to the hosted-fallback fetch.
+    if (!(await Bun.file(join(unpack, "install.sh")).exists())) {
+      throw new Error("smoke test failed: install.sh missing from the package root")
+    }
+    console.log("  ✓ install.sh shipped in the package root")
   } finally {
     await rm(unpack, { recursive: true, force: true })
   }

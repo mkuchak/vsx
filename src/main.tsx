@@ -14,28 +14,28 @@ if (isVersionRequested(process.argv)) {
   process.exit(0)
 }
 
-// `vsx update` re-runs the hosted installer (install.sh is not shipped inside
-// the release tarball, so we fetch the canonical copy). It is idempotent: it
-// no-ops when already on the latest release and otherwise installs the new
-// version and repoints the symlink. Runs after --version but BEFORE
-// resolveWorkspaceArg so `update` is not mistaken for a filesystem path, and
-// before any renderer/tree-sitter/worker setup to stay lightweight.
+// `vsx update` re-runs the installer, preferring the copy shipped inside this
+// very install (~/.vsx/<version>/install.sh; a source checkout has it at the
+// repo root): self-update must not depend on fetching a script from the repo's
+// main branch, whose URL and contents drift independently of the installed
+// version. The hosted copy remains only as a fallback for installs that
+// predate install.sh being packaged into the tarball. The installer is
+// idempotent: it no-ops when already on the latest release and otherwise
+// installs the new version and repoints the symlink. Runs after --version but
+// BEFORE resolveWorkspaceArg so `update` is not mistaken for a filesystem
+// path, and before any renderer/tree-sitter/worker setup to stay lightweight.
 if (isUpdateRequested(process.argv)) {
-  const proc = Bun.spawn(
-    [
-      "bash",
-      "-c",
-      "curl -fsSL https://raw.githubusercontent.com/mkuchak/vsx/main/install.sh | bash",
-    ],
-    { stdio: ["inherit", "inherit", "inherit"] },
-  )
+  const localInstaller = fileURLToPath(new URL("../install.sh", import.meta.url))
+  const cmd = (await Bun.file(localInstaller).exists())
+    ? ["bash", localInstaller]
+    : ["bash", "-c", "curl -fsSL https://raw.githubusercontent.com/mkuchak/vsx/main/install.sh | bash"]
+  const proc = Bun.spawn(cmd, { stdio: ["inherit", "inherit", "inherit"] })
   const code = await proc.exited
-  if (code === 0) {
-    console.log("vsx: update complete — restart vsx for the new version to take effect.")
-  } else {
-    console.error(
-      "vsx: update failed — check your network, and note the vsx repo must be public (or a GH token configured) for self-update.",
-    )
+  // No success line here: the installer already said what happened ("already
+  // installed and up to date" or "vsx <version> installed" + restart hint),
+  // and a blanket "update complete" would contradict the no-op case.
+  if (code !== 0) {
+    console.error("vsx: update failed — see the installer's message above for the reason.")
   }
   process.exit(code)
 }

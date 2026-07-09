@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REPO="mkuchak/vsx"
-API_LATEST="https://api.github.com/repos/${REPO}/releases/latest"
+RELEASES_LATEST="https://github.com/${REPO}/releases/latest"
 VSX_HOME="${HOME}/.vsx"
 VSX_INSTALL_DIR="${VSX_INSTALL_DIR:-${HOME}/.local/bin}"
 
@@ -62,12 +62,15 @@ detect_platform() {
   printf '%s-%s\n' "$os" "$arch"
 }
 
-# Extract `tag_name` from a GitHub release JSON payload on stdin, without jq
-# (jq may be absent on the target). Echoes e.g. `v0.1.0`.
-parse_latest_tag() {
-  grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
-    | head -n 1 \
-    | sed 's/.*"\([^"]*\)"[[:space:]]*$/\1/'
+# Extract the tag from the URL github.com redirects /releases/latest to
+# (https://github.com/<repo>/releases/tag/<tag> → <tag>). Echoes nothing when
+# the URL is not a tag URL — e.g. an un-redirected /releases/latest on a repo
+# with no published releases. Assumes vsx-style tags (vX.Y.Z — no "/" or
+# URL-encoded characters in the tag).
+parse_tag_from_release_url() {
+  case "$1" in
+    */releases/tag/?*) printf '%s\n' "${1##*/}" ;;
+  esac
 }
 
 # Strip a leading `v` from a release tag → the bare semver used in the artifact
@@ -141,38 +144,56 @@ download() {
   fi
 }
 
-# curl-or-wget a URL to stdout (for the GitHub API).
-fetch() {
+# HEAD-request a URL following redirects; echo "<http_code> <final_url>".
+# Returns non-zero only on a transport-level failure — HTTP error statuses are
+# DATA here (resolve_tag branches on them). Branching on status codes instead
+# of curl exit codes also sidesteps a curl quirk: over HTTP/2, `--fail` reports
+# an HTTP 4xx as exit 56 (CURLE_RECV_ERROR) rather than 22, so exit-code
+# branching misclassifies server answers as network failures.
+probe_redirect() {
   local url="$1"
   if command -v curl >/dev/null 2>&1; then
-    curl --retry 2 -fsSL "$url"
+    curl --retry 2 -sSLI -o /dev/null -w '%{http_code} %{url_effective}' "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- "$url"
+    # wget has no %{url_effective}: --spider -S prints each hop's headers on
+    # stderr; the last HTTP status line is the final answer and the last
+    # Location header is the final URL (absent when nothing redirected).
+    local out code final
+    out="$(wget --spider -S "$url" 2>&1)" || true
+    code="$(printf '%s\n' "$out" | awk '/^ *HTTP\// { c = $2 } END { print c }')"
+    final="$(printf '%s\n' "$out" | awk '/^ *Location: / { l = $2 } END { print l }')"
+    [ -n "$code" ] || return 1
+    printf '%s %s' "$code" "${final:-$url}"
   else
-    die "need curl or wget to reach the GitHub API."
+    die "need curl or wget to reach GitHub."
   fi
 }
 
-# Resolve the tag to install: VSX_VERSION override, else the latest release.
+# Resolve the tag to install: VSX_VERSION override, else whatever tag
+# github.com's /releases/latest page redirects to. That redirect is served by
+# the website, NOT api.github.com — the API's unauthenticated quota (60
+# requests/hour, shared by every tool behind the caller's public IP) made this
+# exact lookup 403 in the field. The website endpoint has no such budget, needs
+# no token, and still fails loud and clear (404) when the repo has no releases
+# or moved.
 resolve_tag() {
   if [ -n "${VSX_VERSION:-}" ]; then
     printf '%s\n' "$VSX_VERSION"
     return
   fi
-  local raw fetch_status tag
-  # Not a `fetch ... | parse_latest_tag` pipeline: capturing fetch's own exit
-  # status separately (curl's 22 / wget's 8 both mean "server error", e.g. a
-  # 404) lets the private-repo/no-releases-yet case get its own message instead
-  # of the generic network-failure one.
-  raw="$(fetch "$API_LATEST")" && fetch_status=0 || fetch_status=$?
-  if [ "$fetch_status" -ne 0 ]; then
-    if [ "$fetch_status" -eq 22 ] || [ "$fetch_status" -eq 8 ]; then
-      die "could not determine the latest release tag (is the repo public yet?)."
-    fi
-    die "could not reach the GitHub API to find the latest release."
+  local probe code final tag
+  probe="$(probe_redirect "$RELEASES_LATEST")" \
+    || die "could not reach github.com to resolve the latest release — check your network."
+  code="${probe%% *}"
+  final="${probe#* }"
+  if [ "$code" = "404" ]; then
+    die "no release found at ${RELEASES_LATEST} (no releases published yet, or the repo moved)."
   fi
-  tag="$(printf '%s' "$raw" | parse_latest_tag)"
-  [ -n "$tag" ] || die "could not determine the latest release tag (is the repo public yet?)."
+  if [ "$code" != "200" ]; then
+    die "github.com answered HTTP ${code} while resolving the latest release — try again shortly."
+  fi
+  tag="$(parse_tag_from_release_url "$final")"
+  [ -n "$tag" ] || die "could not parse a release tag from ${final}."
   printf '%s\n' "$tag"
 }
 
@@ -284,6 +305,7 @@ main() {
   info "location: ${target}"
   info "launcher: ${VSX_INSTALL_DIR}/vsx"
   info "update:   re-run the install command any time to get the newest release."
+  info "restart any running vsx to pick up the new version."
 
   case ":${PATH}:" in
     *":${VSX_INSTALL_DIR}:"*) : ;;

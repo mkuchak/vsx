@@ -1,12 +1,18 @@
-import { type ScrollBoxRenderable } from "@opentui/core"
-import { useKeyboard } from "@opentui/react"
+import {
+  type MouseEvent as CoreMouseEvent,
+  type ScrollBarRenderable,
+  type ScrollBoxRenderable,
+} from "@opentui/core"
+import { useKeyboard, useRenderer } from "@opentui/react"
 import { createTwoFilesPatch, parsePatch } from "diff"
 import { relative } from "node:path"
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { detectLanguage, documentRegistry } from "../model/documents"
 import type { CommitDiffTab, DiffTab } from "../model/workbench"
 import { GitService } from "../services/git"
 import "./IntralineDiffRenderable"
+import type { IntralineDiffRenderable } from "./IntralineDiffRenderable"
+import "./ThinHScrollBar"
 import { getSharedSyntaxStyle, theme } from "../theme"
 import { useOverlay, useOverlayFocusRestore } from "../workbench/OverlayProvider"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
@@ -50,6 +56,9 @@ export function pickHunkTarget(
  */
 export const FULL_CONTEXT_MAX_LINES = 5000
 
+/** Columns a single Left/Right keypress scrolls the diff's code panes horizontally. */
+const HORIZONTAL_SCROLL_STEP = 4
+
 /** Line count as a trailing-newline-terminated file reports it (no phantom last line). */
 function lineCount(text: string): number {
   if (text === "") return 0
@@ -83,8 +92,9 @@ export function buildDiffPatch(
  * single target and n/p stalls; we instead reproduce @opentui/core's row layout
  * (buildUnifiedView / buildSplitView) to place a target at each change block.
  *
- * Assumes wrap is off (the `<diff>`'s default wrapMode), so logical lines map
- * 1:1 to visual rows and split-view change runs occupy max(removed, added) rows.
+ * Assumes wrap is off (DiffPane pins the `<diff>`'s wrapMode to "none"), so
+ * logical lines map 1:1 to visual rows and split-view change runs occupy
+ * max(removed, added) rows.
  */
 export function computeChangeBlockOffsets(patch: string, view: DiffView): number[] {
   const lines: string[] = []
@@ -235,6 +245,11 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
   const [view, setView] = useState<DiffView>(lastView)
   const [reloadVersion, setReloadVersion] = useState(0)
   const sbRef = useRef<ScrollBoxRenderable | null>(null)
+  const diffRef = useRef<IntralineDiffRenderable | null>(null)
+  const renderer = useRenderer()
+  const hBarLeftRef = useRef<ScrollBarRenderable | null>(null)
+  const hBarRightRef = useRef<ScrollBarRenderable | null>(null)
+  const hBarUnifiedRef = useRef<ScrollBarRenderable | null>(null)
   // The tab identity + content the currently-mounted `ready` view belongs to.
   // Read inside the async resolve to tell a first/identity-change load (show the
   // placeholder, surface errors) apart from a background re-resolve (keep the
@@ -352,6 +367,80 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
     if (target !== null) sb.scrollTop = target
   }
 
+  const scrollHorizontal = (dir: 1 | -1) => {
+    const diff = diffRef.current
+    if (!diff) return
+    diff.scrollX = diff.scrollX + dir * HORIZONTAL_SCROLL_STEP
+  }
+
+  // A plain vertical wheel over a horizontal bar scrolls the content sideways —
+  // where users most expect the wheel to move the content (same remap as
+  // EditorPane's forwardScrollHorizontal).
+  const forwardScrollHorizontal = useCallback((event: CoreMouseEvent) => {
+    const diff = diffRef.current
+    if (!diff || !event.scroll) return
+    const { direction, delta } = event.scroll
+    if (direction === "up" || direction === "left") diff.scrollX -= delta
+    else diff.scrollX += delta
+  }, [])
+
+  // Keep the horizontal bars and the diff's per-side scroll in step. Same scheme as
+  // EditorPane's syncScrollbars: the code surfaces emit NO scroll event, so poll each
+  // rendered frame, and detect a user thumb drag as the bar's `scrollPosition`
+  // diverging from BOTH the live scrollX and the value we last wrote to the bar —
+  // but only while the bar is actually scrollable (when content fits, ScrollBar
+  // clamps scrollPosition to a negative `scrollSize - viewportSize`, which must
+  // never be mistaken for a drag).
+  const lastReflected = useRef({ left: -1, right: -1 })
+  const syncScrollbars = useCallback(() => {
+    const diff = diffRef.current
+    if (!diff) return
+    // Unified renders only the left code surface — a rightCodeRenderable left over
+    // from an earlier split build stays alive DETACHED with stale scroll state, so
+    // only ever consult the sides the current view actually shows.
+    const pairs =
+      view === "split"
+        ? ([
+            { bar: hBarLeftRef.current, side: "left" },
+            { bar: hBarRightRef.current, side: "right" },
+          ] as const)
+        : ([{ bar: hBarUnifiedRef.current, side: "left" }] as const)
+    for (const { bar, side } of pairs) {
+      if (!bar) continue
+      const state = diff.getHorizontalScrollState(side)
+      if (!state) continue
+      const scrollable = bar.scrollSize > bar.viewportSize
+      if (
+        scrollable &&
+        bar.scrollPosition !== state.scrollX &&
+        bar.scrollPosition !== lastReflected.current[side]
+      ) {
+        // A drag on either bar drives the shared offset through the aggregate
+        // setter (both sides self-clamp) — consistent with the mirrored scroll
+        // model keyboard/wheel scrolling uses.
+        diff.scrollX = bar.scrollPosition
+      }
+      // Re-read after a possible drag application so the mirror below reflects the
+      // post-clamp position, not the pre-drag snapshot.
+      const fresh = diff.getHorizontalScrollState(side)
+      if (!fresh) continue
+      if (bar.scrollSize !== fresh.scrollWidth) bar.scrollSize = fresh.scrollWidth
+      if (bar.viewportSize !== fresh.width) bar.viewportSize = fresh.width
+      if (bar.scrollPosition !== fresh.scrollX) bar.scrollPosition = fresh.scrollX
+      lastReflected.current[side] = fresh.scrollX
+    }
+  }, [view])
+
+  // Per-frame poll (see above). setFrameCallback is the renderer's sanctioned frame
+  // hook; the cleanup removes it so an unmounted pane leaves nothing behind.
+  useEffect(() => {
+    const frame = async () => {
+      syncScrollbars()
+    }
+    renderer.setFrameCallback(frame)
+    return () => renderer.removeFrameCallback(frame)
+  }, [renderer, syncScrollbars])
+
   useKeyboard((key) => {
     if (!focused || load.kind !== "ready") return
     // An overlay owns the keyboard; don't let bare-letter shortcuts fire under it.
@@ -362,6 +451,8 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
     if (key.name === "v") toggleView()
     else if (key.name === "n") jumpHunk(1)
     else if (key.name === "p") jumpHunk(-1)
+    else if (key.name === "left") scrollHorizontal(-1)
+    else if (key.name === "right") scrollHorizontal(1)
   })
 
   if (!tab || load.kind === "empty") {
@@ -411,29 +502,80 @@ export function DiffPane({ focused, height = "100%", groupId }: DiffPaneProps) {
         <text fg={theme.foreground}>{headerLabel}</text>
         <box flexGrow={1} />
         <text fg={theme.dimForeground}>
-          {view === "split" ? "Split" : "Unified"} · n/p change · v toggle
+          {view === "split" ? "Split" : "Unified"} · n/p change · ←/→ scroll · v toggle
         </text>
       </box>
       {hasChanges ? (
-        <scrollbox ref={sbRef} focused={focused} flexGrow={1}>
-          <intraline-diff
-            diff={patch}
-            view={view}
-            showLineNumbers
-            syncScroll
-            filetype={detectLanguage(tab.filePath)}
-            syntaxStyle={getSharedSyntaxStyle()}
-            addedBg={theme.diffAddedBackground}
-            removedBg={theme.diffRemovedBackground}
-            addedLineNumberBg={theme.diffAddedGutterBackground}
-            removedLineNumberBg={theme.diffRemovedGutterBackground}
-            addedSignColor={theme.diffAddedSign}
-            removedSignColor={theme.diffRemovedSign}
-            lineNumberFg={theme.diffLineNumberForeground}
-            addedEmphasisBg={theme.diffAddedEmphasisBackground}
-            removedEmphasisBg={theme.diffRemovedEmphasisBackground}
-          />
-        </scrollbox>
+        <>
+          <scrollbox ref={sbRef} focused={focused} flexGrow={1}>
+            <intraline-diff
+              ref={diffRef}
+              diff={patch}
+              view={view}
+              showLineNumbers
+              syncScroll
+              wrapMode="none"
+              filetype={detectLanguage(tab.filePath)}
+              syntaxStyle={getSharedSyntaxStyle()}
+              addedBg={theme.diffAddedBackground}
+              removedBg={theme.diffRemovedBackground}
+              addedLineNumberBg={theme.diffAddedGutterBackground}
+              removedLineNumberBg={theme.diffRemovedGutterBackground}
+              addedSignColor={theme.diffAddedSign}
+              removedSignColor={theme.diffRemovedSign}
+              lineNumberFg={theme.diffLineNumberForeground}
+              addedEmphasisBg={theme.diffAddedEmphasisBackground}
+              removedEmphasisBg={theme.diffRemovedEmphasisBackground}
+            />
+          </scrollbox>
+          {/* Horizontal bars, one per rendered code surface. Auto-hide comes from
+              ScrollBarRenderable itself (visible=false when scrollSize fits) and is
+              paint-only — the fixed 50% wrappers hold the layout so a hidden side
+              never shifts the other bar. */}
+          {view === "split" ? (
+            <box flexDirection="row" height={1} flexShrink={0}>
+              <box width="50%">
+                <thin-hscrollbar
+                  id="diff-hscrollbar-left"
+                  ref={hBarLeftRef}
+                  orientation="horizontal"
+                  height={1}
+                  onMouseScroll={forwardScrollHorizontal}
+                  trackOptions={{
+                    backgroundColor: theme.scrollbarTrack,
+                    foregroundColor: theme.scrollbarThumb,
+                  }}
+                />
+              </box>
+              <box width="50%">
+                <thin-hscrollbar
+                  id="diff-hscrollbar-right"
+                  ref={hBarRightRef}
+                  orientation="horizontal"
+                  height={1}
+                  onMouseScroll={forwardScrollHorizontal}
+                  trackOptions={{
+                    backgroundColor: theme.scrollbarTrack,
+                    foregroundColor: theme.scrollbarThumb,
+                  }}
+                />
+              </box>
+            </box>
+          ) : (
+            <thin-hscrollbar
+              id="diff-hscrollbar"
+              ref={hBarUnifiedRef}
+              orientation="horizontal"
+              height={1}
+              flexShrink={0}
+              onMouseScroll={forwardScrollHorizontal}
+              trackOptions={{
+                backgroundColor: theme.scrollbarTrack,
+                foregroundColor: theme.scrollbarThumb,
+              }}
+            />
+          )}
+        </>
       ) : (
         <box flexGrow={1} alignItems="center" justifyContent="center">
           <text fg={theme.dimForeground}>No changes</text>

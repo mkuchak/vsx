@@ -1,4 +1,4 @@
-import { RGBA, type CapturedFrame, type CapturedLine } from "@opentui/core"
+import { RGBA, type CapturedFrame, type CapturedLine, type ScrollBarRenderable } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 import { parsePatch } from "diff"
@@ -757,6 +757,294 @@ describe("DiffPane rendering + interaction", () => {
       expect(await pressAndRead("p")).toBe(offsets[0])
     })
   }
+})
+
+/** The DiffPane's diff renderable, for reading scrollX/maxScrollX after horizontal-scroll input. */
+function diffRenderable(): { scrollX: number; maxScrollX: number } {
+  const out: { scrollX: number; maxScrollX: number }[] = []
+  const walk = (node: { getChildren(): unknown[]; constructor: { name: string } }) => {
+    if (node.constructor.name === "IntralineDiffRenderable") out.push(node as never)
+    for (const child of node.getChildren()) walk(child as never)
+  }
+  walk(testSetup!.renderer.root as never)
+  if (out.length !== 1) throw new Error(`expected exactly one intraline-diff, found ${out.length}`)
+  return out[0]
+}
+
+describe("DiffPane horizontal scroll", () => {
+  async function renderOverflowingLine(char: string) {
+    const longLine = char.repeat(200)
+    await write("a.txt", "short\n")
+    await sh(["add", "a.txt"])
+    await sh(["commit", "-qm", "init"])
+    await write("a.txt", `${longLine}\n`)
+
+    workbenchStore.openDiff(join(root, "a.txt"), "unstaged", root, { preview: false })
+    await renderActiveDiff({ width: 40, height: 10 })
+    await waitForText(char.repeat(4))
+  }
+
+  /** Press a key and run enough flushes for the handler + re-render to settle. */
+  async function press(key: Parameters<NonNullable<typeof testSetup>["mockInput"]["pressKey"]>[0]) {
+    testSetup!.mockInput.pressKey(key)
+    for (let i = 0; i < 6; i++) await testSetup!.flush()
+  }
+
+  /** A horizontal scrollbar by its stable id, or null when the current view doesn't render it. */
+  function getBar(id: string): ScrollBarRenderable | null {
+    return (testSetup!.renderer.root.findDescendantById(id) as unknown as ScrollBarRenderable) ?? null
+  }
+
+  /**
+   * Bounded poll until the bar exists and `cond` holds, re-fetching each round (a
+   * view toggle remounts the bars, so a held reference can go stale). The bars are
+   * fed by DiffPane's per-frame sync, which only runs as flushes drive frames.
+   */
+  async function waitForBar(
+    id: string,
+    cond: (bar: ScrollBarRenderable) => boolean,
+    timeoutMs = 4000,
+  ): Promise<ScrollBarRenderable> {
+    const start = Date.now()
+    for (;;) {
+      const bar = getBar(id)
+      if (bar && cond(bar)) return bar
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`timed out waiting for scrollbar "${id}"\n${testSetup!.captureCharFrame()}`)
+      }
+      await testSetup!.flush()
+      await Bun.sleep(20)
+    }
+  }
+
+  for (const view of ["split", "unified"] as const) {
+    test(`a line wider than the viewport has scroll room (no-wrap, ${view})`, async () => {
+      await renderOverflowingLine("x")
+      await ensureView(view)
+      expect(diffRenderable().maxScrollX).toBeGreaterThan(0)
+    })
+
+    test(`Right/Left arrows scroll the diff horizontally and back (${view})`, async () => {
+      await renderOverflowingLine("y")
+      await ensureView(view)
+      const diff = diffRenderable()
+      expect(diff.scrollX).toBe(0)
+
+      testSetup!.mockInput.pressArrow("right")
+      for (let i = 0; i < 6; i++) await testSetup!.flush()
+      expect(diff.scrollX).toBeGreaterThan(0)
+
+      const afterRight = diff.scrollX
+      testSetup!.mockInput.pressArrow("left")
+      for (let i = 0; i < 6; i++) await testSetup!.flush()
+      expect(diff.scrollX).toBeLessThan(afterRight)
+    })
+  }
+
+  // Wheel coordinates are view-specific: code rows are content-sized to the diff's
+  // line count (not stretched to pane height), and the code column region differs
+  // between the split right pane and the unified single surface.
+  for (const [view, x, y] of [
+    ["split", 30, 1], // inside the right ("new") side's single content row
+    ["unified", 20, 2], // inside the "+zzz…" row (row y=1 is the "-short" row)
+  ] as const) {
+    test(`shift+wheel over the diff content scrolls horizontally (${view})`, async () => {
+      await renderOverflowingLine("z")
+      await ensureView(view)
+      const diff = diffRenderable()
+      expect(diff.scrollX).toBe(0)
+
+      for (let i = 0; i < 8; i++) {
+        await testSetup!.mockMouse.scroll(x, y, "down", { modifiers: { shift: true } })
+        await testSetup!.flush()
+      }
+      expect(diff.scrollX).toBeGreaterThan(0)
+    })
+  }
+
+  test("toggling the view resets horizontal scroll (no stale-offset teleport)", async () => {
+    await renderOverflowingLine("w")
+    await ensureView("split")
+    const diff = diffRenderable()
+
+    for (let i = 0; i < 5; i++) {
+      testSetup!.mockInput.pressArrow("right")
+      await testSetup!.flush()
+    }
+    for (let i = 0; i < 6; i++) await testSetup!.flush()
+    expect(diff.scrollX).toBeGreaterThan(0)
+
+    // Toggle to unified: the detached split-right side must not leak its offset —
+    // scroll restarts at 0 and a Left press stays clamped there (no teleport).
+    await press("v")
+    await waitForText("Unified")
+    expect(diff.scrollX).toBe(0)
+    testSetup!.mockInput.pressArrow("left")
+    for (let i = 0; i < 6; i++) await testSetup!.flush()
+    expect(diff.scrollX).toBe(0)
+
+    // And back to split: both sides restart in sync at 0, so the short "old" line
+    // is actually visible (a stale clamped-out offset would render it blank).
+    await press("v")
+    await waitForText("Split")
+    expect(diff.scrollX).toBe(0)
+    expect(testSetup!.captureCharFrame()).toContain("short")
+  })
+
+  test("plain (non-shift) wheel over the diff content still scrolls vertically, not horizontally", async () => {
+    const lines = Array.from({ length: 40 }, (_, i) => `line ${i}`)
+    await write("big.txt", lines.join("\n") + "\n")
+    await sh(["add", "big.txt"])
+    await sh(["commit", "-qm", "init"])
+    lines[2] = "CHANGED"
+    await write("big.txt", lines.join("\n") + "\n")
+
+    workbenchStore.openDiff(join(root, "big.txt"), "unstaged", root, { preview: false })
+    await renderActiveDiff({ width: 40, height: 8 })
+    await waitForText("CHANGED")
+    await ensureView("split")
+
+    const diff = diffRenderable()
+    const before = testSetup!.captureCharFrame()
+    for (let i = 0; i < 5; i++) {
+      await testSetup!.mockMouse.scroll(30, 3, "down")
+      await testSetup!.flush()
+    }
+    expect(testSetup!.captureCharFrame()).not.toBe(before) // vertical position moved
+    expect(diff.scrollX).toBe(0) // no shift held — stayed vertical-only
+  })
+
+  test("split view: the overflowing side's bar shows, the fitting side's auto-hides", async () => {
+    await renderOverflowingLine("x")
+    await ensureView("split")
+
+    // The 200-col line is the NEW content, i.e. the right side; the old side is
+    // just "short". Poll until the per-frame sync has sized the bars.
+    const right = await waitForBar("diff-hscrollbar-right", (b) => b.scrollSize > b.viewportSize)
+    expect(right.visible).toBe(true)
+
+    const left = getBar("diff-hscrollbar-left")!
+    expect(left.scrollSize).toBeLessThanOrEqual(left.viewportSize)
+    expect(left.visible).toBe(false)
+  })
+
+  test("unified view: a single full-width bar shows (split bars not rendered)", async () => {
+    await renderOverflowingLine("u")
+    await ensureView("unified")
+
+    const bar = await waitForBar("diff-hscrollbar", (b) => b.scrollSize > b.viewportSize)
+    expect(bar.visible).toBe(true)
+    expect(getBar("diff-hscrollbar-left")).toBeNull()
+    expect(getBar("diff-hscrollbar-right")).toBeNull()
+  })
+
+  test("a diff with no long lines keeps the bars auto-hidden", async () => {
+    const lines = Array.from({ length: 40 }, (_, i) => `line ${i}`)
+    await write("big.txt", lines.join("\n") + "\n")
+    await sh(["add", "big.txt"])
+    await sh(["commit", "-qm", "init"])
+    lines[2] = "CHANGED"
+    await write("big.txt", lines.join("\n") + "\n")
+
+    workbenchStore.openDiff(join(root, "big.txt"), "unstaged", root, { preview: false })
+    await renderActiveDiff({ width: 40, height: 8 })
+    await waitForText("CHANGED")
+    await ensureView("split")
+
+    // scrollSize > 0 proves the sync has fed the bar real content extents; the
+    // content fits both sides, so auto-hide must keep both bars paint-hidden.
+    const left = await waitForBar("diff-hscrollbar-left", (b) => b.scrollSize > 0)
+    expect(left.scrollSize).toBeLessThanOrEqual(left.viewportSize)
+    expect(left.visible).toBe(false)
+    const right = getBar("diff-hscrollbar-right")!
+    expect(right.scrollSize).toBeLessThanOrEqual(right.viewportSize)
+    expect(right.visible).toBe(false)
+  })
+
+  test("the bar thumb mirrors keyboard horizontal scrolling (split)", async () => {
+    await renderOverflowingLine("m")
+    await ensureView("split")
+    await waitForBar("diff-hscrollbar-right", (b) => b.scrollSize > b.viewportSize)
+
+    const diff = diffRenderable()
+    for (let i = 0; i < 3; i++) {
+      testSetup!.mockInput.pressArrow("right")
+      for (let j = 0; j < 6; j++) await testSetup!.flush()
+    }
+    expect(diff.scrollX).toBeGreaterThan(0)
+
+    const right = await waitForBar("diff-hscrollbar-right", (b) => b.scrollPosition === diff.scrollX)
+    expect(right.scrollPosition).toBe(diff.scrollX)
+    // The never-overflowing left side stays clamped at its own 0 (ScrollBar stores
+    // a non-positive position when content fits — never a scroll).
+    expect(getBar("diff-hscrollbar-left")!.scrollPosition).toBeLessThanOrEqual(0)
+  })
+
+  test("moving the bar thumb scrolls the diff (drag divergence applied by the frame sync)", async () => {
+    await renderOverflowingLine("d")
+    await ensureView("split")
+    const bar = await waitForBar("diff-hscrollbar-right", (b) => b.scrollSize > b.viewportSize)
+
+    const diff = diffRenderable()
+    expect(diff.scrollX).toBe(0)
+
+    // A real thumb drag lands in the bar as a scrollPosition change (the slider's
+    // onChange writes it back); setting it directly exercises the same divergence
+    // path the frame sync watches.
+    bar.scrollPosition = 10
+    const start = Date.now()
+    while (Date.now() - start < 3000 && diff.scrollX !== 10) {
+      await testSetup!.flush()
+      await Bun.sleep(20)
+    }
+    expect(diff.scrollX).toBe(10)
+  })
+
+  test("wheel over the bar scrolls the diff horizontally (unified)", async () => {
+    await renderOverflowingLine("h")
+    await ensureView("unified")
+    const bar = await waitForBar("diff-hscrollbar", (b) => b.scrollSize > b.viewportSize)
+
+    const diff = diffRenderable()
+    expect(diff.scrollX).toBe(0)
+
+    // Wheel-down over the bar's own cells (bar.x/y are absolute) → scroll right.
+    for (let i = 0; i < 4; i++) {
+      await testSetup!.mockMouse.scroll(bar.x + 5, bar.y, "down")
+      await testSetup!.flush()
+    }
+    expect(diff.scrollX).toBeGreaterThan(0)
+
+    const afterDown = diff.scrollX
+    for (let i = 0; i < 2; i++) {
+      await testSetup!.mockMouse.scroll(bar.x + 5, bar.y, "up")
+      await testSetup!.flush()
+    }
+    expect(diff.scrollX).toBeLessThan(afterDown)
+  })
+
+  test("toggling to unified after a split scroll re-syncs the bar to 0", async () => {
+    await renderOverflowingLine("t")
+    await ensureView("split")
+    await waitForBar("diff-hscrollbar-right", (b) => b.scrollSize > b.viewportSize)
+
+    for (let i = 0; i < 5; i++) {
+      testSetup!.mockInput.pressArrow("right")
+      await testSetup!.flush()
+    }
+    for (let i = 0; i < 6; i++) await testSetup!.flush()
+    expect(diffRenderable().scrollX).toBeGreaterThan(0)
+
+    await press("v")
+    await waitForText("Unified")
+    expect(diffRenderable().scrollX).toBe(0)
+    // The freshly-mounted unified bar syncs from the reset left side: position 0.
+    const bar = await waitForBar(
+      "diff-hscrollbar",
+      (b) => b.scrollSize > b.viewportSize && b.scrollPosition === 0,
+    )
+    expect(bar.scrollPosition).toBe(0)
+  })
 })
 
 describe("DiffPane intra-line emphasis", () => {

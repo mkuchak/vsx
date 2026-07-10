@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.7](https://github.com/mkuchak/vsx/compare/v0.3.6...v0.3.7) (2026-07-10)
+
+### Features
+
+* **scroll:** lock trackpad scroll gestures to their dominant axis ([8d3ff5e](https://github.com/mkuchak/vsx/commit/8d3ff5e047ba9447bf2abe9c5974e73e94fa4e0b))
+
 ## [0.3.6](https://github.com/mkuchak/vsx/compare/v0.3.5...v0.3.6) (2026-07-09)
 
 ### Bug Fixes

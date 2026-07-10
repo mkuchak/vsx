@@ -11,6 +11,7 @@ import {
 import { extend } from "@opentui/react"
 import type { StructuredPatch } from "diff"
 import { computeIntralineForHunk, type Range } from "./intralineDiff"
+import { admitScrollEvent } from "./scrollAxisLock"
 
 /**
  * `DiffRenderable.buildView` (and the `_parsedDiff`/`leftCodeRenderable`/
@@ -219,13 +220,20 @@ interface DiffRenderableInternals {
 
 /**
  * Replacement `handleScroll` for each side's `CodeRenderable`, patched in once per
- * instance (see {@link patchScrollBehavior}). Identical to the stock behavior
- * (`@opentui/core`'s `TextBufferRenderable.handleScroll`) except a Shift-held wheel
- * remaps up/down into left/right — the conventional "shift+wheel = horizontal scroll"
- * gesture, which the stock handler never recognizes (it only reacts to a genuine
- * native left/right wheel report, which real trackpads/mice rarely send). Horizontal
- * movement stays gated on `wrapMode === "none"` — the only mode where a line can be
- * wider than the viewport in the first place — matching the stock guard.
+ * instance (see {@link patchScrollBehavior}). Two deviations from the stock behavior
+ * (`@opentui/core`'s `TextBufferRenderable.handleScroll`):
+ * - A Shift-held wheel remaps up/down into left/right — the conventional
+ *   "shift+wheel = horizontal scroll" gesture, which the stock handler never
+ *   recognizes (it only reacts to a genuine native left/right wheel report).
+ * - Events run through the gesture axis lock ({@link admitScrollEvent}): terminals
+ *   interleave both axes during a trackpad swipe (with vertical often amplified by
+ *   terminal-side multipliers), so off-axis strays of the current gesture are
+ *   dropped — INCLUDING their bubble, or the outer scrollbox would still apply the
+ *   vertical strays of a horizontal swipe as page scrolling. Applied vertical
+ *   events must keep bubbling: the code surface is content-sized (its own scrollY
+ *   is a clamped no-op) and the outer scrollbox is what actually scrolls the page.
+ * Horizontal movement stays gated on `wrapMode === "none"` — the only mode where a
+ * line can be wider than the viewport in the first place — matching the stock guard.
  */
 function shiftAwareHandleScroll(this: CodeRenderableInternals, event: CoreMouseEvent): void {
   if (!event.scroll) return
@@ -233,6 +241,10 @@ function shiftAwareHandleScroll(this: CodeRenderableInternals, event: CoreMouseE
   const delta = event.scroll.delta
   if (event.modifiers.shift && (direction === "up" || direction === "down")) {
     direction = direction === "up" ? "left" : "right"
+  }
+  if (!admitScrollEvent(direction)) {
+    event.stopPropagation()
+    return
   }
   if (direction === "up") this.scrollY -= delta
   else if (direction === "down") this.scrollY += delta

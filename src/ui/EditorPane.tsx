@@ -34,6 +34,7 @@ import {
 import { useOverlay, useOverlayFocusRestore } from "../workbench/OverlayProvider"
 import { getLastRendererSelection } from "../workbench/rendererSelection"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
+import { admitScrollEvent } from "./scrollAxisLock"
 import "./ThinHScrollBar"
 
 /**
@@ -68,6 +69,11 @@ class EditorTextareaRenderable extends TextareaRenderable {
    * routes wheel up/down to left/right (the horizontal scrollbar's wheel); a Shift
    * modifier does the same anywhere (VSCode/browser convention). Horizontal scroll
    * stays gated on wrap "none" — the only mode the edit buffer scrolls horizontally.
+   *
+   * Events run through the gesture axis lock (see scrollAxisLock.ts): terminals
+   * interleave both axes during a trackpad swipe, so off-axis strays of the current
+   * gesture are dropped. The `forceHorizontal` path (wheel over the horizontal
+   * scrollbar) bypasses the lock — hovering that bar IS the axis-intent signal.
    */
   applyScroll(event: CoreMouseEvent, forceHorizontal = false): void {
     if (!event.scroll) return
@@ -76,6 +82,7 @@ class EditorTextareaRenderable extends TextareaRenderable {
     if ((forceHorizontal || event.modifiers.shift) && (direction === "up" || direction === "down")) {
       direction = direction === "up" ? "left" : "right"
     }
+    if (!forceHorizontal && !admitScrollEvent(direction)) return
     const view = this.editorView
     const viewport = view.getViewport()
     if (direction === "up") {

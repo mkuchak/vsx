@@ -22,6 +22,7 @@ import {
   resolveDiff,
   resolveDiffContent,
 } from "./DiffPane"
+import { resetScrollAxisLock } from "./scrollAxisLock"
 
 let root: string
 let git: GitService
@@ -67,6 +68,9 @@ function diffTab(rel: string, diffKind: "staged" | "unstaged", oldRel?: string):
 
 beforeEach(async () => {
   workbenchStore.reset()
+  // The wheel axis lock keys gestures off the real clock — a scroll burst at the
+  // end of one test must never count as "the same gesture" in the next.
+  resetScrollAxisLock()
   root = await mkdtemp(join(tmpdir(), "vsx-diff-"))
   await sh(["init", "-q", "-b", "main"])
   await sh(["config", "user.email", "a@b.com"])
@@ -912,6 +916,61 @@ describe("DiffPane horizontal scroll", () => {
     }
     expect(testSetup!.captureCharFrame()).not.toBe(before) // vertical position moved
     expect(diff.scrollX).toBe(0) // no shift held — stayed vertical-only
+  })
+
+  /**
+   * Fixture with BOTH axes scrollable: 40 lines (vertical overflow in an 8-row
+   * pane) where one changed line is 200 cols wide (horizontal overflow). Used by
+   * the axis-lock tests, which need each axis observable independently.
+   */
+  async function renderBothAxesOverflowing() {
+    const lines = Array.from({ length: 40 }, (_, i) => `line ${i}`)
+    await write("big.txt", lines.join("\n") + "\n")
+    await sh(["add", "big.txt"])
+    await sh(["commit", "-qm", "init"])
+    lines[2] = "CHANGED_" + "x".repeat(200)
+    await write("big.txt", lines.join("\n") + "\n")
+
+    workbenchStore.openDiff(join(root, "big.txt"), "unstaged", root, { preview: false })
+    await renderActiveDiff({ width: 40, height: 8 })
+    await waitForText("CHANGED_")
+    await ensureView("split")
+  }
+
+  test("axis lock: a horizontal gesture's vertical strays neither scroll the page nor leak", async () => {
+    await renderBothAxesOverflowing()
+    const diff = diffRenderable()
+    resetScrollAxisLock() // ensureView's wheel-free key events don't scroll, but be explicit
+    const before = testSetup!.captureCharFrame()
+
+    // A deliberate horizontal swipe as Ghostty delivers it: leading with the
+    // intended axis, with amplified vertical strays interleaved (real capture
+    // pattern: left, down, left, down, down, left, … — mirrored here to "right"
+    // so the movement is observable from the scrollX=0 start).
+    const burst = ["right", "down", "right", "down", "right", "down", "right"] as const
+    for (const dir of burst) {
+      await testSetup!.mockMouse.scroll(30, 3, dir)
+      await testSetup!.flush()
+    }
+    expect(diff.scrollX).toBeGreaterThan(0) // horizontal applied
+    expect(testSetup!.captureCharFrame().includes("line 0")).toBe(
+      before.includes("line 0"),
+    ) // vertical strays suppressed — the page did not scroll
+  })
+
+  test("axis lock: a vertical gesture's horizontal strays don't shift the diff sideways", async () => {
+    await renderBothAxesOverflowing()
+    const diff = diffRenderable()
+    resetScrollAxisLock()
+    const before = testSetup!.captureCharFrame()
+
+    const burst = ["down", "left", "down", "left", "down", "down"] as const
+    for (const dir of burst) {
+      await testSetup!.mockMouse.scroll(30, 3, dir)
+      await testSetup!.flush()
+    }
+    expect(testSetup!.captureCharFrame()).not.toBe(before) // vertical applied
+    expect(diff.scrollX).toBe(0) // horizontal strays suppressed
   })
 
   test("split view: the overflowing side's bar shows, the fitting side's auto-hides", async () => {

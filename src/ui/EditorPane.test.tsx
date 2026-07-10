@@ -21,6 +21,7 @@ import { handleRendererSelection } from "../workbench/rendererSelection"
 import { FIND_CURRENT_REF, FIND_MATCH_REF, getEditorControls } from "../workbench/editorControls"
 import type { CommandRegistry } from "../services/commands"
 import { EditorPane } from "./EditorPane"
+import { resetScrollAxisLock } from "./scrollAxisLock"
 
 let testSetup: Awaited<ReturnType<typeof testRender>>
 let dir: string
@@ -170,6 +171,9 @@ function CaptureRegistry() {
 
 beforeEach(async () => {
   workbenchStore.reset()
+  // The wheel axis lock keys gestures off the real clock — a scroll burst at the
+  // end of one test must never count as "the same gesture" in the next.
+  resetScrollAxisLock()
   registry = null
   setFocusedPane = null
   dir = await mkdtemp(join(tmpdir(), "vsx-editorpane-"))
@@ -2142,6 +2146,22 @@ test("wheel routing: shift+wheel over the text scrolls horizontally", async () =
   expect(ta.editorView.getViewport().offsetX).toBeGreaterThan(0)
   // Vertical position is untouched — shift routed the wheel to the horizontal axis.
   expect(ta.editorView.getViewport().offsetY).toBe(0)
+})
+
+test("wheel routing: axis lock keeps a horizontal gesture's vertical strays out of the viewport", async () => {
+  const ta = await renderWideTall()
+  resetScrollAxisLock()
+  expect(ta.editorView.getViewport().offsetX).toBe(0)
+  expect(ta.editorView.getViewport().offsetY).toBe(0)
+
+  // A horizontal-intent trackpad swipe as terminals deliver it: native left
+  // events with amplified vertical strays interleaved (see scrollAxisLock.ts).
+  for (const dir of ["right", "down", "right", "down", "right", "down"] as const) {
+    await testSetup.mockMouse.scroll(ta.x + 5, ta.y + 3, dir)
+    await testSetup.flush()
+  }
+  expect(ta.editorView.getViewport().offsetX).toBeGreaterThan(0)
+  expect(ta.editorView.getViewport().offsetY).toBe(0) // strays suppressed
 })
 
 /**

@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.8](https://github.com/mkuchak/vsx/compare/v0.3.7...v0.3.8) (2026-07-11)
+
+### Features
+
+* **workbench:** share repo discovery and rebuild document reload watcher ([fd37a37](https://github.com/mkuchak/vsx/commit/fd37a375dd78a5e27b915526879b957e4efcf4d9))
+
+### Bug Fixes
+
+* **repos:** drop recursive worktree watch for a visibility-gated poll ([b370e90](https://github.com/mkuchak/vsx/commit/b370e90c4bd3d7d85c969fa340af533b56b5e6f8))
+* **workspace:** replace recursive fs.watch with per-directory watching ([7f1c6af](https://github.com/mkuchak/vsx/commit/7f1c6af51464fe32c0ed564428091a8298ce2082))
+
 ## [0.3.7](https://github.com/mkuchak/vsx/compare/v0.3.6...v0.3.7) (2026-07-10)
 
 ### Features

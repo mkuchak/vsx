@@ -1,6 +1,6 @@
 import { readdir, stat } from "node:fs/promises"
 import { watch as fsWatch } from "node:fs"
-import { join, relative, sep } from "node:path"
+import { join, relative } from "node:path"
 
 export type DirEntry = {
   name: string
@@ -20,9 +20,16 @@ export type FileChange = {
   path: string
 }
 
-export type WatchDisposer = () => void
-
 const MAX_FILES = 50_000
+// Wall-clock budget for the non-git fallback walk. vsx can be rooted at a huge
+// tree (e.g. `vsx ~/.bashrc` roots at $HOME — 400k+ dirs); without a budget the
+// DFS keeps descending until it hits MAX_FILES, walking hundreds of thousands of
+// directories (sluggish for tens of seconds, hammering IO). The walk is async
+// and non-blocking (it awaits readdir per directory, yielding to the event loop),
+// so this budget is NOT about protecting the event loop — it caps time/IO spent
+// enumerating an unbounded root so Quick Open and search degrade to a partial
+// listing instead of grinding.
+export const ENUMERATE_WALK_BUDGET_MS = 2000
 const WATCH_DEBOUNCE_MS = 100
 const ALWAYS_SKIP = new Set(["node_modules", ".git", "dist", "coverage"])
 
@@ -88,12 +95,23 @@ async function enumerateWithGit(root: string): Promise<EnumerateResult> {
   return { files, truncated }
 }
 
-async function enumerateWithWalk(root: string): Promise<EnumerateResult> {
+async function enumerateWithWalk(
+  root: string,
+  budgetMs: number,
+): Promise<EnumerateResult> {
   const files: string[] = []
   let truncated = false
+  const deadline = Date.now() + budgetMs
 
   const walk = async (dir: string): Promise<void> => {
     if (truncated) return
+    // Either limit alone truncates: the wall-clock deadline (see
+    // ENUMERATE_WALK_BUDGET_MS — bounds an unbounded root) OR the file cap.
+    // Checked per directory, so an enormous tree stops descending promptly.
+    if (Date.now() >= deadline) {
+      truncated = true
+      return
+    }
     let dirents
     try {
       dirents = await readdir(dir, { withFileTypes: true })
@@ -119,7 +137,12 @@ async function enumerateWithWalk(root: string): Promise<EnumerateResult> {
   return { files, truncated }
 }
 
-export async function enumerateFiles(root: string): Promise<EnumerateResult> {
+export async function enumerateFiles(
+  root: string,
+  // Injectable so tests can force truncation with a tiny (0ms) budget without
+  // building a 400k-dir fixture.
+  opts: { walkBudgetMs?: number } = {},
+): Promise<EnumerateResult> {
   if (await isGitRepo(root)) {
     try {
       return await enumerateWithGit(root)
@@ -127,15 +150,15 @@ export async function enumerateFiles(root: string): Promise<EnumerateResult> {
       // fall through to manual walk
     }
   }
-  return enumerateWithWalk(root)
+  return enumerateWithWalk(root, opts.walkBudgetMs ?? ENUMERATE_WALK_BUDGET_MS)
 }
 
-export function watch(
-  root: string,
-  cb: (changes: FileChange[]) => void,
-): WatchDisposer {
+// Shared debounce + create/changed/deleted classification for all watchers.
+// `record` takes an absolute path: fs.watch (non-recursive) emits basenames, so
+// each caller joins the event name against its watched dir before feeding it here.
+function createChangeCollector(cb: (changes: FileChange[]) => void) {
   const pending = new Map<string, FileChangeType>()
-  // Paths the watcher has observed to exist. macOS coalesces content edits
+  // Paths the collector has observed to exist. macOS coalesces content edits
   // into `rename` events, so the raw event type can't distinguish created
   // from changed; membership in this set does.
   const known = new Set<string>()
@@ -157,8 +180,7 @@ export function watch(
     timer = setTimeout(flush, WATCH_DEBOUNCE_MS)
   }
 
-  const record = async (filename: string) => {
-    const abs = join(root, filename)
+  const record = async (abs: string) => {
     let exists = false
     try {
       const st = await stat(abs)
@@ -182,24 +204,68 @@ export function watch(
     schedule()
   }
 
-  const watcher = fsWatch(
-    root,
-    { recursive: true },
-    (_event, filename) => {
-      if (filename == null) return
-      const name = filename.toString()
-      const top = name.split(sep)[0]
-      if (top && ALWAYS_SKIP.has(top)) return
-      void record(name)
-    },
-  )
-
-  return () => {
+  const dispose = () => {
     if (timer) {
       clearTimeout(timer)
       timer = undefined
     }
     pending.clear()
+  }
+
+  return { record, dispose }
+}
+
+export type DirWatcher = {
+  add(dir: string): void
+  remove(dir: string): void
+  dispose(): void
+}
+
+// Non-recursive per-directory watch manager. Each `add` registers exactly one
+// `fs.watch(dir)` WITHOUT `recursive: true`, which is load-bearing: under Bun on
+// Linux `fs.watch(root, { recursive: true })` synchronously walks the entire
+// subtree on the event-loop thread (tens of seconds on a home dir) and registers
+// one inotify watch per directory, silently no-op'ing once max_user_watches is
+// exhausted. Watching only the dirs the app cares about avoids all of that.
+export function createDirWatcher(
+  cb: (changes: FileChange[]) => void,
+): DirWatcher {
+  const collector = createChangeCollector(cb)
+  const watchers = new Map<string, ReturnType<typeof fsWatch>>()
+
+  const remove = (dir: string) => {
+    const watcher = watchers.get(dir)
+    if (!watcher) return
+    watchers.delete(dir)
     watcher.close()
   }
+
+  const add = (dir: string) => {
+    if (watchers.has(dir)) return
+    let watcher: ReturnType<typeof fsWatch>
+    try {
+      watcher = fsWatch(dir, (_event, filename) => {
+        if (filename == null) return
+        const name = filename.toString()
+        if (ALWAYS_SKIP.has(name)) return
+        void collector.record(join(dir, name))
+      })
+    } catch {
+      // Best-effort: an unwatchable dir (ENOENT/EACCES throws synchronously)
+      // is skipped rather than surfaced. See repos.ts's watcher philosophy.
+      return
+    }
+    // A vanished watched dir surfaces as an 'error' event, which is fatal if
+    // unhandled. Auto-remove silently so it can never crash the process.
+    watcher.on("error", () => remove(dir))
+    watchers.set(dir, watcher)
+  }
+
+  const dispose = () => {
+    for (const watcher of watchers.values()) watcher.close()
+    watchers.clear()
+    collector.dispose()
+  }
+
+  return { add, remove, dispose }
 }

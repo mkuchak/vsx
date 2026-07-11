@@ -3,10 +3,10 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
+  createDirWatcher,
   detectLanguage,
   enumerateFiles,
   listDir,
-  watch,
   type FileChange,
 } from "./workspace"
 
@@ -108,58 +108,201 @@ describe("enumerateFiles", () => {
       expect(files.some((f) => f.startsWith(skip))).toBe(false)
     }
   })
+
+  test("a generous budget returns a complete, non-truncated listing", async () => {
+    for (let i = 0; i < 20; i++) await writeFile(join(root, `f${i}.txt`), "x")
+
+    const { files, truncated } = await enumerateFiles(root, { walkBudgetMs: 60_000 })
+    expect(truncated).toBe(false)
+    expect(files.length).toBe(20)
+  })
+
+  test("an exhausted time budget truncates the walk (partial list)", async () => {
+    // A tree deep/wide enough that a 0ms budget trips before it finishes: the
+    // per-directory deadline check aborts descent, so the result is partial.
+    for (let d = 0; d < 5; d++) {
+      const sub = join(root, `dir${d}`)
+      await mkdir(sub)
+      for (let i = 0; i < 5; i++) await writeFile(join(sub, `f${i}.txt`), "x")
+    }
+
+    const { files, truncated } = await enumerateFiles(root, { walkBudgetMs: 0 })
+    expect(truncated).toBe(true)
+    // Partial: the deadline aborts before the whole 25-file tree is enumerated.
+    expect(files.length).toBeLessThan(25)
+  })
 })
 
-describe("watch", () => {
-  test("emits created, changed and deleted (debounced)", async () => {
-    const batches: FileChange[][] = []
-    const dispose = watch(root, (changes) => batches.push(changes))
-    const target = join(root, "a.txt")
-    const typesSeen = () =>
-      batches.flat().filter((c) => c.path === target).map((c) => c.type)
-    // Bounded poll instead of fixed sleeps: FSEvents delivery latency varies
-    // wildly under full-suite load (this test flaked at 500ms/step). The event
-    // may take several seconds to arrive, so the deadline is generous; the poll
-    // still returns the instant the event lands, so the happy path stays fast.
-    const waitFor = async (type: FileChange["type"], reTouch?: () => Promise<void>) => {
+describe("createDirWatcher", () => {
+  // Bounded poll: fs.watch delivery latency varies wildly under full-suite load,
+  // so poll until the change lands or the generous deadline passes.
+  const waitFor = (
+    batches: FileChange[][],
+    path: string,
+    type: FileChange["type"],
+    reTouch?: () => Promise<void>,
+  ) => {
+    const seen = () =>
+      batches.flat().some((c) => c.path === path && c.type === type)
+    return (async () => {
       const deadline = Date.now() + 6000
-      while (!typesSeen().includes(type) && Date.now() < deadline) {
-        // Under heavy load FSEvents coalesces the first modify into the create's
-        // delivery, so a lone write may never surface as its own event. Re-touch
-        // each poll: once the create is known, any later event maps to "changed".
+      while (!seen() && Date.now() < deadline) {
         if (reTouch) await reTouch()
         await Bun.sleep(100)
       }
-    }
+      return seen()
+    })()
+  }
 
-    await writeFile(target, "hello")
-    await waitFor("created")
+  test("classifies created, changed and deleted per watched dir", async () => {
+    const a = join(root, "a")
+    const b = join(root, "b")
+    await mkdir(a)
+    await mkdir(b)
+
+    const batches: FileChange[][] = []
+    const dw = createDirWatcher((changes) => batches.push(changes))
+    dw.add(a)
+    dw.add(b)
+
+    const fileA = join(a, "one.txt")
+    const fileB = join(b, "two.txt")
+
+    await writeFile(fileA, "hello")
+    await writeFile(fileB, "world")
+    expect(await waitFor(batches, fileA, "created")).toBe(true)
+    expect(await waitFor(batches, fileB, "created")).toBe(true)
 
     let n = 0
-    await waitFor("changed", () => writeFile(target, `hello world ${n++}`))
+    expect(
+      await waitFor(batches, fileA, "changed", () =>
+        writeFile(fileA, `hello ${n++}`),
+      ),
+    ).toBe(true)
 
-    await rm(target)
-    await waitFor("deleted")
+    await rm(fileA)
+    expect(await waitFor(batches, fileA, "deleted")).toBe(true)
 
-    dispose()
-
-    const types = typesSeen()
-    expect(types).toContain("created")
-    expect(types).toContain("changed")
-    expect(types).toContain("deleted")
-    // Three sequential bounded polls can legitimately wait up to 3×6000ms under
-    // FSEvents latency, exceeding bun:test's default 5s per-test timeout. Give
-    // the poll budget explicit headroom so the test fails only on a real miss.
+    dw.dispose()
   }, 20000)
 
-  test("disposer stops emitting", async () => {
+  test("is non-recursive: events from unwatched child/sibling dirs do not fire", async () => {
+    const watched = join(root, "watched")
+    const child = join(watched, "child")
+    const sibling = join(root, "sibling")
+    await mkdir(watched)
+    await mkdir(child)
+    await mkdir(sibling)
+
     const batches: FileChange[][] = []
-    const dispose = watch(root, (changes) => batches.push(changes))
-    dispose()
+    const dw = createDirWatcher((changes) => batches.push(changes))
+    dw.add(watched)
 
-    await writeFile(join(root, "b.txt"), "x")
-    await Bun.sleep(200)
+    // A direct child file must be observed, proving the watcher is live.
+    const direct = join(watched, "direct.txt")
+    await writeFile(direct, "x")
+    expect(await waitFor(batches, direct, "created")).toBe(true)
 
-    expect(batches.flat().some((c) => c.path === join(root, "b.txt"))).toBe(false)
+    // Writes below the watched dir (nested) and beside it (sibling) must not.
+    const nested = join(child, "deep.txt")
+    const beside = join(sibling, "beside.txt")
+    await writeFile(nested, "x")
+    await writeFile(beside, "x")
+    await Bun.sleep(300)
+
+    const paths = batches.flat().map((c) => c.path)
+    expect(paths).not.toContain(nested)
+    expect(paths).not.toContain(beside)
+
+    dw.dispose()
+  }, 20000)
+
+  test("add is idempotent", async () => {
+    const dir = join(root, "dir")
+    await mkdir(dir)
+
+    const batches: FileChange[][] = []
+    const dw = createDirWatcher((changes) => batches.push(changes))
+    dw.add(dir)
+    dw.add(dir)
+    dw.add(dir)
+
+    const file = join(dir, "f.txt")
+    await writeFile(file, "x")
+    expect(await waitFor(batches, file, "created")).toBe(true)
+
+    // A duplicate add must not register a second watcher (no doubled events).
+    const created = batches
+      .flat()
+      .filter((c) => c.path === file && c.type === "created")
+    expect(created.length).toBe(1)
+
+    dw.dispose()
+  }, 20000)
+
+  test("remove stops events for that dir", async () => {
+    const dir = join(root, "dir")
+    await mkdir(dir)
+
+    const batches: FileChange[][] = []
+    const dw = createDirWatcher((changes) => batches.push(changes))
+    dw.add(dir)
+    dw.remove(dir)
+
+    await writeFile(join(dir, "f.txt"), "x")
+    await Bun.sleep(300)
+
+    expect(batches.flat().some((c) => c.path === join(dir, "f.txt"))).toBe(false)
+
+    dw.remove(dir) // no-op on an unwatched dir
+    dw.dispose()
+  })
+
+  test("dispose closes all watchers", async () => {
+    const a = join(root, "a")
+    const b = join(root, "b")
+    await mkdir(a)
+    await mkdir(b)
+
+    const batches: FileChange[][] = []
+    const dw = createDirWatcher((changes) => batches.push(changes))
+    dw.add(a)
+    dw.add(b)
+    dw.dispose()
+
+    await writeFile(join(a, "f.txt"), "x")
+    await writeFile(join(b, "g.txt"), "x")
+    await Bun.sleep(300)
+
+    expect(batches.flat().length).toBe(0)
+  })
+
+  test("deleting a watched dir does not crash", async () => {
+    const dir = join(root, "gone")
+    await mkdir(dir)
+
+    const batches: FileChange[][] = []
+    const dw = createDirWatcher((changes) => batches.push(changes))
+    dw.add(dir)
+
+    await rm(dir, { recursive: true, force: true })
+    // Give the FSWatcher's error/close path time to fire and auto-remove.
+    await Bun.sleep(300)
+
+    // Still usable afterwards.
+    const other = join(root, "other")
+    await mkdir(other)
+    dw.add(other)
+    const file = join(other, "f.txt")
+    await writeFile(file, "x")
+    expect(await waitFor(batches, file, "created")).toBe(true)
+
+    dw.dispose()
+  }, 20000)
+
+  test("add on a nonexistent dir does not throw", () => {
+    const dw = createDirWatcher(() => {})
+    expect(() => dw.add(join(root, "does-not-exist"))).not.toThrow()
+    dw.dispose()
   })
 })

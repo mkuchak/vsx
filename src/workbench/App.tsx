@@ -7,7 +7,7 @@ import { withMacSuper } from "../services/commands"
 import { createFileHistory, type FileHistory } from "../services/fileHistory"
 import { KeyInspector } from "../services/keyInspector"
 import { getLastRendererSelection, handleRendererSelection } from "./rendererSelection"
-import { activeRepoFor, discoverRepositories, type RepoInfo } from "../services/repos"
+import { activeRepoFor } from "../services/repos"
 import { theme } from "../theme"
 import { CommandsProvider, useCommands } from "./CommandsProvider"
 import { startDocumentRetainer } from "./documentRetainer"
@@ -16,7 +16,8 @@ import { OverlayProvider, useOverlay } from "./OverlayProvider"
 import { getEditorControls } from "./editorControls"
 import { useWorkbenchStore } from "./useWorkbenchStore"
 import { clampSidebarWidth, DEFAULT_SIDEBAR_WIDTH } from "./sidebarWidth"
-import { WatchersProvider } from "./watchers"
+import { ReposProvider, useRepos } from "./ReposProvider"
+import { WatchersProvider, useWorkbenchWatchers } from "./watchers"
 import { CommitLog } from "../ui/CommitLog"
 import { EditorGroups } from "../ui/EditorGroups"
 import type { CursorPosition } from "../ui/EditorPane"
@@ -45,9 +46,11 @@ export function App({
   return (
     <CommandsProvider>
       <OverlayProvider>
-        <WatchersProvider workspaceRoot={workspaceRoot}>
-          <Workbench workspaceRoot={workspaceRoot} initialFile={initialFile} />
-        </WatchersProvider>
+        <ReposProvider workspaceRoot={workspaceRoot}>
+          <WatchersProvider workspaceRoot={workspaceRoot}>
+            <Workbench workspaceRoot={workspaceRoot} initialFile={initialFile} />
+          </WatchersProvider>
+        </ReposProvider>
       </OverlayProvider>
     </CommandsProvider>
   )
@@ -75,6 +78,7 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
   const { isOverlayOpen } = useOverlay()
   const { width: termWidth } = useTerminalDimensions()
   const workbench = useWorkbenchStore()
+  const watchers = useWorkbenchWatchers()
 
   // Only file tabs have a cursor: diff/commitDiff panes don't, so the status bar
   // must not keep showing the last file's Ln/Col over them. Gate here rather than
@@ -89,13 +93,23 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
   // re-renders on every store change via the useWorkbenchStore subscription above.
   const focusArea = workbench.focusArea
   const [cursor, setCursor] = useState<CursorPosition | null>(null)
-  const [repos, setRepos] = useState<RepoInfo[]>([])
+  // Shared with every SCM panel via ReposProvider — one discovery pass, not five.
+  // Used here to attach a repoRoot to ScmPanel's (path, kind)-only onOpenDiff.
+  const { repos } = useRepos(workspaceRoot)
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   // Mirror of sidebarCollapsed for the stable toggle callback so it can read the
   // live value without re-registering the Ctrl+B command on every collapse.
   const collapsedRef = useRef(sidebarCollapsed)
   collapsedRef.current = sidebarCollapsed
+
+  // Gate the git working-tree staleness poll on the Source Control view actually
+  // being on screen (its tab is active AND the sidebar isn't collapsed). Nothing
+  // consumes external-edit staleness otherwise, so the ~10s poll shouldn't run.
+  const scmVisible = sidebarView === "scm" && !sidebarCollapsed
+  useEffect(() => {
+    watchers?.setScmVisible(scmVisible)
+  }, [watchers, scmVisible])
 
   // Width captured at the start of a drag; deltas are measured against it so the
   // continuously-updated live width doesn't compound with each drag event.
@@ -212,12 +226,6 @@ function Workbench({ workspaceRoot, initialFile }: { workspaceRoot: string; init
     const text = getLastRendererSelection()
     if (text) void clipboard.write(text, renderer)
   })
-
-  // Resolved once for the workspace; used to attach a repoRoot to ScmPanel's
-  // (path, kind)-only onOpenDiff callback via the deepest containing repo.
-  useEffect(() => {
-    void discoverRepositories(workspaceRoot).then(setRepos)
-  }, [workspaceRoot])
 
   useEffect(
     () =>

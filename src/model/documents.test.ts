@@ -84,6 +84,25 @@ describe("DocumentRegistry sharing", () => {
     expect(b).not.toBe(a)
     expect(b.getText()).toBe("disk-content")
   })
+
+  test("registry onDidSave re-emits any document's save with its path", async () => {
+    const reg = new DocumentRegistry()
+    const path = await fixture("registry-save.ts", "x")
+    const doc = await reg.openDocument(path)
+
+    const saved: string[] = []
+    const off = reg.onDidSave((p) => saved.push(p))
+
+    doc.setText("y", "edit")
+    await doc.save()
+    expect(saved).toEqual([path])
+
+    // Unsubscribing stops further notifications.
+    off()
+    doc.setText("z", "edit")
+    await doc.save()
+    expect(saved).toEqual([path])
+  })
 })
 
 describe("dirty flag lifecycle", () => {

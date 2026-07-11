@@ -8,6 +8,7 @@ import { workbenchStore } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
 import * as fileHistory from "../services/fileHistory"
 import type { FileHistory } from "../services/fileHistory"
+import * as reposService from "../services/repos"
 import { App } from "./App"
 import { getLastRendererSelection, handleRendererSelection } from "./rendererSelection"
 
@@ -105,6 +106,20 @@ test("boots into the Explorer with an empty editor and status bar showing the br
   expect(frame).toContain("hello.ts")
   expect(frame).toContain("No file open")
   expect(frame).toMatch(/main|master/)
+})
+
+test("discovers repositories exactly once for the whole workbench tree", async () => {
+  // ReposProvider runs the sole discovery sweep; StatusBar, the WatchersProvider
+  // GitWatcher, App's diff-routing, and (once their tab mounts) ScmPanel/CommitLog
+  // all read that shared result from context instead of each re-sweeping the tree.
+  const discoverSpy = spyOn(reposService, "discoverRepositories")
+  try {
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    await settle(testSetup)
+    expect(discoverSpy).toHaveBeenCalledTimes(1)
+  } finally {
+    discoverSpy.mockRestore()
+  }
 })
 
 test("Ctrl+P opens Quick Open, and accepting a file opens it in the editor", async () => {

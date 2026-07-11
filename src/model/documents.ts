@@ -196,9 +196,14 @@ function assertAbsolute(path: string, method: string): void {
   console.warn(message)
 }
 
+type RegistryListener = (path: string) => void
+
 export class DocumentRegistry {
   private readonly entries = new Map<string, Entry>()
   private readonly pending = new Map<string, PendingEntry>()
+  private readonly registerListeners = new Set<RegistryListener>()
+  private readonly unregisterListeners = new Set<RegistryListener>()
+  private readonly saveListeners = new Set<RegistryListener>()
 
   /**
    * Open (or refcount) the single Document for a path. Concurrent opens of a
@@ -226,6 +231,14 @@ export class DocumentRegistry {
         // Everyone may have released while the read was in flight — drop it.
         if (pendingEntry.refCount > 0) {
           this.entries.set(path, { doc, refCount: pendingEntry.refCount })
+          // Re-emit this doc's saves at the registry level, keyed by path, so a
+          // single subscriber (the git-stale wiring) can react to every save
+          // without tracking individual Documents. dispose() clears the doc's
+          // listeners on release, so this subscription can't outlive the entry.
+          doc.onDidSave(() => {
+            for (const cb of this.saveListeners) cb(path)
+          })
+          for (const cb of this.registerListeners) cb(path)
         } else {
           doc.dispose()
         }
@@ -248,6 +261,7 @@ export class DocumentRegistry {
       if (entry.refCount <= 0) {
         entry.doc.dispose()
         this.entries.delete(path)
+        for (const cb of this.unregisterListeners) cb(path)
       }
       return
     }
@@ -260,6 +274,44 @@ export class DocumentRegistry {
   get(path: string): Document | undefined {
     assertAbsolute(path, "get")
     return this.entries.get(path)?.doc
+  }
+
+  /** The absolute paths of every currently-registered (open) document. */
+  registeredPaths(): string[] {
+    return Array.from(this.entries.keys())
+  }
+
+  /**
+   * Fires when a path becomes registered (its first refcount lands). Refcount
+   * bumps on an already-open path do NOT re-fire. Returns an unsubscribe.
+   */
+  onDidRegister(cb: RegistryListener): () => void {
+    this.registerListeners.add(cb)
+    return () => {
+      this.registerListeners.delete(cb)
+    }
+  }
+
+  /**
+   * Fires when a path becomes unregistered (its last refcount released and the
+   * Document disposed). Returns an unsubscribe.
+   */
+  onDidUnregister(cb: RegistryListener): () => void {
+    this.unregisterListeners.add(cb)
+    return () => {
+      this.unregisterListeners.delete(cb)
+    }
+  }
+
+  /**
+   * Fires with a document's path whenever that document is saved to disk (any
+   * currently-registered document). Returns an unsubscribe.
+   */
+  onDidSave(cb: RegistryListener): () => void {
+    this.saveListeners.add(cb)
+    return () => {
+      this.saveListeners.delete(cb)
+    }
   }
 }
 

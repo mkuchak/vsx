@@ -39,6 +39,14 @@ function basename(path: string): string {
   return i === -1 ? path : path.slice(i + 1)
 }
 
+// True only for the workspace fuzzy-file mode — a non-empty query with none of
+// the mode-switching prefixes (`>` command, `:` go-to-line, `/`|`~` path browse).
+// The truncation hint is meaningful only here, since those other modes don't draw
+// from the (possibly-clipped) `enumerateFiles` list.
+function isFileQuery(query: string): boolean {
+  return query !== "" && !/^[>:/~]/.test(query)
+}
+
 /** Whether `path` is `dir` itself or nested under it. */
 function isInside(path: string, dir: string): boolean {
   if (path === dir) return true
@@ -161,6 +169,9 @@ export function QuickInput({
   const [visible, setVisible] = useState(false)
   const [query, setQuery] = useState("")
   const [files, setFiles] = useState<string[]>([])
+  // The workspace file index was clipped (time budget or file cap) — surfaced as
+  // a footer hint so a user on a huge root knows the fuzzy list is partial.
+  const [filesTruncated, setFilesTruncated] = useState(false)
   const [selectedIndex, setSelectedIndex] = useState(0)
 
   const home = useMemo(() => homeDir ?? homedir(), [homeDir])
@@ -246,7 +257,9 @@ export function QuickInput({
     if (!visible) return
     let cancelled = false
     void enumerateFiles(workspaceRoot).then((res) => {
-      if (!cancelled) setFiles(res.files)
+      if (cancelled) return
+      setFiles(res.files)
+      setFilesTruncated(res.truncated)
     })
     return () => {
       cancelled = true
@@ -624,6 +637,11 @@ export function QuickInput({
             </box>
           ))}
         </scrollbox>
+        {filesTruncated && isFileQuery(query) ? (
+          <box height={1} paddingLeft={1} flexShrink={0}>
+            <text fg={theme.warning}>Too many files — results are partial</text>
+          </box>
+        ) : null}
       </box>
     </box>
   )

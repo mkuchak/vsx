@@ -201,6 +201,31 @@ test("typing filters + ranks results and bolds the matched characters", async ()
   expect(boldText()).toContain("util")
 })
 
+test("a truncated enumeration surfaces a partial-results hint in file mode", async () => {
+  // Force enumerateFiles to report truncation without building a huge fixture.
+  const enumSpy = spyOn(workspace, "enumerateFiles").mockResolvedValue({
+    files: ["src/util.ts", "src/utils_helper.ts"],
+    truncated: true,
+  })
+  try {
+    testSetup = await render()
+    await settle()
+    await open()
+
+    // Empty query draws from history, not the clipped file list — no hint yet.
+    expect(testSetup.captureCharFrame()).not.toContain("results are partial")
+
+    await testSetup.mockInput.typeText("util")
+    await settle()
+
+    const frame = testSetup.captureCharFrame()
+    expect(frame).toContain("util.ts")
+    expect(frame).toContain("results are partial")
+  } finally {
+    enumSpy.mockRestore()
+  }
+})
+
 test("Down + Enter opens the second result with preview and closes the overlay", async () => {
   testSetup = await render()
   await settle()

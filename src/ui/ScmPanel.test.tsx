@@ -679,7 +679,7 @@ test("a successful discard reloads any open document for that path", async () =>
   expect(reloadFromDisk).toHaveBeenCalledTimes(1)
 })
 
-test("a bare untracked file creation triggers a watcher-driven refresh", async () => {
+test("a bare working-tree change is not instantly detected, but a git-internal one is", async () => {
   await baseline()
 
   testSetup = await render()
@@ -687,16 +687,21 @@ test("a bare untracked file creation triggers a watcher-driven refresh", async (
   await settle()
   expect(testSetup.captureCharFrame()).not.toContain("bare.txt")
 
-  // Create an untracked file on disk with NO git operation — only the working
-  // tree changes, so the refresh must come from the worktree watcher (not the
-  // .git/index write that the "external git change" test above relies on).
+  // A file created with NO git operation changes only the working tree. The
+  // recursive worktree watch was removed (it exhausted the inotify budget on big
+  // roots), so this must NOT trigger an instant refresh — such external edits now
+  // surface via vsx's own saves or the visibility-gated ~10s poll, not fs.watch.
   await write("bare.txt", "x\n")
+  await settle()
+  await Bun.sleep(800)
+  expect(testSetup.captureCharFrame()).not.toContain("bare.txt")
 
-  await waitForText("bare.txt")
-  const frame = testSetup.captureCharFrame()
-  expect(frame).toContain("Untracked Changes")
-  expect(frame).toContain("bare.txt")
-})
+  // A git-internal change (staging the file) still refreshes instantly via the
+  // retained, cheap .git/index watch — proving the detection path that survived.
+  await sh(["add", "bare.txt"])
+  await waitForText("bare.txt", 8000)
+  expect(testSetup.captureCharFrame()).toContain("bare.txt")
+}, 20000)
 
 test("clicking the + button on a selected Changes row stages the file", async () => {
   await baseline()
@@ -912,13 +917,16 @@ test("collapse state survives a watcher-driven refresh", async () => {
   testSetup.mockInput.pressArrow("left")
   await waitForTextGone("helper.ts")
 
-  // An unrelated external change forces a full row rebuild.
+  // Force a full row rebuild via a git-internal change (staging a new file),
+  // which the retained .git/index watch still catches now that the recursive
+  // worktree watch is gone.
   await write("other.txt", "o\n")
-  await waitForText("other.txt")
+  await sh(["add", "other.txt"])
+  await waitForText("other.txt", 8000)
 
   // Collapse state lives outside the rebuild path, so util stays collapsed.
   expect(testSetup.captureCharFrame()).not.toContain("helper.ts")
-})
+}, 20000)
 
 test("selection tracks the row by id across a refresh that inserts earlier rows", async () => {
   await baseline()

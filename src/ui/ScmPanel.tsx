@@ -4,17 +4,14 @@ import { join } from "node:path"
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { CURSOR_STYLE, gitStatusColor, theme } from "../theme"
 import type { FileStatus, StatusResult } from "../services/git"
-import {
-  discoverRepositories,
-  GitWatcher,
-  type RepoInfo,
-} from "../services/repos"
+import { GitWatcher, type RepoInfo } from "../services/repos"
 import * as trash from "../services/trash"
 import { withMacSuper } from "../services/commands"
 import { documentRegistry } from "../model/documents"
 import { useCommands } from "../workbench/CommandsProvider"
 import { useConfirm, type ConfirmOptions } from "../workbench/ModalProvider"
 import { useOverlay } from "../workbench/OverlayProvider"
+import { useRepos } from "../workbench/ReposProvider"
 import { useWorkbenchWatchers } from "../workbench/watchers"
 import type { ConfirmButton } from "./ConfirmDialog"
 
@@ -272,7 +269,7 @@ export function ScmPanel({
   const { isOverlayOpen } = useOverlay()
   const sharedWatchers = useWorkbenchWatchers()
 
-  const [repos, setRepos] = useState<RepoInfo[]>([])
+  const { repos } = useRepos(workspaceRoot)
   const [statuses, setStatuses] = useState<Map<string, StatusResult>>(
     () => new Map(),
   )
@@ -331,28 +328,20 @@ export function ScmPanel({
   }, [])
 
   useEffect(() => {
+    if (repos.length > 0) setActiveRepoRoot((prev) => prev ?? repos[0].root)
+    for (const repo of repos) refresh(repo.root)
     // Prefer the workbench's shared GitWatcher; only build a private one when
     // rendered standalone (outside a WatchersProvider, e.g. in isolated tests).
-    let ownWatcher: GitWatcher | null = null
-    let unsub = () => {}
-    void discoverRepositories(workspaceRoot).then((discovered) => {
-      if (!mountedRef.current) return
-      reposRef.current = discovered
-      setRepos(discovered)
-      if (discovered.length > 0) setActiveRepoRoot((prev) => prev ?? discovered[0].root)
-      if (sharedWatchers) {
-        unsub = sharedWatchers.onStatusStale((root) => refresh(root))
-      } else {
-        ownWatcher = new GitWatcher(discovered)
-        unsub = ownWatcher.onStatusStale((root) => refresh(root))
-      }
-      for (const repo of discovered) refresh(repo.root)
-    })
+    if (sharedWatchers) {
+      return sharedWatchers.onStatusStale((root) => refresh(root))
+    }
+    const ownWatcher = new GitWatcher(repos)
+    const unsub = ownWatcher.onStatusStale((root) => refresh(root))
     return () => {
       unsub()
-      ownWatcher?.dispose()
+      ownWatcher.dispose()
     }
-  }, [workspaceRoot, refresh, sharedWatchers])
+  }, [repos, refresh, sharedWatchers])
 
   // Per-repo rows, memoized on that repo's status object identity (and the toggle
   // set) so one repo's async status resolution doesn't rebuild every other repo's

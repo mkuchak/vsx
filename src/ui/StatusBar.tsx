@@ -2,9 +2,10 @@ import type { MouseEvent as TuiMouseEvent } from "@opentui/core"
 import { useEffect, useRef, useState } from "react"
 import { documentRegistry } from "../model/documents"
 import { theme } from "../theme"
-import { discoverRepositories, GitWatcher, type RepoInfo } from "../services/repos"
+import { GitWatcher, type RepoInfo } from "../services/repos"
 import type { HeadInfo } from "../services/git"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
+import { useRepos } from "../workbench/ReposProvider"
 import { useWorkbenchWatchers } from "../workbench/watchers"
 import type { CursorPosition } from "./EditorPane"
 
@@ -46,7 +47,7 @@ export function StatusBar({
   const language = activeFilePath ? documentRegistry.get(activeFilePath)?.language : undefined
 
   const sharedWatchers = useWorkbenchWatchers()
-  const [repos, setRepos] = useState<RepoInfo[]>([])
+  const { repos } = useRepos(workspaceRoot)
   const [head, setHead] = useState<HeadInfo | null>(null)
   const [dirtyCount, setDirtyCount] = useState(0)
   const [quitHovered, setQuitHovered] = useState(false)
@@ -85,32 +86,25 @@ export function StatusBar({
   }
 
   useEffect(() => {
+    const primary = repos[0]
+    if (primary) refresh(primary)
+    const onStale = (root: string) => {
+      const repo = repos.find((r) => r.root === root)
+      if (repo) refresh(repo)
+    }
     // Prefer the workbench's shared GitWatcher; only build a private one when
     // rendered standalone (outside a WatchersProvider, e.g. in isolated tests).
-    let ownWatcher: GitWatcher | null = null
-    let unsub = () => {}
-    void discoverRepositories(workspaceRoot).then((discovered) => {
-      if (!mountedRef.current) return
-      setRepos(discovered)
-      const primary = discovered[0]
-      if (primary) refresh(primary)
-      const onStale = (root: string) => {
-        const repo = discovered.find((r) => r.root === root)
-        if (repo) refresh(repo)
-      }
-      if (sharedWatchers) {
-        unsub = sharedWatchers.onStatusStale(onStale)
-      } else {
-        ownWatcher = new GitWatcher(discovered)
-        unsub = ownWatcher.onStatusStale(onStale)
-      }
-    })
+    if (sharedWatchers) {
+      return sharedWatchers.onStatusStale(onStale)
+    }
+    const ownWatcher = new GitWatcher(repos)
+    const unsub = ownWatcher.onStatusStale(onStale)
     return () => {
       unsub()
-      ownWatcher?.dispose()
+      ownWatcher.dispose()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workspaceRoot, sharedWatchers])
+  }, [repos, sharedWatchers])
 
   const branchLabel = head
     ? head.detached

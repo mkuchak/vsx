@@ -4,10 +4,11 @@ import { basename, join } from "node:path"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { workbenchStore } from "../model/workbench"
 import type { CommitInfo, DiffEntry } from "../services/git"
-import { discoverRepositories, type RepoInfo } from "../services/repos"
+import { type RepoInfo } from "../services/repos"
 import { gitStatusColor, theme } from "../theme"
 import { useCommitDetails } from "../workbench/ModalProvider"
 import { useOverlay } from "../workbench/OverlayProvider"
+import { useRepos } from "../workbench/ReposProvider"
 
 /** Git's well-known empty-tree SHA; used as the "before" ref for a root commit. */
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
@@ -139,7 +140,7 @@ export type CommitLogProps = {
 export function CommitLog({ workspaceRoot, focused, pageSize = DEFAULT_PAGE_SIZE }: CommitLogProps) {
   const { isOverlayOpen } = useOverlay()
   const showCommitDetails = useCommitDetails()
-  const [repos, setRepos] = useState<RepoInfo[]>([])
+  const { repos } = useRepos(workspaceRoot)
   const [states, setStates] = useState<Map<string, RepoState>>(() => new Map())
   const [selectedIndex, setSelectedIndex] = useState(0)
 
@@ -152,12 +153,6 @@ export function CommitLog({ workspaceRoot, focused, pageSize = DEFAULT_PAGE_SIZE
       mountedRef.current = false
     }
   }, [])
-
-  useEffect(() => {
-    void discoverRepositories(workspaceRoot).then((discovered) => {
-      if (mountedRef.current) setRepos(discovered)
-    })
-  }, [workspaceRoot])
 
   const serviceFor = (repoRoot: string) =>
     repos.find((r) => r.root === repoRoot)?.service ?? null

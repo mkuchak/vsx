@@ -2,7 +2,6 @@ import { lstat, readdir } from "node:fs/promises"
 import { watch as fsWatch } from "node:fs"
 import { join, resolve, sep } from "node:path"
 import { GitService } from "./git"
-import { watch as watchWorkspace, type WatchDisposer } from "./workspace"
 
 export type RepoInfo = {
   root: string
@@ -147,26 +146,42 @@ export function activeRepoFor(
 
 type StaleCb = (repoRoot: string) => void
 
+// How often the visibility-gated poll re-emits staleness for every repo. The
+// working tree is no longer fs.watch'd (a recursive watch under Bun/Linux walks
+// the whole tree and exhausts the inotify budget), so an EXTERNAL edit — one made
+// by another editor or a script — is invisible to the git-internal watches. This
+// poll bounds how long such a change stays unseen WHILE the SCM view is open to
+// ~10s. It only emits staleness (subscribers re-run `git status` themselves); it
+// never spawns git of its own, and it does not run when no SCM view is showing.
+const STATUS_POLL_MS = 10_000
+
 export class GitWatcher {
   private subscribers = new Set<StaleCb>()
   private timers = new Map<string, ReturnType<typeof setTimeout>>()
   private watchers: ReturnType<typeof fsWatch>[] = []
-  private disposers: WatchDisposer[] = []
+  private readonly repos: RepoInfo[]
+  private readonly pollMs: number
+  private pollTimer: ReturnType<typeof setInterval> | undefined
   private disposed = false
 
-  constructor(repos: RepoInfo[]) {
+  constructor(
+    repos: RepoInfo[],
+    // `statusPollMs` is injectable so tests can drive the visibility-gated poll on
+    // a few-ms interval without sleeping a real STATUS_POLL_MS; production always
+    // uses the default.
+    opts?: { statusPollMs?: number },
+  ) {
+    this.repos = repos
+    this.pollMs = opts?.statusPollMs ?? STATUS_POLL_MS
     for (const repo of repos) this.setupRepo(repo)
   }
 
   private setupRepo(repo: RepoInfo): void {
     const mark = () => this.markStale(repo.root)
 
-    // Working tree: reuse the debounced, .git/node_modules-skipping watcher.
-    try {
-      this.disposers.push(watchWorkspace(repo.root, mark))
-    } catch {
-      // ignore: an unwatchable working tree still gets git-internal coverage
-    }
+    // No working-tree watch: working-tree changes surface via vsx's own saves
+    // (notifyPathTouched) and the visibility-gated status poll instead. Only the
+    // cheap git-internal watches below remain — staging/commit/branch stay instant.
 
     // git-dir: HEAD (branch switch) and index (staging) live here — for a
     // worktree these are worktree-private. This watch is already scoped to just
@@ -185,6 +200,11 @@ export class GitWatcher {
 
     // common-dir refs/: watching the SHARED refs is what lets a worktree pick
     // up branch/ref changes made from other worktrees or the main checkout.
+    // This is the ONE deliberately-recursive watch left in the codebase: refs/
+    // is tiny (a handful of loose-ref files plus packed-refs), so recursively
+    // watching it costs a trivial number of inotify watches — unlike a working
+    // tree, it can never blow the budget, which is why the working-tree recursive
+    // watch was removed while this one stays.
     this.watchDir(join(repo.commonDir, "refs"), true, () => true, mark)
   }
 
@@ -230,12 +250,47 @@ export class GitWatcher {
     return () => this.subscribers.delete(cb)
   }
 
+  /**
+   * Save trigger: mark the repo containing `path` stale, on the same debounced
+   * path the git-internal watches use. This is how vsx's OWN saves refresh
+   * status/branch now that the working tree isn't watched — the deepest repo
+   * containing the file wins (nested repos), and a path outside every repo no-ops.
+   */
+  notifyPathTouched(path: string): void {
+    if (this.disposed) return
+    const repo = activeRepoFor(path, this.repos)
+    if (repo) this.markStale(repo.root)
+  }
+
+  /**
+   * Start/stop the external-edit staleness poll. Driven by SCM-view visibility:
+   * while a status consumer is on screen the poll marks every repo stale every
+   * {@link STATUS_POLL_MS}; when hidden the timer is torn down so nothing runs in
+   * the background. The StatusBar also consumes staleness (branch/status), but it
+   * is refreshed by save triggers and the git-internal watches — polling for it
+   * alone was ruled out, so the poll is gated purely on the SCM view.
+   */
+  setStatusPollActive(active: boolean): void {
+    if (this.disposed) return
+    if (active) {
+      if (this.pollTimer) return
+      this.pollTimer = setInterval(() => {
+        for (const repo of this.repos) this.markStale(repo.root)
+      }, this.pollMs)
+    } else if (this.pollTimer) {
+      clearInterval(this.pollTimer)
+      this.pollTimer = undefined
+    }
+  }
+
   dispose(): void {
     this.disposed = true
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer)
+      this.pollTimer = undefined
+    }
     for (const t of this.timers.values()) clearTimeout(t)
     this.timers.clear()
-    for (const d of this.disposers) d()
-    this.disposers = []
     for (const w of this.watchers) w.close()
     this.watchers = []
     this.subscribers.clear()

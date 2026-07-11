@@ -172,6 +172,112 @@ describe("GitWatcher", () => {
     await Bun.sleep(300)
     expect(stale.length).toBe(0)
   })
+
+  test("a working-tree edit alone does NOT mark the repo stale", async () => {
+    // The working tree is no longer watched — only git-internal state is. Writing
+    // a plain file into the tree (no staging, no ref change) must produce no event.
+    await initRepo(workspace)
+    const repos = await discoverRepositories(workspace)
+    const repo = repos[0]!
+
+    const watcher = new GitWatcher(repos)
+    const stale: string[] = []
+    watcher.onStatusStale((root) => stale.push(root))
+
+    try {
+      await writeFile(join(repo.root, "untracked.txt"), "hello\n")
+      await writeFile(join(repo.root, "file.txt"), "changed\n")
+      await Bun.sleep(300)
+      expect(stale).toEqual([])
+    } finally {
+      watcher.dispose()
+    }
+  })
+
+  test("notifyPathTouched marks the deepest containing repo stale", async () => {
+    await initRepo(workspace)
+    const repoBDir = join(workspace, "pkgs", "repoB")
+    await initRepo(repoBDir)
+
+    const repos = await discoverRepositories(workspace)
+    const nested = repos.find((r) => r.root.includes("repoB"))!
+    const outer = repos.find((r) => r !== nested)!
+
+    const watcher = new GitWatcher(repos)
+    const stale: string[] = []
+    watcher.onStatusStale((root) => stale.push(root))
+
+    try {
+      // A file inside the nested repo marks ONLY the nested (deepest) repo.
+      watcher.notifyPathTouched(join(nested.root, "file.txt"))
+      await Bun.sleep(250)
+      expect(stale).toEqual([nested.root])
+
+      // A file only under the outer repo marks the outer repo.
+      stale.length = 0
+      watcher.notifyPathTouched(join(outer.root, "file.txt"))
+      await Bun.sleep(250)
+      expect(stale).toEqual([outer.root])
+
+      // A path outside every repo is a no-op.
+      stale.length = 0
+      watcher.notifyPathTouched("/definitely/not/a/repo/x.txt")
+      await Bun.sleep(250)
+      expect(stale).toEqual([])
+    } finally {
+      watcher.dispose()
+    }
+  })
+
+  test("status poll runs only while visible and emits every repo stale", async () => {
+    await initRepo(workspace)
+    const repoBDir = join(workspace, "pkgs", "repoB")
+    await initRepo(repoBDir)
+
+    const repos = await discoverRepositories(workspace)
+    // Short interval (well above the 150ms markStale debounce, so each tick
+    // actually flushes) drives the gated poll within the test instead of after 10s.
+    const watcher = new GitWatcher(repos, { statusPollMs: 200 })
+    const stale: string[] = []
+    watcher.onStatusStale((root) => stale.push(root))
+
+    try {
+      // No poll while hidden.
+      await Bun.sleep(500)
+      expect(stale).toEqual([])
+
+      // Turning visibility on starts the poll; a tick marks every repo stale.
+      watcher.setStatusPollActive(true)
+      await Bun.sleep(500)
+      const roots = new Set(stale)
+      for (const repo of repos) expect(roots.has(repo.root)).toBe(true)
+
+      // Turning it off stops the timer: let any pending debounce flush, then prove
+      // no further emissions arrive.
+      watcher.setStatusPollActive(false)
+      await Bun.sleep(400)
+      const countAfterOff = stale.length
+      await Bun.sleep(500)
+      expect(stale.length).toBe(countAfterOff)
+    } finally {
+      watcher.dispose()
+    }
+  })
+
+  test("dispose stops a running poll (no leaked interval)", async () => {
+    await initRepo(workspace)
+    const repos = await discoverRepositories(workspace)
+
+    const watcher = new GitWatcher(repos, { statusPollMs: 200 })
+    const stale: string[] = []
+    watcher.onStatusStale((root) => stale.push(root))
+    watcher.setStatusPollActive(true)
+    watcher.dispose()
+
+    stale.length = 0
+    await Bun.sleep(500)
+    expect(stale).toEqual([])
+  })
 })
 
 // Keep the RepoInfo type import exercised for verbatimModuleSyntax.

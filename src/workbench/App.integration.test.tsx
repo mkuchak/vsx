@@ -1,12 +1,13 @@
-import type { RGBA, TextareaRenderable } from "@opentui/core"
+import { MouseButton, type RGBA, type TextareaRenderable } from "@opentui/core"
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { testRender } from "@opentui/react/test-utils"
 import { documentRegistry } from "../model/documents"
 import { workbenchStore, type Group, type Tab } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
+import * as trash from "../services/trash"
 import { theme } from "../theme"
 import { App } from "./App"
 import { handleRendererSelection } from "./rendererSelection"
@@ -161,6 +162,47 @@ function paneBorderRgb(groupId: string): [number, number, number] {
 function hexRgb(hex: string): [number, number, number] {
   const n = Number.parseInt(hex.slice(1), 16)
   return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]
+}
+
+/** Background color of a FileTree row box (id === its absolute path), or null. */
+function rowBackgroundRgb(id: string): [number, number, number] | null {
+  let found: RGBA | undefined
+  const walk = (node: { id?: string; backgroundColor?: RGBA; getChildren: () => unknown[] }) => {
+    if (node.id === id) found = node.backgroundColor
+    for (const child of node.getChildren()) walk(child as typeof node)
+  }
+  walk(testSetup.renderer.root as unknown as { getChildren: () => unknown[] })
+  if (!found) return null
+  const [r, g, b] = found.toInts()
+  return [r, g, b]
+}
+
+function sameRgb(a: [number, number, number], b: [number, number, number]): boolean {
+  return a[0] === b[0] && a[1] === b[1] && a[2] === b[2]
+}
+
+// Poll until the FileTree row for `id` carries the selection-highlight background,
+// so the async reveal (ancestor listing loads before the row can be selected) settles.
+async function waitForRowSelected(id: string, timeoutMs = 4000) {
+  const want = hexRgb(theme.selectionBackground)
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    await testSetup.flush()
+    const rgb = rowBackgroundRgb(id)
+    if (rgb && sameRgb(rgb, want)) return
+    await Bun.sleep(30)
+  }
+  throw new Error(`row "${id}" never became selected\n${testSetup.captureCharFrame()}`)
+}
+
+// Screen position of `marker` on the breadcrumb row (the only row carrying the "›"
+// separator), so a click targets the breadcrumb segment and never the tab strip
+// above it, which shows the same filename.
+function locateInBreadcrumb(marker: string): { x: number; y: number } {
+  const lines = testSetup.captureCharFrame().split("\n")
+  const y = lines.findIndex((l) => l.includes("›") && l.includes(marker))
+  if (y === -1) throw new Error(`"${marker}" not on a breadcrumb row\n${lines.join("\n")}`)
+  return { x: lines[y].indexOf(marker), y }
 }
 
 beforeEach(async () => {
@@ -959,3 +1001,433 @@ test("diff pane: dragging caches the selection, then Ctrl+C copies it", async ()
     writeSpy.mockRestore()
   }
 })
+
+// ── 12. Breadcrumb click → reveal-in-Explorer (never a floating picker) ──────
+// Wires the Breadcrumbs' onSegmentClick up to App's revealInExplorer: a click
+// forces the Explorer view visible and reveals the clicked path in the tree
+// (expanding ancestors + selecting the row). Two entry states are covered — the
+// sidebar showing a DIFFERENT view, and the sidebar fully collapsed — because
+// FileTree only mounts under the Explorer view, so both remount it fresh on the
+// same render that sets revealRequest (the mount-timing edge case).
+
+async function openNestedFile(): Promise<string> {
+  await mkdir(join(root, "sub"))
+  const nested = join(root, "sub", "nested.ts")
+  await writeFile(nested, "const nested = 1\n")
+  await waitForText("hello.ts")
+
+  // Open via Quick Open so a "sub › nested.ts" breadcrumb is rendered for it.
+  testSetup.mockInput.pressKey("p", { ctrl: true })
+  await waitForText("Go to file")
+  await testSetup.mockInput.typeText("nested")
+  await settle(300)
+  testSetup.mockInput.pressEnter()
+  await waitForText("const nested = 1")
+  await settle(150)
+  return nested
+}
+
+test("Breadcrumb click: with the sidebar on Source Control, clicking a segment switches back to Explorer and reveals the path", async () => {
+  await boot({ kittyKeyboard: true })
+  const nested = await openNestedFile()
+
+  // Switch the sidebar to Source Control — FileTree unmounts entirely.
+  testSetup.mockInput.pressKey("g", { ctrl: true, shift: true })
+  await waitForText("SOURCE CONTROL")
+
+  // Click the filename breadcrumb segment (its onMouseDown fires onSegmentClick).
+  const { x, y } = locateInBreadcrumb("nested.ts")
+  await testSetup.mockMouse.click(x, y)
+  await testSetup.flush()
+
+  // Sidebar is back on the Explorer (the file tree is showing again, SCM header gone)…
+  await waitForText("hello.ts")
+  expect(testSetup.captureCharFrame()).not.toContain("SOURCE CONTROL")
+  // …the ancestor dir is expanded and the target row is selected/highlighted.
+  await waitForRowSelected(nested)
+  expect(testSetup.captureCharFrame()).toContain("▾ sub")
+})
+
+test("Breadcrumb click: with the sidebar collapsed, clicking a segment re-shows the Explorer and reveals the path", async () => {
+  await boot()
+  const nested = await openNestedFile()
+
+  // Collapse the sidebar (Ctrl+B) — its whole subtree, including FileTree, unmounts.
+  testSetup.mockInput.pressKey("b", { ctrl: true })
+  await settle(150)
+  expect(testSetup.captureCharFrame()).not.toContain("hello.ts")
+
+  // The breadcrumb still renders in the editor column; click its filename segment.
+  const { x, y } = locateInBreadcrumb("nested.ts")
+  await testSetup.mockMouse.click(x, y)
+  await testSetup.flush()
+
+  // Sidebar is visible again with the Explorer tree, ancestor expanded, row selected.
+  await waitForText("hello.ts")
+  await waitForRowSelected(nested)
+  expect(testSetup.captureCharFrame()).toContain("▾ sub")
+})
+
+// ── 13. A6: Explorer right-click → Delete / Copy Path context menu ───────────
+// Right-clicking a file row opens the anchored ContextMenu (mounted at the App
+// root, outside FileTree's scrollbox). Delete routes through useConfirm →
+// trash.moveToTrash → closeTabsForPath; Copy Path writes the absolute path to
+// the clipboard with no confirmation.
+
+// Right-click the tree row carrying `marker`, then wait for the context menu.
+async function openTreeContextMenu(marker: string) {
+  const { x, y } = locate(marker)
+  await testSetup.mockMouse.pressDown(x, y, MouseButton.RIGHT)
+  await settle(80)
+  await waitForText("Copy Path")
+}
+
+test("A6: right-clicking a file row opens a menu with Delete and Copy Path", async () => {
+  await boot()
+  await waitForText("hello.ts")
+
+  await openTreeContextMenu("hello.ts")
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("Delete")
+  expect(frame).toContain("Copy Path")
+})
+
+test("A6: right-clicking a DIFFERENT row while the menu is open replaces it in one gesture", async () => {
+  await boot()
+  await waitForText("hello.ts")
+  await waitForText("second.ts")
+
+  // Anchor the first menu on the LOWER row so it opens downward and never covers
+  // the upper row we right-click next (otherwise that click would land on the
+  // menu box, not the row).
+  await openTreeContextMenu("second.ts")
+
+  // ONE right-click on the upper row must swap the menu's target — no
+  // dismiss-then-reopen. Before the fix a full-screen backdrop swallowed this
+  // click (dismissing the menu, the row never fired), forcing two right-clicks.
+  const hello = locateInTree("hello.ts")
+  await testSetup.mockMouse.pressDown(hello.x, hello.y, MouseButton.RIGHT)
+  await settle(80)
+  // The menu is still open (not dismissed to nothing)…
+  await waitForText("Copy Path")
+
+  // …and now targets hello.ts: Rename pre-fills its basename (would be
+  // "second.ts" if the single click had failed to retarget).
+  await clickMenuItem("Rename")
+  await waitForDialog()
+  expect(dialogInputValue()).toBe("hello.ts")
+}, 15000)
+
+test("A6: Copy Path writes the absolute path to the clipboard and opens no confirm dialog", async () => {
+  const writeSpy = spyOn(clipboard, "write").mockResolvedValue(undefined)
+  try {
+    await boot()
+    await waitForText("hello.ts")
+    await openTreeContextMenu("hello.ts")
+
+    const { x, y } = locate("Copy Path")
+    await testSetup.mockMouse.pressDown(x, y, MouseButton.LEFT)
+    await settle(120)
+
+    expect(writeSpy).toHaveBeenCalledTimes(1)
+    expect(writeSpy.mock.calls[0][0]).toBe(HELLO())
+    // Instant action — no confirmation, and the menu dismissed.
+    expect(testSetup.captureCharFrame()).not.toContain("Move to Trash")
+    expect(testSetup.captureCharFrame()).not.toContain("Copy Path")
+  } finally {
+    writeSpy.mockRestore()
+  }
+})
+
+test("A6: confirming Delete trashes the file then closes its tabs", async () => {
+  const trashSpy = spyOn(trash, "moveToTrash").mockResolvedValue(undefined)
+  const closeSpy = spyOn(workbenchStore, "closeTabsForPath")
+  try {
+    await boot()
+    await waitForText("hello.ts")
+    await openTreeContextMenu("hello.ts")
+
+    const del = locate("Delete")
+    await testSetup.mockMouse.pressDown(del.x, del.y, MouseButton.LEFT)
+    await waitForText("delete the file 'hello.ts'")
+
+    // "Move to Trash" is the default-highlighted button — Enter confirms it.
+    testSetup.mockInput.pressEnter()
+    await settle(150)
+
+    expect(trashSpy).toHaveBeenCalledTimes(1)
+    expect(trashSpy.mock.calls[0][0]).toEqual([HELLO()])
+    expect(closeSpy).toHaveBeenCalledWith(HELLO())
+  } finally {
+    trashSpy.mockRestore()
+    closeSpy.mockRestore()
+  }
+})
+
+test("A6: cancelling the Delete confirmation trashes nothing", async () => {
+  const trashSpy = spyOn(trash, "moveToTrash").mockResolvedValue(undefined)
+  try {
+    await boot()
+    await waitForText("hello.ts")
+    await openTreeContextMenu("hello.ts")
+
+    const del = locate("Delete")
+    await testSetup.mockMouse.pressDown(del.x, del.y, MouseButton.LEFT)
+    await waitForText("delete the file 'hello.ts'")
+
+    // Escape cancels the confirm dialog (resolves to null).
+    testSetup.mockInput.pressEscape()
+    await settle(150)
+
+    expect(trashSpy).not.toHaveBeenCalled()
+  } finally {
+    trashSpy.mockRestore()
+  }
+})
+
+test("A6: right-clicking a folder row shows a folder-scoped Delete confirmation", async () => {
+  await mkdir(join(root, "sub"))
+  await writeFile(join(root, "sub", "nested.ts"), "const nested = 1\n")
+  const trashSpy = spyOn(trash, "moveToTrash").mockResolvedValue(undefined)
+  try {
+    await boot()
+    await waitForText("sub")
+    await openTreeContextMenu("sub")
+
+    const del = locate("Delete")
+    await testSetup.mockMouse.pressDown(del.x, del.y, MouseButton.LEFT)
+    // The prompt distinguishes a folder from a file.
+    await waitForText("delete the folder 'sub'")
+  } finally {
+    trashSpy.mockRestore()
+  }
+})
+
+// ── 14. A7: Explorer context menu → Rename / Move / New File / New Folder ─────
+// Below A6's Delete / Copy Path divider sit four TextInputDialog-driven actions.
+// Rename pre-fills the bare basename; Move pre-fills the full current directory.
+// A PathExistsError from the filesystem surfaces inline WITHOUT closing the
+// dialog. New File / New Folder create a sibling of a right-clicked file (VSCode
+// convention) and, for New File, open the created file as a tab.
+
+async function exists(p: string): Promise<boolean> {
+  try {
+    await stat(p)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function waitForFile(p: string, want = true, timeoutMs = 8000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if ((await exists(p)) === want) return
+    await Bun.sleep(30)
+  }
+  throw new Error(`timed out waiting for ${p} to ${want ? "exist" : "not exist"}`)
+}
+
+async function waitForActiveTab(path: string, timeoutMs = 4000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    await testSetup.flush()
+    if (activeTabPath() === path) return
+    await Bun.sleep(30)
+  }
+  throw new Error(`active tab never became ${path} (is ${activeTabPath()})`)
+}
+
+// The tree row for `marker` lives in the sidebar (x < sidebar width); an open
+// editor tab/breadcrumb shows the same filename out in the editor column, so
+// scope the hit to the sidebar to disambiguate once a file is open.
+function locateInTree(marker: string): { x: number; y: number } {
+  const lines = testSetup.captureCharFrame().split("\n")
+  for (let y = 0; y < lines.length; y++) {
+    const x = lines[y].indexOf(marker)
+    if (x !== -1 && x < DEFAULT_SIDEBAR_WIDTH) return { x, y }
+  }
+  throw new Error(`"${marker}" not in tree\n${lines.join("\n")}`)
+}
+
+async function openTreeMenu(marker: string) {
+  const { x, y } = locateInTree(marker)
+  await testSetup.mockMouse.pressDown(x, y, MouseButton.RIGHT)
+  await settle(80)
+  await waitForText("New Folder")
+}
+
+// Click a context-menu item by its label.
+async function clickMenuItem(label: string) {
+  const { x, y } = locate(label)
+  await testSetup.mockMouse.pressDown(x, y, MouseButton.LEFT)
+  await settle(80)
+}
+
+// The TextInputDialog is open once its "Confirm" button is on screen. The dialog
+// TITLE alone can't be the signal: several titles ("Rename"/"Move"/"New File"/
+// "New Folder") equal a context-menu label, so waiting on the title would match
+// the still-open menu. "Confirm" is unique to the dialog.
+async function waitForDialog() {
+  await waitForText("Confirm")
+}
+
+// Replace whatever the TextInputDialog pre-filled with `value`. The harness
+// doesn't reliably preserve the "pre-selected text" state that lets a single
+// keystroke replace the seed, so clear it explicitly (backspaces past empty are
+// harmless no-ops) before typing. Requires the dialog input to own native focus
+// — move focus off any editor textarea first (OpenTUI focus is singular).
+// The TextInputDialog's <input> live buffer, or null when the dialog is closed.
+function dialogInputValue(): string | null {
+  let found: string | null = null
+  const walk = (node: { id?: string; value?: unknown; getChildren: () => unknown[] }) => {
+    if (node.id === "textInputDialog-input") found = String(node.value ?? "")
+    for (const child of node.getChildren()) walk(child as typeof node)
+  }
+  walk(testSetup.renderer.root as unknown as { getChildren: () => unknown[] })
+  return found
+}
+
+// Replace whatever the TextInputDialog pre-filled with `value`. When a file tab
+// is open its editor textarea stays mounted and intermittently wins OpenTUI's
+// singular native focus, so a burst of keystrokes can be dropped mid-type,
+// truncating the typed name. Assert against the input's ACTUAL buffer (not the
+// rendered frame, which scrolls/clips values wider than the 40-col field), and
+// retry the whole clear+type until it matches — so a dropped keystroke retries
+// instead of confirming a partial name.
+async function retypeDialog(value: string) {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    for (let i = 0; i < 80; i++) testSetup.mockInput.pressBackspace()
+    await settle(40)
+    await testSetup.mockInput.typeText(value)
+    await settle(60)
+    if (dialogInputValue() === value) return
+  }
+  throw new Error(`dialog input never reached "${value}" (got "${dialogInputValue()}")`)
+}
+
+test("A7: the context menu offers Rename / Move / New File / New Folder", async () => {
+  await boot()
+  await waitForText("hello.ts")
+  await openTreeMenu("hello.ts")
+
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("Rename")
+  expect(frame).toContain("Move")
+  expect(frame).toContain("New File")
+  expect(frame).toContain("New Folder")
+}, 15000)
+
+test("A7: Rename opens a dialog pre-filled with the bare basename", async () => {
+  await boot()
+  await waitForText("hello.ts")
+  await openTreeMenu("hello.ts")
+
+  await clickMenuItem("Rename")
+  await waitForDialog()
+  // The input shows the bare basename to edit in place — NOT a directory path.
+  const frame = testSetup.captureCharFrame()
+  expect(frame).toContain("hello.ts")
+  expect(frame).not.toContain(`${root}/`)
+}, 15000)
+
+test("A7: a successful rename moves the file and retargets its open tab", async () => {
+  // kitty so focusExplorer's Ctrl+Shift+E disambiguates from Ctrl+E.
+  await boot({ kittyKeyboard: true })
+  await openHelloFromTree()
+  expect(activeTabPath()).toBe(HELLO())
+  const doc = documentRegistry.get(HELLO())
+  expect(doc).toBeDefined()
+
+  // Move focus off the editor textarea so the dialog input owns native focus
+  // (OpenTUI focus is singular); the tab stays open, so retarget is still tested.
+  await focusExplorer()
+  await openTreeMenu("hello.ts")
+  await clickMenuItem("Rename")
+  await waitForDialog()
+
+  const renamed = join(root, "renamed.ts")
+  await retypeDialog("renamed.ts")
+  testSetup.mockInput.pressEnter()
+
+  await waitForFile(renamed, true)
+  await waitForFile(HELLO(), false)
+  // The open tab silently follows the rename (no close/reopen), same buffer.
+  expect(tabFor(renamed)).toBeDefined()
+  expect(tabFor(HELLO())).toBeUndefined()
+  expect(documentRegistry.get(renamed)).toBe(doc)
+}, 15000)
+
+test("A7: renaming onto an existing name shows an error and keeps the dialog open", async () => {
+  await boot()
+  await waitForText("hello.ts")
+  await openTreeMenu("hello.ts")
+  await clickMenuItem("Rename")
+  await waitForDialog()
+
+  // second.ts already exists in the fixture repo.
+  await retypeDialog("second.ts")
+  testSetup.mockInput.pressEnter()
+
+  // The PathExistsError surfaces inline; the dialog stays open (title still on
+  // screen) and nothing moved on disk.
+  await waitForText("already exists")
+  expect(testSetup.captureCharFrame()).toContain("Rename")
+  expect(await exists(HELLO())).toBe(true)
+}, 15000)
+
+test("A7: Move pre-fills the current directory and moves the file there", async () => {
+  await mkdir(join(root, "dest"))
+  await boot()
+  await waitForText("hello.ts")
+  await openTreeMenu("hello.ts")
+  await clickMenuItem("Move")
+  await waitForDialog()
+  // Move pre-fills the item's DIRECTORY (a full path), unlike Rename's basename.
+  expect(testSetup.captureCharFrame()).toContain(root.slice(root.length - 12))
+
+  const moved = join(root, "dest", "hello.ts")
+  await retypeDialog(moved)
+  testSetup.mockInput.pressEnter()
+
+  await waitForFile(moved, true)
+  await waitForFile(HELLO(), false)
+  // Retargeting an open tab is shared with Rename and covered there; this test
+  // pins the Move-specific behaviour (directory pre-fill + the on-disk move).
+}, 15000)
+
+test("A7: New File on a file row creates a sibling and opens it as a tab", async () => {
+  await boot()
+  await waitForText("hello.ts")
+  await openTreeMenu("hello.ts")
+
+  await clickMenuItem("New File")
+  await waitForDialog()
+
+  const created = join(root, "created.ts")
+  await retypeDialog("created.ts")
+  testSetup.mockInput.pressEnter()
+
+  await waitForFile(created, true)
+  // Opened in the active group as a permanent tab.
+  await waitForActiveTab(created)
+}, 15000)
+
+test("A7: New Folder creates the directory and expands it in the tree", async () => {
+  await boot()
+  await waitForText("hello.ts")
+  await openTreeMenu("hello.ts")
+
+  await clickMenuItem("New Folder")
+  await waitForDialog()
+
+  const created = join(root, "newdir")
+  await retypeDialog("newdir")
+  testSetup.mockInput.pressEnter()
+
+  await waitForFile(created, true)
+  expect((await stat(created)).isDirectory()).toBe(true)
+  // Both the parent and the new (empty) folder are marked expanded.
+  const expanded = workbenchStore.getState().explorerExpandedPaths
+  expect(expanded.has(created)).toBe(true)
+}, 15000)

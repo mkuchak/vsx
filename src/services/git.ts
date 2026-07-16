@@ -24,6 +24,23 @@ export type CommitInfo = {
   message: string
 }
 
+export type LineBlame = {
+  hash: string
+  authorName: string
+  authorDate: Date
+  /** First line of the commit message (git blame's "summary" header). */
+  summary: string
+  /** Best-effort PR number parsed from a trailing "(#1234)" in `summary` (the convention
+   *  GitHub's squash-merge produces) — null when absent. This is a heuristic, not a real
+   *  API lookup: this codebase makes zero outbound network calls anywhere, and adding
+   *  GitHub API access (auth, rate limits, offline handling) is out of scope. */
+  prNumber: number | null
+  /** True when this line has UNCOMMITTED local changes — git blame reports the
+   *  all-zeros hash (`0000000000000000000000000000000000000000`) for these; every
+   *  other field is meaningless/absent in that case and callers must check this FIRST. */
+  uncommitted: boolean
+}
+
 export type DiffEntry = {
   path: string
   statusLetter: string
@@ -246,6 +263,79 @@ export class GitService {
     } catch (e) {
       if (e instanceof GitError && isPathMissing(e.stderr)) return ""
       throw e
+    }
+  }
+
+  async blame(relativePath: string, line: number): Promise<LineBlame | null> {
+    let stdout: string
+    try {
+      // `-L <line>,<line>` restricts blame to the single requested line, and
+      // `--line-porcelain` repeats the full commit header for it (unlike plain
+      // `--porcelain`, which omits repeated headers for a commit it already
+      // printed — irrelevant here since we ask for one line, but line-porcelain
+      // keeps the parser trivial). `relativePath` is assumed repo-relative;
+      // path resolution is the caller's job (mirrors show()).
+      const range = `${line},${line}`
+      ;({ stdout } = await this.git([
+        "blame",
+        "--line-porcelain",
+        "-L",
+        range,
+        "--",
+        relativePath,
+      ]))
+    } catch (e) {
+      if (!(e instanceof GitError)) throw e
+      // Untracked path, or a line number past the end of the file: this data
+      // just isn't available, so degrade to null rather than throwing.
+      return null
+    }
+
+    const lines = stdout.split("\n")
+    if (lines.length === 0 || !lines[0]) return null
+
+    // The first line is `<40-hex-hash> <origLine> <finalLine> [<groupCount>]`.
+    const hash = lines[0].split(" ")[0]
+
+    // An all-zeros hash means the line is a local, not-yet-committed change; the
+    // author/summary headers are placeholders in that case, so short-circuit.
+    if (/^0{40}$/.test(hash)) {
+      return {
+        hash,
+        authorName: "",
+        authorDate: new Date(0),
+        summary: "",
+        prNumber: null,
+        uncommitted: true,
+      }
+    }
+
+    let authorName = ""
+    let authorTime = 0
+    let summary = ""
+    // Header lines run until the source line, which git prefixes with a literal
+    // TAB. Walk each `key value` header, collecting only the fields we need.
+    for (let i = 1; i < lines.length; i++) {
+      const header = lines[i]
+      if (header.startsWith("\t")) break
+      const sp = header.indexOf(" ")
+      const key = sp < 0 ? header : header.slice(0, sp)
+      const value = sp < 0 ? "" : header.slice(sp + 1)
+      if (key === "author") authorName = value
+      else if (key === "author-time") authorTime = Number(value)
+      else if (key === "summary") summary = value
+    }
+
+    // GitHub's squash-merge appends the PR number as a trailing "(#1234)".
+    const prMatch = summary.match(/\(#(\d+)\)\s*$/)
+
+    return {
+      hash,
+      authorName,
+      authorDate: new Date(authorTime * 1000),
+      summary,
+      prNumber: prMatch ? Number(prMatch[1]) : null,
+      uncommitted: false,
     }
   }
 

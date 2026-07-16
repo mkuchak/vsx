@@ -588,6 +588,74 @@ describe("optional locks", () => {
   })
 })
 
+describe("blame", () => {
+  test("returns hash, author, date, and summary for a committed line", async () => {
+    await write("f.txt", "one\ntwo\nthree\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "add greeting lines"])
+    const headHash = (await sh(["rev-parse", "HEAD"])).trim()
+
+    const blame = await git.blame("f.txt", 2)
+    expect(blame).not.toBeNull()
+    expect(blame!.uncommitted).toBe(false)
+    expect(blame!.hash).toBe(headHash)
+    expect(blame!.authorName).toBe("Tester")
+    expect(blame!.summary).toBe("add greeting lines")
+    expect(blame!.authorDate).toBeInstanceOf(Date)
+    expect(blame!.authorDate.getTime()).toBeGreaterThan(0)
+    expect(blame!.prNumber).toBeNull()
+  })
+
+  test("parses a trailing (#123) into prNumber", async () => {
+    await write("f.txt", "line\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "tidy up the parser (#123)"])
+
+    const blame = await git.blame("f.txt", 1)
+    expect(blame!.summary).toBe("tidy up the parser (#123)")
+    expect(blame!.prNumber).toBe(123)
+  })
+
+  test("returns prNumber null when the summary has no PR suffix", async () => {
+    await write("f.txt", "line\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "no pr here"])
+
+    const blame = await git.blame("f.txt", 1)
+    expect(blame!.prNumber).toBeNull()
+  })
+
+  test("flags a locally-modified (unstaged) line as uncommitted", async () => {
+    await write("f.txt", "one\ntwo\nthree\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "base"])
+    await write("f.txt", "one\nCHANGED\nthree\n")
+
+    const blame = await git.blame("f.txt", 2)
+    expect(blame).not.toBeNull()
+    expect(blame!.uncommitted).toBe(true)
+    expect(blame!.hash).toMatch(/^0{40}$/)
+    expect(blame!.prNumber).toBeNull()
+  })
+
+  test("returns null for an out-of-range line number", async () => {
+    await write("f.txt", "only one line\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "base"])
+
+    expect(await git.blame("f.txt", 99)).toBeNull()
+  })
+
+  test("returns null for an untracked path", async () => {
+    await write("f.txt", "committed\n")
+    await sh(["add", "-A"])
+    await sh(["commit", "-q", "-m", "base"])
+    await write("untracked.txt", "not tracked\n")
+
+    expect(await git.blame("untracked.txt", 1)).toBeNull()
+  })
+})
+
 describe("queue", () => {
   test("serializes concurrent calls and survives a failing call", async () => {
     await write("f.txt", "x\n")

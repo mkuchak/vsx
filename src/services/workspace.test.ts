@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test"
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
   createDirWatcher,
+  createFile,
+  createFolder,
   detectLanguage,
   enumerateFiles,
   listDir,
+  PathExistsError,
+  renamePath,
   type FileChange,
 } from "./workspace"
 
@@ -306,3 +310,78 @@ describe("createDirWatcher", () => {
     dw.dispose()
   })
 })
+
+describe("renamePath", () => {
+  test("renames a file within the same directory", async () => {
+    const src = join(root, "old.txt")
+    const dst = join(root, "new.txt")
+    await writeFile(src, "hello")
+
+    await renamePath(src, dst)
+
+    expect(await readFile(dst, "utf8")).toBe("hello")
+    expect(await pathPresent(src)).toBe(false)
+  })
+
+  test("moves a file into a different directory", async () => {
+    const src = join(root, "file.txt")
+    const destDir = join(root, "sub")
+    const dst = join(destDir, "file.txt")
+    await writeFile(src, "payload")
+    await mkdir(destDir)
+
+    await renamePath(src, dst)
+
+    expect(await readFile(dst, "utf8")).toBe("payload")
+    expect(await pathPresent(src)).toBe(false)
+  })
+
+  test("throws PathExistsError and leaves the destination untouched", async () => {
+    const src = join(root, "src.txt")
+    const dst = join(root, "dst.txt")
+    await writeFile(src, "source")
+    await writeFile(dst, "original")
+
+    await expect(renamePath(src, dst)).rejects.toBeInstanceOf(PathExistsError)
+    expect(await readFile(dst, "utf8")).toBe("original")
+    expect(await readFile(src, "utf8")).toBe("source")
+  })
+})
+
+describe("createFolder", () => {
+  test("creates an empty directory", async () => {
+    const dir = join(root, "fresh")
+    await createFolder(dir)
+    expect((await stat(dir)).isDirectory()).toBe(true)
+  })
+
+  test("throws PathExistsError when the path already exists", async () => {
+    const dir = join(root, "dup")
+    await mkdir(dir)
+    await expect(createFolder(dir)).rejects.toBeInstanceOf(PathExistsError)
+  })
+})
+
+describe("createFile", () => {
+  test("creates an empty file", async () => {
+    const file = join(root, "fresh.txt")
+    await createFile(file)
+    expect(await readFile(file, "utf8")).toBe("")
+  })
+
+  test("throws PathExistsError without truncating existing content", async () => {
+    const file = join(root, "dup.txt")
+    await writeFile(file, "keep me")
+    await expect(createFile(file)).rejects.toBeInstanceOf(PathExistsError)
+    expect(await readFile(file, "utf8")).toBe("keep me")
+  })
+})
+
+async function pathPresent(path: string): Promise<boolean> {
+  try {
+    await stat(path)
+    return true
+  } catch {
+    return false
+  }
+}

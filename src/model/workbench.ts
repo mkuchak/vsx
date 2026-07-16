@@ -91,6 +91,15 @@ export function commitDiffTabId(repoRoot: string, newRef: string, filePath: stri
   return `commitDiff::${repoRoot}::${newRef}::${filePath}`
 }
 
+/**
+ * The real underlying file path for a tab. A file tab's `path` IS its file path;
+ * both diff kinds key identity on a synthetic `path`, so their real file lives on
+ * `filePath` instead.
+ */
+export function tabFilePath(tab: Tab): string {
+  return tab.kind === "file" ? tab.path : tab.filePath
+}
+
 export interface Group {
   id: string
   tabs: Tab[]
@@ -138,6 +147,14 @@ export interface OpenCommitDiffOptions {
 
 type Listener = () => void
 
+/**
+ * Notified when a tab's real file path moves identity (rename/move). Distinct
+ * from the generic `subscribe` channel so a listener can re-key its own
+ * path-indexed bookkeeping BEFORE the generic listeners recompute off the new
+ * paths — see {@link WorkbenchStore.retargetTabPath}.
+ */
+type RetargetListener = (oldPath: string, newPath: string) => void
+
 let groupSeq = 0
 
 function createGroup(): Group {
@@ -153,6 +170,7 @@ export class WorkbenchStore {
   private state: WorkbenchState
   private version = 0
   private readonly listeners = new Set<Listener>()
+  private readonly retargetListeners = new Set<RetargetListener>()
   private confirmDirtyClose?: ConfirmDirtyClose
   private openRecorder?: (path: string) => void
 
@@ -201,6 +219,20 @@ export class WorkbenchStore {
     this.listeners.add(listener)
     return () => {
       this.listeners.delete(listener)
+    }
+  }
+
+  /**
+   * Subscribe to tab path-identity moves (rename/move). Fired synchronously by
+   * {@link retargetTabPath} with `(oldPath, newPath)` BEFORE the generic
+   * `subscribe`/`notify` listeners run, so a path-keyed consumer (e.g. the
+   * document retainer) can re-key its bookkeeping ahead of any generic listener
+   * recomputing off the already-mutated tab paths. Returns an unsubscribe.
+   */
+  onTabPathRetargeted(cb: RetargetListener): () => void {
+    this.retargetListeners.add(cb)
+    return () => {
+      this.retargetListeners.delete(cb)
     }
   }
 
@@ -584,6 +616,105 @@ export class WorkbenchStore {
   async closeActiveTab(): Promise<void> {
     const active = this.activeGroup.activeTabPath
     if (active) await this.closeTab(active)
+  }
+
+  /**
+   * Re-key every tab across every group that references `oldPath` — a file tab's
+   * identity `.path`, or a diff/commitDiff tab's underlying `.filePath` — to
+   * `newPath`, so an open editor silently follows a rename/move (VSCode
+   * behavior) instead of closing and reopening. A file tab's `path` IS its
+   * identity, so `activeTabPath`/`mruOrder` entries equal to `oldPath` are
+   * rewritten too, preserving selection + MRU position. A diff/commitDiff tab's
+   * synthetic identity (never a real path) is left intact, so its selection/MRU
+   * position survives with only `filePath` updated. Fires the change
+   * notification exactly once, even when the path is open in several groups.
+   */
+  retargetTabPath(oldPath: string, newPath: string): void {
+    let changed = false
+    for (const group of this.state.groups) {
+      for (const tab of group.tabs) {
+        if (tab.kind === "file") {
+          if (tab.path === oldPath) {
+            tab.path = newPath
+            changed = true
+          }
+        } else if (tab.filePath === oldPath) {
+          tab.filePath = newPath
+          changed = true
+        }
+      }
+      if (group.activeTabPath === oldPath) {
+        group.activeTabPath = newPath
+        changed = true
+      }
+      for (let i = 0; i < group.mruOrder.length; i++) {
+        if (group.mruOrder[i] === oldPath) {
+          group.mruOrder[i] = newPath
+          changed = true
+        }
+      }
+    }
+    if (changed) {
+      // Retarget-specific listeners run first so a path-keyed consumer re-keys
+      // its own state before the generic notify() lets a listener recompute off
+      // the new paths (see onTabPathRetargeted / documentRetainer).
+      for (const listener of this.retargetListeners) listener(oldPath, newPath)
+      this.notify()
+    }
+  }
+
+  /**
+   * Force-close every tab (across every group) whose real file path
+   * (`tab.kind === "file" ? tab.path : tab.filePath`) equals `path`, OR — for a
+   * folder delete — is nested under `path + "/"`. Used by the explorer's
+   * delete-file / delete-folder action.
+   *
+   * Judgment call: this force-closes with NO dirty-save prompt, unlike
+   * {@link closeTab}. The caller has already moved the file (or folder) to trash
+   * by the time this runs, so the path no longer exists on disk. A "save before
+   * closing?" prompt would be actively wrong here — choosing "save" would rewrite
+   * the just-deleted file (or fail outright when its parent folder is gone),
+   * resurrecting exactly what the user asked to delete. The explicit, more-recent
+   * "delete this" intent outranks the stale unsaved edits, matching VSCode, which
+   * closes editors for a deleted file without prompting. Fires the change
+   * notification exactly once.
+   */
+  closeTabsForPath(path: string): void {
+    const prefix = `${path}/`
+    const matches = (tab: Tab): boolean => {
+      const real = tabFilePath(tab)
+      return real === path || real.startsWith(prefix)
+    }
+
+    let changed = false
+    // Snapshot the group list: collapsing an emptied split group mutates it.
+    for (const group of [...this.state.groups]) {
+      const doomed = group.tabs.filter(matches).map((t) => t.path)
+      if (doomed.length === 0) continue
+      changed = true
+      for (const p of doomed) {
+        const idx = group.tabs.findIndex((t) => t.path === p)
+        if (idx !== -1) group.tabs.splice(idx, 1)
+        remove(group.mruOrder, p)
+        if (group.activeTabPath === p) {
+          group.activeTabPath = group.mruOrder[0] ?? null
+        }
+      }
+
+      // Emptying a non-last group collapses the split back, mirroring
+      // removeTabFromGroup — but only re-home the active group if it was this one.
+      if (group.tabs.length === 0 && this.state.groups.length > 1) {
+        const groupIdx = this.state.groups.findIndex((g) => g.id === group.id)
+        this.state.groups.splice(groupIdx, 1)
+        this.state.sizes = removeFraction(this.state.sizes, groupIdx)
+        if (this.state.activeGroupId === group.id) {
+          const fallback =
+            this.state.groups[groupIdx] ?? this.state.groups[this.state.groups.length - 1]
+          this.state.activeGroupId = fallback.id
+        }
+      }
+    }
+    if (changed) this.notify()
   }
 
   /** Promote a specific preview tab to a permanent tab. No-op if not a preview tab. */

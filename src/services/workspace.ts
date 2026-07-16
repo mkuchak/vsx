@@ -1,4 +1,4 @@
-import { readdir, stat } from "node:fs/promises"
+import { access, mkdir, readdir, rename, stat, writeFile } from "node:fs/promises"
 import { watch as fsWatch } from "node:fs"
 import { join, relative } from "node:path"
 
@@ -268,4 +268,51 @@ export function createDirWatcher(
   }
 
   return { add, remove, dispose }
+}
+
+export class PathExistsError extends Error {
+  constructor(public readonly path: string) {
+    super(`A file or folder already exists at: ${path}`)
+    this.name = "PathExistsError"
+  }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// node's rename() silently overwrites an existing destination on POSIX and has
+// no atomic "fail if exists" flag, so we must check first. This leaves a small
+// TOCTOU window, acceptable for a single local editor (no adversarial concurrent
+// writers). createFolder/createFile below avoid the race with atomic flags.
+export async function renamePath(oldPath: string, newPath: string): Promise<void> {
+  if (await pathExists(newPath)) throw new PathExistsError(newPath)
+  await rename(oldPath, newPath)
+}
+
+export async function createFolder(path: string): Promise<void> {
+  try {
+    await mkdir(path, { recursive: false })
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new PathExistsError(path)
+    }
+    throw err
+  }
+}
+
+export async function createFile(path: string): Promise<void> {
+  try {
+    await writeFile(path, "", { flag: "wx" })
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new PathExistsError(path)
+    }
+    throw err
+  }
 }

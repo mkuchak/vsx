@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { WorkbenchStore } from "./workbench.ts"
+import { WorkbenchStore, diffTabId } from "./workbench.ts"
 import { documentRegistry } from "./documents.ts"
 
 function activeTabs(store: WorkbenchStore): string[] {
@@ -1126,5 +1126,176 @@ describe("open recorder", () => {
     expect(() => store.openFile("/a.ts")).not.toThrow()
     expect(activeTabs(store)).toEqual(["/a.ts"])
     expect(activePath(store)).toBe("/a.ts")
+  })
+})
+
+describe("retargetTabPath", () => {
+  test("re-keys file `.path` and diff `.filePath` across groups, preserving active + MRU", () => {
+    const store = new WorkbenchStore()
+    store.openFile("/a.ts", { preview: false }) // file tab in group0
+    store.splitGroup() // group1 gets a permanent clone of /a.ts, becomes active
+    // Open a diff of the same file in the active group1 (identity is synthetic).
+    store.openDiff("/a.ts", "unstaged", "/repo")
+    const diffId = diffTabId("unstaged", "/repo", "/a.ts")
+
+    const [g0, g1] = store.getState().groups
+    expect(g1.activeTabPath).toBe(diffId) // the diff is active in group1
+
+    store.retargetTabPath("/a.ts", "/b.ts")
+
+    // group0: the lone file tab followed the rename, active + MRU rewritten.
+    expect(g0.tabs.map((t) => t.path)).toEqual(["/b.ts"])
+    expect(g0.activeTabPath).toBe("/b.ts")
+    expect(g0.mruOrder).toContain("/b.ts")
+    expect(g0.mruOrder).not.toContain("/a.ts")
+
+    // group1: file tab path retargeted; diff tab keeps its synthetic identity but
+    // its underlying filePath is retargeted; the diff stays active.
+    const g1File = g1.tabs.find((t) => t.kind === "file")
+    const g1Diff = g1.tabs.find((t) => t.kind === "diff")
+    expect(g1File?.path).toBe("/b.ts")
+    expect(g1Diff?.path).toBe(diffId)
+    expect(g1Diff?.kind === "diff" && g1Diff.filePath).toBe("/b.ts")
+    expect(g1.activeTabPath).toBe(diffId)
+    expect(g1.mruOrder).toContain("/b.ts")
+    expect(g1.mruOrder).not.toContain("/a.ts")
+  })
+
+  test("notifies exactly once even when the path is open in several groups", () => {
+    const store = new WorkbenchStore()
+    store.openFile("/a.ts", { preview: false })
+    store.splitGroup() // /a.ts now open in two groups
+
+    let calls = 0
+    store.subscribe(() => calls++)
+    store.retargetTabPath("/a.ts", "/b.ts")
+    expect(calls).toBe(1)
+  })
+
+  test("is a no-op (no notification) when no tab references the old path", () => {
+    const store = new WorkbenchStore()
+    store.openFile("/a.ts", { preview: false })
+
+    let calls = 0
+    store.subscribe(() => calls++)
+    store.retargetTabPath("/missing.ts", "/other.ts")
+    expect(calls).toBe(0)
+    expect(activeTabs(store)).toEqual(["/a.ts"])
+  })
+
+  test("onTabPathRetargeted fires with (oldPath, newPath) before generic notify", () => {
+    const store = new WorkbenchStore()
+    store.openFile("/a.ts", { preview: false })
+
+    const order: string[] = []
+    const seen: string[][] = []
+    store.onTabPathRetargeted((oldPath, newPath) => {
+      seen.push([oldPath, newPath])
+      order.push("retarget")
+    })
+    store.subscribe(() => order.push("notify"))
+
+    store.retargetTabPath("/a.ts", "/b.ts")
+
+    expect(seen).toEqual([["/a.ts", "/b.ts"]])
+    expect(order).toEqual(["retarget", "notify"])
+  })
+
+  test("onTabPathRetargeted does not fire when the retarget is a no-op", () => {
+    const store = new WorkbenchStore()
+    store.openFile("/a.ts", { preview: false })
+
+    let calls = 0
+    store.onTabPathRetargeted(() => calls++)
+    store.retargetTabPath("/missing.ts", "/other.ts")
+    expect(calls).toBe(0)
+  })
+
+  test("onTabPathRetargeted unsubscribe stops further deliveries", () => {
+    const store = new WorkbenchStore()
+    store.openFile("/a.ts", { preview: false })
+
+    let calls = 0
+    const off = store.onTabPathRetargeted(() => calls++)
+    store.retargetTabPath("/a.ts", "/b.ts")
+    expect(calls).toBe(1)
+
+    off()
+    store.retargetTabPath("/b.ts", "/c.ts")
+    expect(calls).toBe(1)
+  })
+})
+
+describe("closeTabsForPath", () => {
+  test("closes an exact-path match across groups, collapsing an emptied split", () => {
+    const store = new WorkbenchStore()
+    store.openFile("/x/a.ts", { preview: false })
+    store.openFile("/x/b.ts", { preview: false }) // active
+    store.splitGroup() // group1 gets a clone of /x/b.ts, becomes active
+    expect(store.getState().groups).toHaveLength(2)
+
+    store.closeTabsForPath("/x/b.ts")
+
+    // group1 emptied and collapsed; group0 keeps only the non-matching tab.
+    expect(store.getState().groups).toHaveLength(1)
+    expect(store.getState().groups[0].tabs.map((t) => t.path)).toEqual(["/x/a.ts"])
+  })
+
+  test("directory path closes every nested tab but not sibling prefixes", () => {
+    const store = new WorkbenchStore()
+    store.openFile("/proj/src/a.ts", { preview: false })
+    store.openFile("/proj/src/nested/b.ts", { preview: false })
+    store.openFile("/proj/src-extra.ts", { preview: false }) // shares a string prefix, NOT nested
+    store.openFile("/proj/other.ts", { preview: false })
+
+    store.closeTabsForPath("/proj/src")
+
+    expect(activeTabs(store)).toEqual(["/proj/src-extra.ts", "/proj/other.ts"])
+  })
+
+  test("also closes a diff tab whose underlying file is deleted", () => {
+    const store = new WorkbenchStore()
+    store.openFile("/repo/a.ts", { preview: false })
+    store.openDiff("/repo/a.ts", "unstaged", "/repo")
+
+    store.closeTabsForPath("/repo/a.ts")
+    expect(activeTabs(store)).toEqual([])
+  })
+
+  test("force-closes a dirty tab WITHOUT invoking the dirty-close prompt", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "vsx-closeforpath-"))
+    try {
+      const path = join(dir, "a.ts")
+      await writeFile(path, "original\n")
+      const doc = await documentRegistry.openDocument(path)
+      doc.setText("edited\n", "edit") // dirty
+
+      const store = new WorkbenchStore()
+      store.openFile(path, { preview: false })
+      let prompts = 0
+      store.setConfirmDirtyCloseHandler(async () => {
+        prompts++
+        return "cancel"
+      })
+
+      store.closeTabsForPath(path)
+
+      expect(prompts).toBe(0) // no prompt for an already-deleted file
+      expect(activeTabs(store)).toEqual([]) // tab is gone despite being dirty
+      documentRegistry.releaseDocument(path)
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("is a no-op (no notification) when nothing matches", () => {
+    const store = new WorkbenchStore()
+    store.openFile("/a.ts", { preview: false })
+
+    let calls = 0
+    store.subscribe(() => calls++)
+    store.closeTabsForPath("/nope.ts")
+    expect(calls).toBe(0)
+    expect(activeTabs(store)).toEqual(["/a.ts"])
   })
 })

@@ -114,6 +114,31 @@ describe("no registry leaks under churn", () => {
     for (const p of paths) expect(documentRegistry.get(p)).toBeUndefined()
   })
 
+  test("renaming an open file via retarget then closing its tab disposes the doc", async () => {
+    const a = await makeFile("a.ts", "aaa\n")
+    const b = join(dir, "b.ts")
+
+    stop = startDocumentRetainer()
+    workbenchStore.openFile(a, { preview: false })
+    await settle()
+    expect(documentRegistry.get(a)).toBeDefined()
+
+    // Same order as App.tsx's retargetOpenTab: registry re-keys FIRST, then the
+    // tab store re-keys (which synchronously re-runs the retainer's sync()).
+    documentRegistry.retarget(a, b)
+    workbenchStore.retargetTabPath(a, b)
+    await settle()
+
+    // The document lives at its new identity, with a single (not doubled) refcount.
+    expect(documentRegistry.get(b)).toBeDefined()
+    expect(documentRegistry.get(a)).toBeUndefined()
+
+    // Closing the last tab must drop the refcount to zero and dispose the doc.
+    workbenchStore.closeActiveTab()
+    await settle()
+    expect(documentRegistry.get(b)).toBeUndefined()
+  })
+
   test("the disposer releases every retained document", async () => {
     const a = await makeFile("a.ts", "aaa\n")
     const b = await makeFile("b.ts", "bbb\n")

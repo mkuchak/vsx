@@ -75,8 +75,8 @@ export interface Document {
 }
 
 class DocumentModel implements Document {
-  readonly uri: string
-  readonly language: string | undefined
+  uri: string
+  language: string | undefined
 
   private text: string
   private savedText: string
@@ -164,6 +164,18 @@ class DocumentModel implements Document {
     }
   }
 
+  /**
+   * Re-point this document at a new path after a rename/move. Only identity
+   * changes: `uri` (so a subsequent {@link save} writes to the new path) and the
+   * derived `language` (the extension may have changed, e.g. `.ts` → `.md`).
+   * Text, version and dirty state are deliberately untouched — this is a pure
+   * identity re-key of the same in-memory buffer.
+   */
+  retargetTo(newPath: string): void {
+    this.uri = newPath
+    this.language = detectLanguage(newPath)
+  }
+
   dispose(): void {
     this.changeListeners.clear()
     this.saveListeners.clear()
@@ -235,8 +247,10 @@ export class DocumentRegistry {
           // single subscriber (the git-stale wiring) can react to every save
           // without tracking individual Documents. dispose() clears the doc's
           // listeners on release, so this subscription can't outlive the entry.
+          // Emit the doc's CURRENT uri (not the captured open-time path) so a
+          // save after a retarget() reports the new path to subscribers.
           doc.onDidSave(() => {
-            for (const cb of this.saveListeners) cb(path)
+            for (const cb of this.saveListeners) cb(doc.uri)
           })
           for (const cb of this.registerListeners) cb(path)
         } else {
@@ -274,6 +288,23 @@ export class DocumentRegistry {
   get(path: string): Document | undefined {
     assertAbsolute(path, "get")
     return this.entries.get(path)?.doc
+  }
+
+  /**
+   * Re-key an open document from `oldPath` to `newPath` after a rename/move so
+   * the same in-memory buffer keeps editing, now pointed at the new path
+   * (VSCode's behavior). Preserves refcount, dirty state, version and content —
+   * only the registry key and the document's identity change. A no-op when
+   * nothing is open for `oldPath`.
+   */
+  retarget(oldPath: string, newPath: string): void {
+    assertAbsolute(oldPath, "retarget")
+    assertAbsolute(newPath, "retarget")
+    const entry = this.entries.get(oldPath)
+    if (!entry) return
+    this.entries.delete(oldPath)
+    entry.doc.retargetTo(newPath)
+    this.entries.set(newPath, entry)
   }
 
   /** The absolute paths of every currently-registered (open) document. */

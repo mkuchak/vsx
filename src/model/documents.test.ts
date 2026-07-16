@@ -105,6 +105,67 @@ describe("DocumentRegistry sharing", () => {
   })
 })
 
+describe("retarget", () => {
+  test("re-keys an open document and future saves target the new path", async () => {
+    const reg = new DocumentRegistry()
+    const oldPath = await fixture("old.ts", "content")
+    const newPath = join(dir, "new.ts")
+
+    const doc = await reg.openDocument(oldPath)
+    doc.setText("edited", "edit")
+
+    reg.retarget(oldPath, newPath)
+
+    // Re-keyed: lookups follow the new path, the old key is gone, identity moved.
+    expect(reg.get(newPath)).toBe(doc)
+    expect(reg.get(oldPath)).toBeUndefined()
+    expect(doc.uri).toBe(newPath)
+    // Content/dirty state untouched by the pure identity re-key.
+    expect(doc.getText()).toBe("edited")
+    expect(doc.isDirty).toBe(true)
+
+    await doc.save()
+    expect(await readFile(newPath, "utf8")).toBe("edited")
+  })
+
+  test("recomputes language when the extension changes", async () => {
+    const reg = new DocumentRegistry()
+    const oldPath = await fixture("note.ts", "x")
+    const newPath = join(dir, "note.md")
+
+    const doc = await reg.openDocument(oldPath)
+    expect(doc.language).toBe("typescript")
+
+    reg.retarget(oldPath, newPath)
+    expect(doc.language).toBe("markdown")
+  })
+
+  test("registry onDidSave reports the new path after a retarget", async () => {
+    const reg = new DocumentRegistry()
+    const oldPath = await fixture("moved.ts", "x")
+    const newPath = join(dir, "moved-renamed.ts")
+
+    const doc = await reg.openDocument(oldPath)
+    const saved: string[] = []
+    reg.onDidSave((p) => saved.push(p))
+
+    reg.retarget(oldPath, newPath)
+    doc.setText("y", "edit")
+    await doc.save()
+
+    expect(saved).toEqual([newPath])
+  })
+
+  test("is a safe no-op when nothing is open for the old path", async () => {
+    const reg = new DocumentRegistry()
+    const oldPath = join(dir, "absent.ts")
+    const newPath = join(dir, "absent-renamed.ts")
+
+    expect(() => reg.retarget(oldPath, newPath)).not.toThrow()
+    expect(reg.get(newPath)).toBeUndefined()
+  })
+})
+
 describe("dirty flag lifecycle", () => {
   test("edit sets dirty, save clears it", async () => {
     const reg = new DocumentRegistry()

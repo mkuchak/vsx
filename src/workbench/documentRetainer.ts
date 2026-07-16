@@ -77,8 +77,23 @@ export function startDocumentRetainer(): () => void {
   sync()
   const unsubscribe = workbenchStore.subscribe(sync)
 
+  // A rename/move re-keys the registry entry itself (documentRegistry.retarget
+  // runs first, in App.tsx), so the refcount is already correct at the new path.
+  // Mirror that here as a PURE local re-key — moving whatever state (including an
+  // in-flight "opening"/"opening-cancelled") sits at oldPath to newPath — with no
+  // registry acquire/release. Routing this through sync()'s acquire(newPath) /
+  // release(oldPath) pair would double-count: acquire would bump the already
+  // re-keyed entry's refcount while release(oldPath) no-ops on the vacated key.
+  const unsubscribeRetarget = workbenchStore.onTabPathRetargeted((oldPath, newPath) => {
+    const state = retentions.get(oldPath)
+    if (state === undefined) return
+    retentions.delete(oldPath)
+    retentions.set(newPath, state)
+  })
+
   return () => {
     unsubscribe()
+    unsubscribeRetarget()
     for (const path of [...retentions.keys()]) release(path)
   }
 }

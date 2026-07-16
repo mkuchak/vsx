@@ -232,14 +232,22 @@ function render(props?: Partial<Parameters<typeof EditorPane>[0]>) {
 // a render) from failing spuriously when a loaded machine starves the event loop
 // past the old 3s deadline. Kept below BLAME_TEST_TIMEOUT so a genuine hang throws
 // a readable frame dump here rather than a bare framework timeout.
-const WAIT_TIMEOUT_MS = 20000
+//
+// GitHub Actions' shared ubuntu-latest runners have proven to need meaningfully
+// more headroom than any local reproduction (2-CPU taskset, lowered
+// fs.inotify.max_user_instances, CI=true) could trigger: the word-wrapped-line
+// blame test failed 3/3 consecutive CI runs at the old 20s ceiling while passing
+// reliably in every local attempt, including under matched resource constraints.
+// Raised well past what local investigation needed, so a real hang still throws
+// promptly instead of silently eating the whole 25-minute job budget.
+const WAIT_TIMEOUT_MS = 60000
 
 // bun's default per-test timeout is 5s. Under heavy combined-suite load the event
 // loop is starved enough that a blame annotation — correct, but gated behind the
 // 120ms debounce + a render — can settle just past 5s, tripping that default even
 // though the logic is fine. The blame tests opt into a generous per-test ceiling so
 // only a real hang fails them; non-blame tests keep the default.
-const BLAME_TEST_TIMEOUT = 25000
+const BLAME_TEST_TIMEOUT = 65000
 const blameTest = (name: string, fn: () => Promise<void>) => test(name, fn, BLAME_TEST_TIMEOUT)
 
 // `renderOnce()` drives an actual render pass, which is the ONLY thing that fires

@@ -9,6 +9,7 @@ import { join } from "node:path"
 import { documentRegistry } from "../model/documents"
 import { workbenchStore, type DiffTab } from "../model/workbench"
 import { GitService } from "../services/git"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { theme } from "../theme"
 import { CommandsProvider } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
@@ -80,7 +81,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  testSetup?.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   testSetup = undefined
   workbenchStore.reset()
   await Bun.sleep(30)

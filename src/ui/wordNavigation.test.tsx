@@ -18,6 +18,7 @@ import { join } from "node:path"
 import { testRender } from "@opentui/react/test-utils"
 import { workbenchStore } from "../model/workbench"
 import { OverlayProvider } from "../workbench/OverlayProvider"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { EditorPane } from "./EditorPane"
 import type { TextareaRenderable } from "@opentui/core"
 
@@ -30,7 +31,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  if (testSetup) testSetup.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   workbenchStore.reset()
   await rm(dir, { recursive: true, force: true })
 })

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { isDragArmed } from "../ui/dragManager"
 import { workbenchStore } from "../model/workbench"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { App } from "./App"
 
 let root: string
@@ -43,7 +44,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  if (testSetup) testSetup.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   workbenchStore.reset()
   await rm(root, { recursive: true, force: true })
 })

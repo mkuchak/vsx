@@ -8,6 +8,7 @@ import { documentRegistry } from "../model/documents"
 import { workbenchStore, type Group, type Tab } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
 import * as trash from "../services/trash"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { theme } from "../theme"
 import { App } from "./App"
 import { handleRendererSelection } from "./rendererSelection"
@@ -222,7 +223,7 @@ beforeEach(async () => {
 // fired by renderer.destroy(), documents from a prior test can never leak into
 // the next one even though workbenchStore.reset() does not release documents.
 afterEach(async () => {
-  if (testSetup) testSetup.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   // Clear the shared renderer-selection cache between tests.
   handleRendererSelection({ getSelectedText: () => "" })
   await rm(root, { recursive: true, force: true })
@@ -233,6 +234,10 @@ async function boot({ width = 100, kittyKeyboard = false } = {}) {
     width,
     height: 30,
     kittyKeyboard,
+    // The renderer's default (true) destroys itself on a nextTick after ANY
+    // Ctrl+C keypress — several tests here press Ctrl+C to test copy, which would
+    // otherwise self-destruct mid-test. Matches production (src/main.tsx).
+    exitOnCtrlC: false,
   })
   await settle()
 }

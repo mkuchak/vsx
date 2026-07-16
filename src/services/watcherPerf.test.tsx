@@ -11,6 +11,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { testRender } from "@opentui/react/test-utils"
 import { workbenchStore } from "../model/workbench"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { App } from "../workbench/App"
 import { startDocumentReloadWatcher } from "../workbench/watchers"
 import { discoverRepositories, GitWatcher } from "./repos"
@@ -197,6 +198,6 @@ test("mounting the full workbench on a ~20k-dir tree does not block the event lo
       expect(afterCount - baseline).toBeLessThan(MAX_BOOT_WATCHES)
     }
   } finally {
-    setup?.renderer.destroy()
+    if (setup) await destroyRendererAndWait(setup.renderer)
   }
 }, 20_000)

@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { GitService } from "../services/git"
 import type { RepoInfo } from "../services/repos"
 import { tabFilePath, workbenchStore } from "../model/workbench"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import {
   Breadcrumbs,
   resolveBreadcrumbSegments,
@@ -13,8 +14,8 @@ import {
 
 let testSetup: Awaited<ReturnType<typeof testRender>> | undefined
 
-afterEach(() => {
-  testSetup?.renderer.destroy()
+afterEach(async () => {
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   testSetup = undefined
 })
 

@@ -3,12 +3,13 @@ import { useState } from "react"
 import { testRender } from "@opentui/react/test-utils"
 import type { Document } from "../model/documents.ts"
 import type { GitService, LineBlame } from "../services/git.ts"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { useLineBlame, type BlameState } from "./useLineBlame.ts"
 
 let testSetup: Awaited<ReturnType<typeof testRender>> | undefined
 
-afterEach(() => {
-  testSetup?.renderer.destroy()
+afterEach(async () => {
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   testSetup = undefined
 })
 

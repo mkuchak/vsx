@@ -1,12 +1,13 @@
 import { afterEach, expect, test } from "bun:test"
 import { testRender } from "@opentui/react/test-utils"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { DEFAULT_SIDEBAR_WIDTH } from "../workbench/sidebarWidth"
 import { SidebarTabs } from "./SidebarTabs"
 
 let testSetup: Awaited<ReturnType<typeof testRender>> | undefined
 
-afterEach(() => {
-  testSetup?.renderer.destroy()
+afterEach(async () => {
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   testSetup = undefined
 })
 

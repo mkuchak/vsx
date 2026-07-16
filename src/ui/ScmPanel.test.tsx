@@ -10,6 +10,7 @@ import { OverlayProvider } from "../workbench/OverlayProvider"
 import { GitService, type StatusResult } from "../services/git"
 import { documentRegistry } from "../model/documents"
 import * as trash from "../services/trash"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { ScmPanel, type ScmPanelProps } from "./ScmPanel"
 
 let testSetup: Awaited<ReturnType<typeof testRender>>
@@ -54,7 +55,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  if (testSetup) testSetup.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   // Let the unmount cleanup (watcher dispose + in-flight status) settle before
   // deleting the repo so lingering git spawns don't race the next test.
   await Bun.sleep(50)

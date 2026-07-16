@@ -11,6 +11,7 @@ import { createFileHistory, type FileHistory } from "../services/fileHistory"
 import * as fuzzy from "../services/fuzzy"
 import * as workspace from "../services/workspace"
 import type { DirEntry } from "../services/workspace"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { QuickInput, splitPathQuery } from "./QuickInput"
 
 const HOME = "/home/tester"
@@ -74,7 +75,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  if (testSetup) testSetup.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   workbenchStore.reset()
   // Clear any recorder a test wired so it can't leak into the next one.
   workbenchStore.setOpenRecorder(null)

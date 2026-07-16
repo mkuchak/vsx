@@ -22,7 +22,9 @@ import { OverlayProvider } from "../workbench/OverlayProvider"
 import { handleRendererSelection } from "../workbench/rendererSelection"
 import { FIND_CURRENT_REF, FIND_MATCH_REF, getEditorControls } from "../workbench/editorControls"
 import type { CommandRegistry } from "../services/commands"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { EditorPane } from "./EditorPane"
+import { setClickClock } from "./clickClock"
 import { resetScrollAxisLock } from "./scrollAxisLock"
 
 let testSetup: Awaited<ReturnType<typeof testRender>>
@@ -144,7 +146,11 @@ function renderTwoPane(groupA: string, groupB: string) {
         <CaptureRegistry />
       </CommandsProvider>
     </OverlayProvider>,
-    { width: 50, height: 14 },
+    // exitOnCtrlC: the renderer's DEFAULT (true) destroys the renderer on a
+    // process.nextTick after ANY Ctrl+C keypress — so every copy test ran its
+    // assertions against a renderer that self-destructed (and act()-unmounted the
+    // tree) mid-test. Off, so only afterEach tears the renderer down.
+    { width: 50, height: 14, exitOnCtrlC: false },
   )
 }
 
@@ -176,13 +182,20 @@ beforeEach(async () => {
   // The wheel axis lock keys gestures off the real clock — a scroll burst at the
   // end of one test must never count as "the same gesture" in the next.
   resetScrollAxisLock()
+  // Freeze the multi-click clock: a simulated double/triple-click asserts "these
+  // clicks count as one gesture," not "these landed within some race against the
+  // real clock" — under a starved event loop the real wall-clock gap between two
+  // awaited simulated clicks can occasionally exceed MULTI_CLICK_MS even though
+  // the test's intent was unambiguous. Freezing to a constant removes that race;
+  // gesture-vs-not is still governed by the (real, unfrozen) same-spot check.
+  setClickClock(() => 0)
   registry = null
   setFocusedPane = null
   dir = await mkdtemp(join(tmpdir(), "vsx-editorpane-"))
 })
 
 afterEach(async () => {
-  if (testSetup) testSetup.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   if (restoreHighlight) {
     restoreHighlight()
     restoreHighlight = null
@@ -222,7 +235,8 @@ function render(props?: Partial<Parameters<typeof EditorPane>[0]>) {
         <CaptureRegistry />
       </CommandsProvider>
     </OverlayProvider>,
-    { width: 50, height: 12 },
+    // See renderTwoPane: exitOnCtrlC's default self-destroys the renderer mid-test.
+    { width: 50, height: 12, exitOnCtrlC: false },
   )
 }
 
@@ -233,21 +247,23 @@ function render(props?: Partial<Parameters<typeof EditorPane>[0]>) {
 // past the old 3s deadline. Kept below BLAME_TEST_TIMEOUT so a genuine hang throws
 // a readable frame dump here rather than a bare framework timeout.
 //
-// GitHub Actions' shared ubuntu-latest runners have proven to need meaningfully
-// more headroom than any local reproduction (2-CPU taskset, lowered
-// fs.inotify.max_user_instances, CI=true) could trigger: the word-wrapped-line
-// blame test failed 3/3 consecutive CI runs at the old 20s ceiling while passing
-// reliably in every local attempt, including under matched resource constraints.
-// Raised well past what local investigation needed, so a real hang still throws
-// promptly instead of silently eating the whole 25-minute job budget.
-const WAIT_TIMEOUT_MS = 60000
+// A word-wrapped-line blame test failed 3/3 consecutive CI runs even at this
+// ceiling before the ACTUAL bug was found and fixed: recomputeBlame's movement
+// guard (EditorPane.tsx) sampled cursor+scroll but not viewport size/wrap layout,
+// so a frame that ran before yoga layout settled could commit a stale geometry
+// the cursor's fixed final position would never re-trigger — a permanent latch,
+// not slowness, which is why no timeout ever helped. Kept at a moderate (not
+// 3s-original) ceiling since a starved CI runner can still legitimately need more
+// than 3s for a real debounce+render to land — but no longer inflated to work
+// around the latch, since that's fixed at the source now.
+const WAIT_TIMEOUT_MS = 20000
 
 // bun's default per-test timeout is 5s. Under heavy combined-suite load the event
 // loop is starved enough that a blame annotation — correct, but gated behind the
 // 120ms debounce + a render — can settle just past 5s, tripping that default even
 // though the logic is fine. The blame tests opt into a generous per-test ceiling so
 // only a real hang fails them; non-blame tests keep the default.
-const BLAME_TEST_TIMEOUT = 65000
+const BLAME_TEST_TIMEOUT = 25000
 const blameTest = (name: string, fn: () => Promise<void>) => test(name, fn, BLAME_TEST_TIMEOUT)
 
 // `renderOnce()` drives an actual render pass, which is the ONLY thing that fires
@@ -2448,7 +2464,15 @@ function contentRows() {
     .filter((l: string) => l.includes("line "))
 }
 
-test("scroll-beyond-last-line: wheel-down past the old bottom-pin keeps scrolling, painting blank rows below the last line", async () => {
+// The scroll-beyond tests drive 60+ real wheel->render round-trips each way
+// (wheelToBottom + the return loop); under CPU starvation (CI runners, taskset)
+// that legitimately exceeds bun's 5s default, and the timed-out test's ZOMBIE body
+// then touches the torn-down EditorView ("EditorView is destroyed"). Same
+// precedent as blameTest: generous ceiling, only a real hang fails.
+const SCROLL_TEST_TIMEOUT = 30000
+const scrollTest = (name: string, fn: () => Promise<void>) => test(name, fn, SCROLL_TEST_TIMEOUT)
+
+scrollTest("scroll-beyond-last-line: wheel-down past the old bottom-pin keeps scrolling, painting blank rows below the last line", async () => {
   const file = join(dir, "overscroll-past.ts")
   // 60 lines, NO trailing newline so the last line ("line 60") carries text.
   await writeFile(file, Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n"))
@@ -2478,7 +2502,7 @@ test("scroll-beyond-last-line: wheel-down past the old bottom-pin keeps scrollin
   expect(contentRows().length).toBeLessThanOrEqual(3)
 })
 
-test("scroll-beyond-last-line: continued wheel-down parks the last line near the top with blanks below", async () => {
+scrollTest("scroll-beyond-last-line: continued wheel-down parks the last line near the top with blanks below", async () => {
   const file = join(dir, "overscroll-top.ts")
   await writeFile(file, Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n"))
   workbenchStore.openFile(file)
@@ -2499,7 +2523,7 @@ test("scroll-beyond-last-line: continued wheel-down parks the last line near the
   expect(rows.slice(lastLineRow + 1).some((l) => l.includes("line "))).toBe(false)
 })
 
-test("scroll-beyond-last-line: wheel-up from an overscrolled view returns to the top normally", async () => {
+scrollTest("scroll-beyond-last-line: wheel-up from an overscrolled view returns to the top normally", async () => {
   const file = join(dir, "overscroll-up.ts")
   await writeFile(file, Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n"))
   workbenchStore.openFile(file)
@@ -2524,7 +2548,7 @@ test("scroll-beyond-last-line: wheel-up from an overscrolled view returns to the
   expect(testSetup.captureCharFrame()).toContain("line 1")
 })
 
-test("scroll-beyond-last-line: typing while overscrolled keeps the caret visible (no wild snap)", async () => {
+scrollTest("scroll-beyond-last-line: typing while overscrolled keeps the caret visible (no wild snap)", async () => {
   const file = join(dir, "overscroll-type.ts")
   await writeFile(file, Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n"))
   workbenchStore.openFile(file)
@@ -2546,7 +2570,7 @@ test("scroll-beyond-last-line: typing while overscrolled keeps the caret visible
   expect(testSetup.captureCharFrame()).toContain("Zline 60")
 })
 
-test("scroll-beyond-last-line: the vertical scrollbar's scrollSize includes the overscroll allowance", async () => {
+scrollTest("scroll-beyond-last-line: the vertical scrollbar's scrollSize includes the overscroll allowance", async () => {
   const file = join(dir, "overscroll-bar.ts")
   await writeFile(file, Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n"))
   workbenchStore.openFile(file)

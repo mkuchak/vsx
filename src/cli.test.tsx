@@ -7,6 +7,7 @@ import pkg from "../package.json"
 import { isUpdateRequested, isVersionRequested, resolveWorkspaceArg } from "./cli"
 import { documentRegistry } from "./model/documents"
 import { workbenchStore } from "./model/workbench"
+import { destroyRendererAndWait } from "./testUtils/rendererTeardown"
 import { App } from "./workbench/App"
 
 // `process.argv` shape: [binary, script, ...userArgs], so the first two entries
@@ -136,7 +137,7 @@ test("App renders and opens files under a non-cwd workspace root", async () => {
     expect(testSetup.captureCharFrame()).toContain("greeting")
     expect(documentRegistry.get(join(root, "hello.ts"))?.language).toBe("typescript")
   } finally {
-    if (testSetup) testSetup.renderer.destroy()
+    if (testSetup) await destroyRendererAndWait(testSetup.renderer)
     await rm(root, { recursive: true, force: true })
   }
 })
@@ -168,7 +169,7 @@ test("App with initialFile opens that file as an active, permanent tab on boot",
     expect(state.focusArea).toBe("editor")
     expect(testSetup.captureCharFrame()).toContain("greeting")
   } finally {
-    if (testSetup) testSetup.renderer.destroy()
+    if (testSetup) await destroyRendererAndWait(testSetup.renderer)
     await rm(root, { recursive: true, force: true })
   }
 })
@@ -191,7 +192,7 @@ test("App without initialFile opens no tab on boot", async () => {
     expect(group.tabs).toHaveLength(0)
     expect(group.activeTabPath).toBeNull()
   } finally {
-    if (testSetup) testSetup.renderer.destroy()
+    if (testSetup) await destroyRendererAndWait(testSetup.renderer)
     await rm(root, { recursive: true, force: true })
   }
 })

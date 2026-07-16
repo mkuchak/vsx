@@ -1,12 +1,13 @@
 import { testRender } from "@opentui/react/test-utils"
 import { afterEach, expect, test } from "bun:test"
 import type { LineBlame } from "../services/git"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { BlameAnnotation, layoutAnnotation } from "./BlameAnnotation"
 
 let testSetup: Awaited<ReturnType<typeof testRender>> | undefined
 
-afterEach(() => {
-  testSetup?.renderer.destroy()
+afterEach(async () => {
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   testSetup = undefined
 })
 

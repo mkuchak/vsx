@@ -13,6 +13,7 @@ import type { SearchResult } from "../services/search"
 import { CommandsProvider } from "../workbench/CommandsProvider"
 import { consumePendingGoto } from "../workbench/editorControls"
 import { OverlayProvider } from "../workbench/OverlayProvider"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { EditorGroups } from "./EditorGroups"
 import { SearchPanel } from "./SearchPanel"
 
@@ -44,7 +45,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  testSetup?.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   testSetup = undefined
   workbenchStore.reset()
   mock.restore()

@@ -1,13 +1,14 @@
 import { afterEach, expect, test } from "bun:test"
 import { testRender } from "@opentui/react/test-utils"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { CommandsProvider } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
 import { TextInputDialog, type TextInputDialogProps } from "./TextInputDialog"
 
 let testSetup: Awaited<ReturnType<typeof testRender>>
 
-afterEach(() => {
-  if (testSetup) testSetup.renderer.destroy()
+afterEach(async () => {
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
 })
 
 type Node = { id?: string; x?: number; y?: number; getChildren: () => unknown[] }

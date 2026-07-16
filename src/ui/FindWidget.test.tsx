@@ -8,6 +8,7 @@ import { documentRegistry } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
 import { CommandsProvider } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { EditorGroups } from "./EditorGroups"
 import { FindWidget } from "./FindWidget"
 
@@ -20,7 +21,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  testSetup?.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   testSetup = undefined
   workbenchStore.reset()
   await rm(dir, { recursive: true, force: true })

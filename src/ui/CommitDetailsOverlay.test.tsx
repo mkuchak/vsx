@@ -1,13 +1,14 @@
 import { testRender } from "@opentui/react/test-utils"
 import { afterEach, expect, test } from "bun:test"
 import type { CommitInfo } from "../services/git"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { CommandsProvider } from "../workbench/CommandsProvider"
 import { CommitDetailsOverlay } from "./CommitDetailsOverlay"
 
 let testSetup: Awaited<ReturnType<typeof testRender>> | undefined
 
-afterEach(() => {
-  testSetup?.renderer.destroy()
+afterEach(async () => {
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   testSetup = undefined
 })
 

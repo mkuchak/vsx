@@ -8,6 +8,7 @@ import { join } from "node:path"
 import { act, useState } from "react"
 import { documentRegistry } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { CommandsProvider, useCommands } from "../workbench/CommandsProvider"
 import { OverlayProvider, useOverlay } from "../workbench/OverlayProvider"
 import type { CommandRegistry } from "../services/commands"
@@ -48,7 +49,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  testSetup?.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   testSetup = undefined
   workbenchStore.reset()
   await rm(dir, { recursive: true, force: true })

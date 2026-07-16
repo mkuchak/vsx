@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { testRender } from "@opentui/react/test-utils"
 import { workbenchStore } from "../model/workbench"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { StatusBar } from "./StatusBar"
 
 let root: string
@@ -26,7 +27,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  if (testSetup) testSetup.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   await rm(root, { recursive: true, force: true })
 })
 

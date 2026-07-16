@@ -7,6 +7,7 @@ import { MouseButton, RGBA, type CapturedLine } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { workbenchStore } from "../model/workbench"
 import * as workspace from "../services/workspace"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { theme } from "../theme"
 import { FileTree } from "./FileTree"
 
@@ -40,7 +41,7 @@ beforeEach(async () => {
 afterEach(async () => {
   listDirSpy.mockRestore()
   dirWatcherSpy?.mockRestore()
-  if (testSetup) testSetup.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   workbenchStore.reset()
   await rm(dir, { recursive: true, force: true })
 })
@@ -238,7 +239,7 @@ test("unmount disposes all directory watches (no stray refresh after)", async ()
   testSetup = await render()
   await waitForText("package.json")
 
-  testSetup.renderer.destroy()
+  await destroyRendererAndWait(testSetup.renderer)
   await Bun.sleep(50)
   expect(disposed).toBe(1)
 
@@ -267,7 +268,7 @@ test("expanded folders survive an unmount + remount (sidebar hide/show or tab sw
   // on Ctrl+B (unmount the whole sidebar) and on switching sidebarView away from
   // "explorer" and back (a ternary swap, not a CSS hide). The workbenchStore
   // singleton is untouched by this, unlike local component state.
-  testSetup.renderer.destroy()
+  await destroyRendererAndWait(testSetup.renderer)
 
   testSetup = await render()
   // The remounted instance must show src already expanded, children and all —

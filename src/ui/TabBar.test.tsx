@@ -7,6 +7,7 @@ import { join } from "node:path"
 import { act } from "react"
 import { type Document, documentRegistry } from "../model/documents.ts"
 import { workbenchStore } from "../model/workbench.ts"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown.ts"
 import { CommandsProvider } from "../workbench/CommandsProvider.tsx"
 import { TabBar } from "./TabBar.tsx"
 
@@ -19,7 +20,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  testSetup?.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   testSetup = undefined
   await rm(root, { recursive: true, force: true })
 })
@@ -206,7 +207,8 @@ describe("dirty indicator", () => {
       workbenchStore.openFile(path, { preview: false })
       const setup = await renderTabBar()
       await settle(setup) // ensure the subscription actually attached while mounted
-      setup.renderer.destroy() // unmounts React, running useDocument's cleanup
+      // unmounts React, running useDocument's cleanup
+      await destroyRendererAndWait(setup.renderer)
       await act(async () => {
         await Bun.sleep(0)
       })

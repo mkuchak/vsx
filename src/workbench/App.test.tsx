@@ -9,6 +9,7 @@ import * as clipboard from "../services/clipboard"
 import * as fileHistory from "../services/fileHistory"
 import type { FileHistory } from "../services/fileHistory"
 import * as reposService from "../services/repos"
+import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { App } from "./App"
 import { getLastRendererSelection, handleRendererSelection } from "./rendererSelection"
 
@@ -91,7 +92,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  if (testSetup) testSetup.renderer.destroy()
+  if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   // Clear the module-level renderer-selection cache so it can't leak into the
   // next test's Ctrl+C fallback (an empty selection resets it).
   handleRendererSelection({ getSelectedText: () => "" })
@@ -99,7 +100,7 @@ afterEach(async () => {
 })
 
 test("boots into the Explorer with an empty editor and status bar showing the branch", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
 
   const frame = testSetup.captureCharFrame()
@@ -114,7 +115,7 @@ test("discovers repositories exactly once for the whole workbench tree", async (
   // all read that shared result from context instead of each re-sweeping the tree.
   const discoverSpy = spyOn(reposService, "discoverRepositories")
   try {
-    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
     await settle(testSetup)
     expect(discoverSpy).toHaveBeenCalledTimes(1)
   } finally {
@@ -123,7 +124,7 @@ test("discovers repositories exactly once for the whole workbench tree", async (
 })
 
 test("Ctrl+P opens Quick Open, and accepting a file opens it in the editor", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
 
   testSetup.mockInput.pressKey("p", { ctrl: true })
@@ -145,7 +146,7 @@ test("Ctrl+P opens Quick Open, and accepting a file opens it in the editor", asy
 })
 
 test("opening a file directly through the model reflects its content in the editor pane", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
 
   workbenchStore.openFile(join(root, "hello.ts"), { preview: true })
@@ -158,7 +159,7 @@ test("opening a file directly through the model reflects its content in the edit
 })
 
 test("an external edit to an open, clean file reloads the buffer in the editor", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
 
   // Open the file (clean, no unsaved edits) so its document is registered.
@@ -183,6 +184,7 @@ test("Ctrl+Shift+G switches the sidebar to Source Control", async () => {
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
 
@@ -198,6 +200,7 @@ test("discard confirmation renders across the full viewport, not just the 32-col
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
 
@@ -223,6 +226,7 @@ test("confirming a discard through the root modal reverts the file", async () =>
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
 
@@ -247,6 +251,7 @@ test("cancelling a discard through the root modal leaves the file untouched", as
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
 
@@ -275,7 +280,7 @@ async function openHelloFromTree() {
 }
 
 test("closing Quick Open with Esc restores editor focus so typing lands in the editor again", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   await openHelloFromTree()
 
@@ -301,7 +306,7 @@ test("closing Quick Open with Esc restores editor focus so typing lands in the e
 test("Ctrl+V while Quick Open is open does not leak a paste into the editor underneath", async () => {
   const readSpy = spyOn(clipboard, "read").mockResolvedValue("LEAKED")
   try {
-    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
     await settle(testSetup)
     await openHelloFromTree()
 
@@ -327,7 +332,7 @@ test("Enter while an overlay is open does not open the FileTree's selected row",
   // test was flaky for exactly that reason).
   const { spy } = stubFileHistory()
   try {
-    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
     await settle(testSetup)
     await waitForText("hello.ts")
 
@@ -359,7 +364,7 @@ function statusShowsCursor(): boolean {
 }
 
 test("Esc that closes Quick Open does not flip sidebar focus into the editor", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   await waitForText("hello.ts")
 
@@ -387,6 +392,7 @@ test("cancelling a discard dialog with Esc does not flip sidebar focus into the 
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
 
@@ -429,6 +435,7 @@ test("focusing the Explorer blurs the editor so typing and arrows never reach th
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
   await openHelloFromTree() // opens hello.ts and moves focus into the editor
@@ -461,7 +468,7 @@ test("focusing the Explorer blurs the editor so typing and arrows never reach th
 })
 
 test("in split view, sidebar focus blurs both panes and Esc focuses only the active one", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 140, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 140, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
 
   // Two panes over the same file. Opening/splitting now takes editor focus, so
@@ -508,7 +515,7 @@ function headerLabelRed(label: string): number {
 }
 
 test("sidebar header shows all four activity tabs with Explorer active by default", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
 
   const line0 = testSetup.captureCharFrame().split("\n")[0]
@@ -529,6 +536,7 @@ test("Ctrl+Shift+F focuses the Search view and un-collapses the sidebar", async 
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
 
@@ -543,7 +551,7 @@ test("Ctrl+Shift+F focuses the Search view and un-collapses the sidebar", async 
 })
 
 test("clicking the Source tab switches to Source Control and highlights that tab", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
 
   await testSetup.mockMouse.pressDown(headerLabelX("Source"), 0)
@@ -554,7 +562,7 @@ test("clicking the Source tab switches to Source Control and highlights that tab
 })
 
 test("clicking the Commit tab switches to the commit log", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
 
   await testSetup.mockMouse.pressDown(headerLabelX("Commit"), 0)
@@ -570,6 +578,7 @@ test("Ctrl+Shift+E keyboard command still switches to and highlights the Explore
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
 
@@ -587,7 +596,7 @@ test("Ctrl+Shift+E keyboard command still switches to and highlights the Explore
 })
 
 test("clicking a sidebar tab does not leak focus into the editor", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
 
   // Open a file INTO the editor so it holds focus (cursor visible in the status bar).
@@ -611,7 +620,7 @@ function primeRendererSelection(text: string) {
 }
 
 test("with the sidebar focused, Ctrl+C copies the cached renderer selection once", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   // Boot focuses the Explorer (sidebar) with no editor textarea mounted.
 
@@ -629,7 +638,7 @@ test("with the sidebar focused, Ctrl+C copies the cached renderer selection once
 })
 
 test("with a diff tab active in the editor, Ctrl+C copies the cached renderer selection once", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
 
   // A diff tab mounts DiffPane (no textarea) yet takes editor focus, so the global
@@ -652,7 +661,7 @@ test("with a diff tab active in the editor, Ctrl+C copies the cached renderer se
 })
 
 test("with a file editor focused, Ctrl+C copies once (global handler stands down, no double-copy)", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   await openHelloFromTree() // file tab focused → EditorPane owns Ctrl+C
 
@@ -694,7 +703,7 @@ function soleEditorGroupWidth(): number {
 }
 
 test("Ctrl+B collapses the sidebar and grows the editor to full width, then re-expands", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   await waitForText("hello.ts")
 
@@ -724,6 +733,7 @@ test("Ctrl+Shift+E while the sidebar is collapsed re-opens it with the Explorer 
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
 
@@ -744,7 +754,7 @@ test("Ctrl+Shift+E while the sidebar is collapsed re-opens it with the Explorer 
 })
 
 test("collapsing while the sidebar is focused hands keyboard focus to the editor", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   // Boot focuses the Explorer (sidebar).
   expect(workbenchStore.getState().focusArea).toBe("sidebar")
@@ -757,7 +767,7 @@ test("collapsing while the sidebar is focused hands keyboard focus to the editor
 })
 
 test("clicking the sidebar footer collapses the sidebar", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   await waitForText("Hide Sidebar")
 
@@ -785,6 +795,7 @@ test("an expanded Explorer folder survives switching sidebar tabs and toggling t
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
   await waitForText("hello.ts")
@@ -822,7 +833,7 @@ test("an expanded Explorer folder survives switching sidebar tabs and toggling t
 test("clicking Collapse All in the sidebar footer collapses the Explorer tree", async () => {
   await mkdir(join(root, "src"))
   await writeFile(join(root, "src", "index.ts"), "export {}\n")
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   await waitForText("hello.ts")
 
@@ -851,6 +862,7 @@ test("Collapse All is not shown while a non-Explorer sidebar tab is active", asy
     width: 100,
     height: 30,
     kittyKeyboard: true,
+    exitOnCtrlC: false,
   })
   await settle(testSetup)
   await waitForText("hello.ts")
@@ -862,7 +874,7 @@ test("Collapse All is not shown while a non-Explorer sidebar tab is active", asy
 }, 15000)
 
 test("clicking the status-bar ☰ affordance toggles the sidebar both ways", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   await waitForText("hello.ts")
 
@@ -883,7 +895,7 @@ test("clicking the status-bar ☰ affordance toggles the sidebar both ways", asy
 })
 
 test("clicking the status-bar ☰ affordance while an overlay is open does not toggle the sidebar", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   await waitForText("hello.ts")
   expect(findById("sidebar")).not.toBeNull()
@@ -901,7 +913,7 @@ test("clicking the status-bar ☰ affordance while an overlay is open does not t
 })
 
 test("clicking the status-bar ☰ affordance preserves the cached renderer selection for Ctrl+C", async () => {
-  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+  testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
   await settle(testSetup)
   await waitForText("hello.ts")
 
@@ -962,7 +974,7 @@ test("the initialFile boot open is recorded exactly once", async () => {
 test("quitting flushes the file history before teardown", async () => {
   const { flush, spy } = stubFileHistory()
   try {
-    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
     await settle(testSetup)
 
     testSetup.mockInput.pressKey("q", { ctrl: true })
@@ -976,7 +988,7 @@ test("quitting flushes the file history before teardown", async () => {
 test("ctrl+alt+q also quits (alternate chord for hosts that swallow ctrl+q)", async () => {
   const { flush, spy } = stubFileHistory()
   try {
-    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
     await settle(testSetup)
 
     testSetup.mockInput.pressKey("q", { ctrl: true, meta: true })
@@ -990,7 +1002,7 @@ test("ctrl+alt+q also quits (alternate chord for hosts that swallow ctrl+q)", as
 test("ctrl+q keeps quitting immediately, with no confirm dialog", async () => {
   const { flush, spy } = stubFileHistory()
   try {
-    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
     await settle(testSetup)
 
     testSetup.mockInput.pressKey("q", { ctrl: true })
@@ -1006,7 +1018,7 @@ test("ctrl+q keeps quitting immediately, with no confirm dialog", async () => {
 test("clicking the status-bar ⏻ button opens a confirm dialog without quitting yet", async () => {
   const { flush, spy } = stubFileHistory()
   try {
-    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
     await settle(testSetup)
 
     const quitCell = findById("statusbar-quit-button")!
@@ -1024,7 +1036,7 @@ test("clicking the status-bar ⏻ button opens a confirm dialog without quitting
 test("confirming the quit dialog runs workbench.quit", async () => {
   const { flush, spy } = stubFileHistory()
   try {
-    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
     await settle(testSetup)
 
     const quitCell = findById("statusbar-quit-button")!
@@ -1044,7 +1056,7 @@ test("confirming the quit dialog runs workbench.quit", async () => {
 test("cancelling the quit dialog closes it and the app keeps running", async () => {
   const { flush, spy } = stubFileHistory()
   try {
-    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30 })
+    testSetup = await testRender(<App workspaceRoot={root} />, { width: 100, height: 30, exitOnCtrlC: false })
     await settle(testSetup)
 
     const quitCell = findById("statusbar-quit-button")!

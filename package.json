@@ -11,6 +11,7 @@
     "start": "bun run src/main.tsx",
     "dev": "bun --watch run src/main.tsx",
     "test": "bun test",
+    "test:ci-parity": "bun run scripts/ci-parity.ts",
     "build:release": "bun run scripts/build-release.ts",
     "typecheck": "tsc --noEmit",
     "release": "release-it --ci"

@@ -1493,8 +1493,24 @@ function EditorTextarea({
   const blameState = useLineBlame(doc, blameLine, blameService, blameRelativePath)
 
   // Last-sampled inputs, so the per-frame recompute below can skip the (whole-doc)
-  // work unless the cursor row/col or the scroll offsets actually moved.
-  const blameSampleRef = useRef({ row: -1, col: -1, offsetY: -1, offsetX: -1 })
+  // work unless something the computed overlay depends on actually changed. The
+  // tuple must cover EVERY input the computation reads — cursor, scroll offsets,
+  // viewport size, and the wrap layout (total visual line count) — because this
+  // guard is the recompute's only re-entry point. A freshly mounted textarea's
+  // EditorView boots at a default 80x24 viewport until yoga layout applies the
+  // real size; on a slow machine the first frame can sample the cursor's final
+  // resting position against that degenerate layout, and a tuple blind to
+  // viewport/wrap changes would latch the garbage overlay forever (the cursor
+  // never moves again, so the guard would hit on every subsequent frame).
+  const blameSampleRef = useRef({
+    row: -1,
+    col: -1,
+    offsetY: -1,
+    offsetX: -1,
+    width: -1,
+    height: -1,
+    virtualLines: -1,
+  })
   const recomputeBlame = useCallback(() => {
     // No repo for this file → no blame ever, so skip the per-frame sampling (and the
     // state churn it would cause) entirely; blameLine/blameOverlay stay null.
@@ -1506,11 +1522,31 @@ function EditorTextarea({
     const vp = view.getViewport()
     const row = cursor?.row ?? -1
     const col = cursor?.col ?? -1
+    // Cheap scalar FFI call; changes whenever the wrap layout re-flows (e.g. the
+    // viewport width settling after mount re-wraps a long line), even if the
+    // cursor and scroll offsets stayed put.
+    const virtualLines = view.getTotalVirtualLineCount()
     const last = blameSampleRef.current
-    if (row === last.row && col === last.col && vp.offsetY === last.offsetY && vp.offsetX === last.offsetX) {
+    if (
+      row === last.row &&
+      col === last.col &&
+      vp.offsetY === last.offsetY &&
+      vp.offsetX === last.offsetX &&
+      vp.width === last.width &&
+      vp.height === last.height &&
+      virtualLines === last.virtualLines
+    ) {
       return
     }
-    blameSampleRef.current = { row, col, offsetY: vp.offsetY, offsetX: vp.offsetX }
+    blameSampleRef.current = {
+      row,
+      col,
+      offsetY: vp.offsetY,
+      offsetX: vp.offsetX,
+      width: vp.width,
+      height: vp.height,
+      virtualLines,
+    }
 
     if (!cursor) {
       setBlameLine(null)

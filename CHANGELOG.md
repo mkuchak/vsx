@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.9](https://github.com/mkuchak/vsx/compare/v0.3.8...v0.3.9) (2026-07-16)
+
+### Features
+
+* **editor:** add inline git-blame annotation to EditorPane ([06a5c42](https://github.com/mkuchak/vsx/commit/06a5c428ff94973b551738b9b4be40687dbfef9c))
+* **explorer:** wire breadcrumbs reveal and context-menu triggers into FileTree/EditorGroups ([95fd42c](https://github.com/mkuchak/vsx/commit/95fd42c56141c8cb252f8615ab80c8981ef4ad7d))
+* **git:** add line-level blame lookup to GitService ([76ae859](https://github.com/mkuchak/vsx/commit/76ae859118cec1237fa71357766f1419de66bc37)), closes [#1234](https://github.com/mkuchak/vsx/issues/1234)
+* **model:** add tab/document retargeting and filesystem mutation primitives ([d73abd6](https://github.com/mkuchak/vsx/commit/d73abd6093253bb0edee66b426afe667e69c7188))
+* **ui:** add Breadcrumbs, ContextMenu, and TextInputDialog components ([b5a8b9c](https://github.com/mkuchak/vsx/commit/b5a8b9c3966bfc7bf198042c6333f7b3fe0ad6e5))
+* **workbench:** wire file-explorer context menu and breadcrumb reveal into App ([1e0a158](https://github.com/mkuchak/vsx/commit/1e0a1580f3b8b8a80f4fa46cdc5a98d6b3234177))
+
+### Bug Fixes
+
+* **editor:** fix blame annotation position latch on mount ([e904ae5](https://github.com/mkuchak/vsx/commit/e904ae5ba1cea9cddd254bee8d1b1d9e62bb7f39))
+* **editor:** make multi-click detection use an injectable clock ([2158d48](https://github.com/mkuchak/vsx/commit/2158d484e0f99930b299053ad73d02c100ba0837))
+
 ## [0.3.8](https://github.com/mkuchak/vsx/compare/v0.3.7...v0.3.8) (2026-07-11)
 
 ### Features

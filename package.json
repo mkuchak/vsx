@@ -1,6 +1,6 @@
 {
   "name": "vsx",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "module": "src/main.tsx",
   "type": "module",
   "private": true,

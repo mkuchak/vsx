@@ -14,6 +14,8 @@ import { testRender } from "@opentui/react/test-utils"
 import { documentRegistry } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
+import type { GitService, LineBlame } from "../services/git"
+import type { RepoInfo } from "../services/repos"
 import { getSharedSyntaxStyle, theme } from "../theme"
 import { CommandsProvider, useCommands } from "../workbench/CommandsProvider"
 import { OverlayProvider } from "../workbench/OverlayProvider"
@@ -224,14 +226,65 @@ function render(props?: Partial<Parameters<typeof EditorPane>[0]>) {
   )
 }
 
-async function waitForText(text: string, timeoutMs = 3000) {
+// A generous ceiling: these poll a real frame on a short interval and return the
+// instant the text lands, so a large timeout never slows a passing test — it only
+// stops the blame tests (whose text arrives after useLineBlame's 120ms debounce +
+// a render) from failing spuriously when a loaded machine starves the event loop
+// past the old 3s deadline. Kept below BLAME_TEST_TIMEOUT so a genuine hang throws
+// a readable frame dump here rather than a bare framework timeout.
+const WAIT_TIMEOUT_MS = 20000
+
+// bun's default per-test timeout is 5s. Under heavy combined-suite load the event
+// loop is starved enough that a blame annotation — correct, but gated behind the
+// 120ms debounce + a render — can settle just past 5s, tripping that default even
+// though the logic is fine. The blame tests opt into a generous per-test ceiling so
+// only a real hang fails them; non-blame tests keep the default.
+const BLAME_TEST_TIMEOUT = 25000
+const blameTest = (name: string, fn: () => Promise<void>) => test(name, fn, BLAME_TEST_TIMEOUT)
+
+// `renderOnce()` drives an actual render pass, which is the ONLY thing that fires
+// the renderer's frame callbacks — and the inline-blame position (recomputeBlame in
+// EditorPane) rides that frame hook, so the annotation never appears from a bare
+// `flush()` (React updates only). In isolation a background frame loop ticks often
+// enough to hide this; under load that loop starves and blame can take >20s or never
+// show, so every poll here forces a frame rather than hoping one happens.
+async function waitForText(text: string, timeoutMs = WAIT_TIMEOUT_MS) {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
     await testSetup.flush()
+    await testSetup.renderOnce()
     if (testSetup.captureCharFrame().includes(text)) return
     await Bun.sleep(30)
   }
   throw new Error(`timed out waiting for "${text}"\n${testSetup.captureCharFrame()}`)
+}
+
+/** Poll until `text` is gone from the frame, instead of sleeping a fixed guess
+ *  and racing useLineBlame's 120ms debounce. Dirty-gating removes the annotation
+ *  deterministically (and never re-spawns git while dirty), so once it's gone it
+ *  stays gone — a first-absent poll is a sound stand-in for the old fixed wait. */
+/** Poll (flushing between checks) until `predicate` holds, instead of reading a
+ *  still-settling layout/state value at a single instant. */
+async function waitUntil(predicate: () => boolean, label = "condition", timeoutMs = WAIT_TIMEOUT_MS) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    await testSetup.flush()
+    await testSetup.renderOnce()
+    if (predicate()) return
+    await Bun.sleep(30)
+  }
+  throw new Error(`timed out waiting for ${label}\n${testSetup.captureCharFrame()}`)
+}
+
+async function waitForTextGone(text: string, timeoutMs = WAIT_TIMEOUT_MS) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    await testSetup.flush()
+    await testSetup.renderOnce()
+    if (!testSetup.captureCharFrame().includes(text)) return
+    await Bun.sleep(30)
+  }
+  throw new Error(`timed out waiting for "${text}" to disappear\n${testSetup.captureCharFrame()}`)
 }
 
 test("renders a recognized file's content in an editable textarea", async () => {
@@ -246,6 +299,194 @@ test("renders a recognized file's content in an editable textarea", async () => 
   expect(frame).toContain("const answer = 42")
   expect(frame).toContain("function greet")
   expect(frame).toMatchSnapshot()
+})
+
+/** A RepoInfo whose GitService.blame() resolves to a fixed LineBlame (no real git). */
+function fakeReposWithBlame(root: string, blame: LineBlame): RepoInfo[] {
+  const service = { blame: async () => blame } as unknown as GitService
+  return [{ root, gitDir: join(root, ".git"), commonDir: join(root, ".git"), service }]
+}
+
+blameTest("renders the inline blame annotation on the cursor's line", async () => {
+  const file = join(dir, "example.ts")
+  await writeFile(file, 'const answer = 42\nfunction greet() {\n  return "hi"\n}\n')
+  workbenchStore.openFile(file)
+
+  const repos = fakeReposWithBlame(dir, {
+    hash: "abc1234",
+    authorName: "Ada Lovelace",
+    authorDate: new Date(),
+    summary: "Add the answer (#42)",
+    prNumber: 42,
+    uncommitted: false,
+  })
+
+  testSetup = await render({ repos })
+  await waitForText("const answer")
+  // The blame fetch is debounced (120ms) then applied asynchronously.
+  await waitForText("Ada Lovelace")
+
+  expect(testSetup.captureCharFrame()).toContain("Ada Lovelace")
+})
+
+blameTest("hides the inline blame annotation while the buffer is dirty", async () => {
+  const file = join(dir, "example.ts")
+  await writeFile(file, "const answer = 42\n")
+  workbenchStore.openFile(file)
+
+  const repos = fakeReposWithBlame(dir, {
+    hash: "abc1234",
+    authorName: "Ada Lovelace",
+    authorDate: new Date(),
+    summary: "Add the answer",
+    prNumber: null,
+    uncommitted: false,
+  })
+
+  testSetup = await render({ repos })
+  await waitForText("Ada Lovelace")
+
+  // A local edit makes the doc dirty; useLineBlame gates blame off immediately.
+  await testSetup.mockInput.typeText("X")
+  await waitForTextGone("Ada Lovelace")
+
+  expect(testSetup.captureCharFrame()).not.toContain("Ada Lovelace")
+})
+
+blameTest("re-shows the inline blame annotation after the dirty buffer is saved", async () => {
+  const file = join(dir, "example.ts")
+  await writeFile(file, "const answer = 42\n")
+  workbenchStore.openFile(file)
+
+  const repos = fakeReposWithBlame(dir, {
+    hash: "abc1234",
+    authorName: "Ada Lovelace",
+    authorDate: new Date(),
+    summary: "Add the answer",
+    prNumber: null,
+    uncommitted: false,
+  })
+
+  testSetup = await render({ repos })
+  await waitForText("Ada Lovelace")
+
+  // Edit the line: dirty flips true, useLineBlame gates blame off immediately.
+  await testSetup.mockInput.typeText("X")
+  await waitForTextGone("Ada Lovelace")
+  expect(testSetup.captureCharFrame()).not.toContain("Ada Lovelace")
+
+  // Save WITHOUT moving the cursor — exactly what the Ctrl+S command's run() does
+  // (that binding lives in EditorGroups, not this pane harness). The blame must
+  // reappear on its own via useLineBlame's onDidSave subscription.
+  await documentRegistry.get(file)?.save()
+  await waitForText("Ada Lovelace")
+
+  expect(testSetup.captureCharFrame()).toContain("Ada Lovelace")
+})
+
+/**
+ * Frame row (absolute, 0-based) the blame annotation currently occupies, or -1 if
+ * it isn't painted. Polls until it lands on `expectedRow` so the assertion never
+ * races a still-settling recompute/blame fetch.
+ */
+async function waitForBlameRow(expectedRow: number, timeoutMs = WAIT_TIMEOUT_MS) {
+  const start = Date.now()
+  let seen = -1
+  while (Date.now() - start < timeoutMs) {
+    await testSetup.flush()
+    await testSetup.renderOnce()
+    const rows = testSetup.captureCharFrame().split("\n") as string[]
+    seen = rows.findIndex((l) => l.includes("Ada Lovelace"))
+    if (seen === expectedRow) return seen
+    await Bun.sleep(30)
+  }
+  throw new Error(
+    `blame landed on row ${seen}, expected ${expectedRow}\n${testSetup.captureCharFrame()}`,
+  )
+}
+
+blameTest("positions the inline blame on the LAST visual row of a word-wrapped line", async () => {
+  const file = join(dir, "wrap-blame.ts")
+  // One long logical line that wraps across several visual rows at the 50-col render
+  // width. The annotation trails the end of the line, whose text visually ends on
+  // the line's LAST visual row — not the top of the wrapped block.
+  const longLine = "word ".repeat(30).trim()
+  await writeFile(file, `${longLine}\nshort\n`)
+  workbenchStore.openFile(file)
+
+  const repos = fakeReposWithBlame(dir, {
+    hash: "abc1234",
+    authorName: "Ada Lovelace",
+    authorDate: new Date(),
+    summary: "Wrapped line",
+    prNumber: null,
+    uncommitted: false,
+  })
+
+  testSetup = await render({ repos }) // default wordWrap="word"
+  await waitForText("short") // content is up → the textarea + document are mounted
+
+  // Plant the caret on the wrapped logical line 0 explicitly. useLineBlame's
+  // cursor-line input comes from recomputeBlame sampling the view's cursor on a
+  // frame; if that first sample lands before the default-open cursor exists, its
+  // movement-guard latches blameLine at null and the annotation never fetches.
+  // Setting the cursor makes that input deterministic (and keeps the caret on the
+  // same line 0 the assertion below is about).
+  const ta = getTextarea()
+  ta.setCursor(0, 0)
+  await waitForText("Ada Lovelace")
+
+  // Derive the first/last visual rows that line occupies from the same API the pane reads.
+  const visualSpan = () => {
+    const info = ta.editorView.getLogicalLineInfo()
+    const first = info.lineSources.indexOf(0)
+    let last = first
+    while (last + 1 < info.lineSources.length && info.lineSources[last + 1] === 0) last++
+    return { first, last }
+  }
+  // The wrap layout can still be settling when the blame text first paints, so
+  // poll the same API the pane reads until logical line 0 genuinely spans >1
+  // visual row rather than reading it at a single (occasionally-empty) instant.
+  await waitUntil(() => visualSpan().last > visualSpan().first, "logical line 0 to wrap")
+  const { first: firstVisual, last: lastVisual } = visualSpan()
+  // The fixture genuinely wraps: its tail is on a LOWER visual row than its head.
+  expect(lastVisual).toBeGreaterThan(firstVisual)
+
+  // Frame row 0 is the textarea's top row (offsetY 0), so the annotation's frame row
+  // equals its visualRow. It must sit on the last visual row (the visible tail), not
+  // the first — the pre-fix code anchored it to `firstVisual`, clamped hard against
+  // the right edge by the full logical length overflowing that top row's width.
+  const blameRow = await waitForBlameRow(ta.y + lastVisual)
+  expect(blameRow).not.toBe(ta.y + firstVisual)
+})
+
+blameTest("positions the inline blame on the caret's own row for a non-wrapped line", async () => {
+  const file = join(dir, "nowrap-blame.ts")
+  await writeFile(file, "alpha\nbravo\ncharlie\n")
+  workbenchStore.openFile(file)
+
+  const repos = fakeReposWithBlame(dir, {
+    hash: "abc1234",
+    authorName: "Ada Lovelace",
+    authorDate: new Date(),
+    summary: "Short line",
+    prNumber: null,
+    uncommitted: false,
+  })
+
+  testSetup = await render({ repos }) // default wordWrap="word", but no line wraps
+  await waitForText("bravo") // content is up → the textarea + document are mounted
+
+  // Park the caret on the middle line up front — a short line occupies exactly one
+  // visual row (first === last), so the annotation must land on that row (the
+  // already-correct single-visual-row behavior this fix must not regress). Setting
+  // the cursor before waiting also makes useLineBlame's cursor-line input
+  // deterministic instead of racing the default-open cursor (see the wrap test).
+  const ta = getTextarea()
+  ta.setCursor(1, 0)
+  await waitForText("Ada Lovelace")
+  const visualRow = ta.editorView.getLogicalLineInfo().lineSources.indexOf(1)
+  await waitForBlameRow(ta.y + visualRow)
 })
 
 test("renders an unrecognized extension as plain text without crashing", async () => {

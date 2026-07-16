@@ -11,6 +11,7 @@ import {
   type TextareaOptions,
 } from "@opentui/core"
 import { extend, useKeyboard, useRenderer } from "@opentui/react"
+import { relative } from "node:path"
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react"
 import {
   documentRegistry,
@@ -19,7 +20,11 @@ import {
 } from "../model/documents"
 import { workbenchStore } from "../model/workbench"
 import * as clipboard from "../services/clipboard"
+import type { GitService } from "../services/git"
+import { activeRepoFor, type RepoInfo } from "../services/repos"
 import { CURSOR_STYLE, getFindStyleIds, getSharedSyntaxStyle, theme } from "../theme"
+import { useLineBlame } from "../workbench/useLineBlame"
+import { BlameAnnotation } from "./BlameAnnotation"
 import { createNativeOffsetConverter } from "./highlightOffsets"
 import {
   consumePendingGoto,
@@ -154,6 +159,12 @@ export type EditorPaneProps = {
   wordWrap?: "word" | "none"
   /** Fires with a 1-based line/column whenever the cursor moves. Status-bar hookup. */
   onCursorChange?: (pos: CursorPosition) => void
+  /**
+   * Discovered repos, threaded down from the shared {@link useRepos} pass in
+   * EditorGroupPane. Used to resolve the open file's repo for inline git blame;
+   * defaults to `[]` (no repo → no blame) so isolated panel tests need not wire it.
+   */
+  repos?: RepoInfo[]
 }
 
 /** Bytes of an oversized file to show as a plain-text preview. */
@@ -408,11 +419,21 @@ export function EditorPane({
   groupId,
   wordWrap = "word",
   onCursorChange,
+  repos = [],
 }: EditorPaneProps) {
   const state = useWorkbenchStore()
   const resolvedGroupId = groupId ?? state.activeGroupId
   const group = state.groups.find((g) => g.id === resolvedGroupId)
   const path = group?.activeTabPath ?? null
+
+  // Resolve the open file's repo (deepest match) for inline git blame. `path` is
+  // absolute (documents key on it verbatim), so a repo-relative path — what
+  // GitService.blame() and useLineBlame want — is `relative(repo.root, path)`.
+  // No repo containing the file → no service/path → useLineBlame stays inert.
+  const blameRepo = path !== null ? activeRepoFor(path, repos) : null
+  const blameService = blameRepo?.service ?? null
+  const blameRelativePath =
+    blameRepo !== null && path !== null ? relative(blameRepo.root, path) : null
 
   const [load, setLoad] = useState<LoadState>({ kind: "empty" })
   const [, forceUpdate] = useReducer((n: number) => n + 1, 0)
@@ -522,6 +543,8 @@ export function EditorPane({
       height={height}
       wordWrap={wordWrap}
       onCursorChange={onCursorChange}
+      blameService={blameService}
+      blameRelativePath={blameRelativePath}
     />
   )
 }
@@ -534,6 +557,10 @@ type EditorTextareaProps = {
   height: number | `${number}%` | "auto"
   wordWrap: "word" | "none"
   onCursorChange?: (pos: CursorPosition) => void
+  /** GitService for the repo containing this file, or null when it's outside every repo. */
+  blameService: GitService | null
+  /** Repo-relative path of this file (for `git blame`), or null when there's no repo. */
+  blameRelativePath: string | null
 }
 
 /**
@@ -543,7 +570,16 @@ type EditorTextareaProps = {
  * `onContentChange`, and external changes (disk/save) flow Document → textarea by
  * pushing text into the buffer on non-'edit' change events.
  */
-function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChange }: EditorTextareaProps) {
+function EditorTextarea({
+  doc,
+  groupId,
+  focused,
+  height,
+  wordWrap,
+  onCursorChange,
+  blameService,
+  blameRelativePath,
+}: EditorTextareaProps) {
   const renderer = useRenderer()
   const { isOverlayOpen } = useOverlay()
   const taRef = useRef<EditorTextareaRenderable | null>(null)
@@ -1428,16 +1464,6 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
     }
   }, [])
 
-  // Per-frame poll (see above). setFrameCallback is the renderer's sanctioned
-  // frame hook; the cleanup removes it so an unmounted pane leaves nothing behind.
-  useEffect(() => {
-    const frame = async () => {
-      syncScrollbars()
-    }
-    renderer.setFrameCallback(frame)
-    return () => renderer.removeFrameCallback(frame)
-  }, [renderer, syncScrollbars])
-
   // Gutter width. The built-in `<line-number>` sizes its width from
   // `target.virtualLineCount`, but for an editable buffer that getter reports the
   // *visible* line count, not the document total — so left to itself the gutter
@@ -1451,6 +1477,119 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
     () => Math.max(3, String(doc.getText().split("\n").length).length + 2),
     [doc],
   )
+
+  // Inline git blame (GitLens-style) for the cursor's line. `blameLine` (1-based
+  // logical row) drives the fetch; `blameOverlay` positions the annotation and is
+  // recomputed on BOTH cursor moves and scrolls (a scroll leaves the logical line
+  // unchanged but shifts its on-screen row). useLineBlame owns dirty-gating,
+  // debouncing, and stale-request cancellation, so this just feeds it inputs.
+  const [blameLine, setBlameLine] = useState<number | null>(null)
+  const [blameOverlay, setBlameOverlay] = useState<{
+    visualRow: number
+    lineEndColumn: number
+    paneWidth: number
+    paneHeight: number
+  } | null>(null)
+  const blameState = useLineBlame(doc, blameLine, blameService, blameRelativePath)
+
+  // Last-sampled inputs, so the per-frame recompute below can skip the (whole-doc)
+  // work unless the cursor row/col or the scroll offsets actually moved.
+  const blameSampleRef = useRef({ row: -1, col: -1, offsetY: -1, offsetX: -1 })
+  const recomputeBlame = useCallback(() => {
+    // No repo for this file → no blame ever, so skip the per-frame sampling (and the
+    // state churn it would cause) entirely; blameLine/blameOverlay stay null.
+    if (blameService === null || blameRelativePath === null) return
+    const ta = taRef.current
+    if (!ta) return
+    const view = ta.editorView
+    const cursor = view.getCursor()
+    const vp = view.getViewport()
+    const row = cursor?.row ?? -1
+    const col = cursor?.col ?? -1
+    const last = blameSampleRef.current
+    if (row === last.row && col === last.col && vp.offsetY === last.offsetY && vp.offsetX === last.offsetX) {
+      return
+    }
+    blameSampleRef.current = { row, col, offsetY: vp.offsetY, offsetX: vp.offsetX }
+
+    if (!cursor) {
+      setBlameLine(null)
+      setBlameOverlay(null)
+      return
+    }
+    setBlameLine(cursor.row + 1)
+
+    // Map the caret's LOGICAL row to the VISUAL row where its text visually ENDS,
+    // then subtract the scroll offset. Under word wrap (the default) a long logical
+    // line wraps across several visual rows; the annotation trails the END of the
+    // line, so it must anchor to the LAST of those rows (where the text visually
+    // ends), not the first. lineSources[v] is the logical line of visual row v (the
+    // same source revealMatch reads): its first occurrence is the caret line's top
+    // visual row; scanning forward to the last consecutive occurrence gives the row
+    // its text ends on. Wrap-off yields one visual row per logical line (first ===
+    // last), so this holds unchanged in both modes; -1 (info unavailable) falls back
+    // to the raw logical row.
+    const info = view.getLogicalLineInfo()
+    const firstVisual = info.lineSources.indexOf(cursor.row)
+    let lastVisual = firstVisual
+    while (
+      lastVisual >= 0 &&
+      lastVisual + 1 < info.lineSources.length &&
+      info.lineSources[lastVisual + 1] === cursor.row
+    ) {
+      lastVisual++
+    }
+    const virtualRow = firstVisual === -1 ? cursor.row : lastVisual
+    const visualRow = virtualRow - vp.offsetY
+    const paneHeight = vp.height
+    if (visualRow < 0 || visualRow >= paneHeight) {
+      // Caret line's tail scrolled out of view: render nothing rather than a stray row.
+      setBlameOverlay(null)
+      return
+    }
+    // Anchor at the end of the rendered line text. Columns are measured from the
+    // overlay box's left edge, which starts at the gutter, so add gutterMinWidth.
+    // paneWidth spans gutter + text viewport (excluding the 1-col vertical scrollbar)
+    // so the annotation clamps against the text's right edge, not over the scrollbar.
+    //
+    // Under word wrap the annotation trails the LAST visual row, whose rendered
+    // width is lineWidthCols[lastVisual] — the display width of just that final
+    // wrapped segment (exact: where the visible text ends), not the full logical
+    // length, which describes the text spread across every wrapped row and would
+    // overflow the first row's width. Under wrap "none" there is a single visual row
+    // and horizontal scroll, so keep the long-standing char-length-minus-offsetX
+    // anchor exactly as before.
+    let lineEndColumn: number
+    if (ta.wrapMode === "none") {
+      const lineText = ta.plainText.split("\n")[cursor.row] ?? ""
+      lineEndColumn = gutterMinWidth + Math.max(0, lineText.length - vp.offsetX)
+    } else if (firstVisual === -1) {
+      const lineText = ta.plainText.split("\n")[cursor.row] ?? ""
+      lineEndColumn = gutterMinWidth + lineText.length
+    } else {
+      lineEndColumn = gutterMinWidth + (info.lineWidthCols[lastVisual] ?? 0)
+    }
+    setBlameOverlay({
+      visualRow,
+      lineEndColumn,
+      paneWidth: gutterMinWidth + vp.width,
+      paneHeight,
+    })
+  }, [gutterMinWidth, blameService, blameRelativePath])
+
+  // Per-frame poll (see above). setFrameCallback is the renderer's sanctioned
+  // frame hook; the cleanup removes it so an unmounted pane leaves nothing behind.
+  // recomputeBlame rides the same frame poll: like the viewport, the edit buffer
+  // emits no cursor/scroll event we can subscribe to for the on-screen POSITION, so
+  // sampling per frame (guarded to real movement) is how the annotation follows.
+  useEffect(() => {
+    const frame = async () => {
+      syncScrollbars()
+      recomputeBlame()
+    }
+    renderer.setFrameCallback(frame)
+    return () => renderer.removeFrameCallback(frame)
+  }, [renderer, syncScrollbars, recomputeBlame])
 
   return (
     <box flexDirection="column" height={height}>
@@ -1512,6 +1651,20 @@ function EditorTextarea({ doc, groupId, focused, height, wordWrap, onCursorChang
           }}
         />
       </box>
+      {/* Inline blame overlay. Absolutely positioned inside this outer box (its top
+          is the first text row, so visualRow maps directly to `top`), drawn on top
+          of the text content via BlameAnnotation's own zIndex. Rendered only when
+          the caret line is on screen; BlameAnnotation itself renders nothing while
+          `blame` is null (dirty buffer, no repo, or blame not yet resolved). */}
+      {blameOverlay && (
+        <BlameAnnotation
+          blame={blameState.kind === "ready" ? blameState.blame : null}
+          visualRow={blameOverlay.visualRow}
+          lineEndColumn={blameOverlay.lineEndColumn}
+          paneWidth={blameOverlay.paneWidth}
+          paneHeight={blameOverlay.paneHeight}
+        />
+      )}
     </box>
   )
 }

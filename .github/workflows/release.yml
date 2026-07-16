@@ -58,6 +58,16 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
+      # ubuntu-latest's stock fs.inotify.max_user_instances (128) is far below a
+      # typical dev machine's (1024+). Bun 1.3.14 no longer segfaults under that
+      # exhaustion (see the BUN_VERSION comment above), but the suite's real
+      # fs.watch + git-subprocess tests still contend hard for the remaining
+      # headroom — reproduced locally by lowering this same sysctl to 128, which
+      # turned otherwise-clean runs flaky across DIFFERENT tests each time (not
+      # one fixed bug), matching the pattern of runner-only CI failures on
+      # unrelated tests. Raise it to match a normal dev machine instead of
+      # chasing individual timeouts.
+      - run: sudo sysctl -w fs.inotify.max_user_instances=1024
       - run: bun install --frozen-lockfile
       - name: Typecheck
         run: bunx tsc --noEmit

@@ -1,12 +1,14 @@
 import { useKeyboard, useTerminalDimensions } from "@opentui/react"
 import { useEffect, useRef, useState } from "react"
 import { documentRegistry } from "../model/documents.ts"
-import { workbenchStore, type Group } from "../model/workbench.ts"
+import { tabFilePath, workbenchStore, type Group } from "../model/workbench.ts"
 import { withMacSuper } from "../services/commands.ts"
 import { theme } from "../theme"
 import { useCommands } from "../workbench/CommandsProvider.tsx"
 import { useOverlay } from "../workbench/OverlayProvider"
+import { useRepos } from "../workbench/ReposProvider.tsx"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore.ts"
+import { Breadcrumbs } from "./Breadcrumbs.tsx"
 import { DiffPane } from "./DiffPane.tsx"
 import { EditorPane, type CursorPosition } from "./EditorPane.tsx"
 import { applyArmedDrag, disarmDrag, endArmedDrag } from "./dragManager.ts"
@@ -33,6 +35,11 @@ export type EditorGroupsProps = {
    * full terminal width when unset (e.g. standalone in tests without a sidebar).
    */
   containerWidth?: number
+  /** Workspace root, needed to resolve the active file's breadcrumb path relative to its repo/workspace. */
+  workspaceRoot: string
+  /** Fired when a breadcrumb segment is clicked; passed through to Breadcrumbs. Left unwired
+   *  (undefined) until a later task adds the actual reveal-in-Explorer behavior in App.tsx. */
+  onSegmentClick?: (path: string) => void
 }
 
 /**
@@ -47,7 +54,9 @@ export function EditorGroups({
   onCursorChange,
   editorFocused = true,
   containerWidth,
-}: EditorGroupsProps = {}) {
+  workspaceRoot,
+  onSegmentClick,
+}: EditorGroupsProps) {
   const state = useWorkbenchStore()
   const commands = useCommands()
   const { isOverlayOpen } = useOverlay()
@@ -260,6 +269,11 @@ export function EditorGroups({
             focused={group.id === state.activeGroupId && editorFocused}
             wordWrap={wordWrap}
             onCursorChange={group.id === state.activeGroupId ? onCursorChange : undefined}
+            // Approximate this pane's own cell width from its flex fraction of the
+            // shared pane area; drives breadcrumb truncation. Fractions sum to 1.
+            breadcrumbWidth={Math.max(1, Math.round(paneCells * (state.sizes[i] ?? 1)))}
+            workspaceRoot={workspaceRoot}
+            onSegmentClick={onSegmentClick}
           />
         )
         if (i === 0) return [pane]
@@ -284,13 +298,20 @@ function EditorGroupPane({
   focused,
   wordWrap,
   onCursorChange,
+  breadcrumbWidth,
+  workspaceRoot,
+  onSegmentClick,
 }: {
   group: Group
   grow: number
   focused: boolean
   wordWrap: "word" | "none"
   onCursorChange?: (pos: CursorPosition) => void
+  breadcrumbWidth: number
+  workspaceRoot: string
+  onSegmentClick?: (path: string) => void
 }) {
+  const { repos } = useRepos(workspaceRoot)
   const active = group.tabs.find((t) => t.path === group.activeTabPath)
   const isDiff = active?.kind === "diff" || active?.kind === "commitDiff"
 
@@ -315,6 +336,13 @@ function EditorGroupPane({
       onMouseDown={() => workbenchStore.focusGroup(group.id)}
     >
       <TabBar groupId={group.id} />
+      <Breadcrumbs
+        path={active ? tabFilePath(active) : null}
+        repos={repos}
+        workspaceRoot={workspaceRoot}
+        containerWidth={breadcrumbWidth}
+        onSegmentClick={onSegmentClick}
+      />
       {isDiff ? (
         <DiffPane focused={focused} groupId={group.id} height="100%" />
       ) : (
@@ -324,6 +352,7 @@ function EditorGroupPane({
           height="100%"
           wordWrap={wordWrap}
           onCursorChange={onCursorChange}
+          repos={repos}
         />
       )}
     </box>

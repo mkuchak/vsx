@@ -109,7 +109,7 @@ async function render(opts: { withEditor?: boolean; maxResults?: number } = {}) 
           </box>
           {opts.withEditor ? (
             <box flexGrow={1} height="100%">
-              <EditorGroups />
+              <EditorGroups workspaceRoot={root} />
             </box>
           ) : null}
         </box>

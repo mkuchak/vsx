@@ -1,7 +1,8 @@
 import { useKeyboard } from "@opentui/react"
-import type { ScrollBoxRenderable } from "@opentui/core"
+import { MouseButton } from "@opentui/core"
+import type { MouseEvent as TuiMouseEvent, ScrollBoxRenderable } from "@opentui/core"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { dirname } from "node:path"
+import { dirname, join, relative, sep } from "node:path"
 import { workbenchStore } from "../model/workbench"
 import { theme } from "../theme"
 import { listDir, createDirWatcher, type DirEntry, type DirWatcher } from "../services/workspace"
@@ -13,6 +14,26 @@ export type FileTreeProps = {
   focused: boolean
   onOpenFile: (path: string, opts: { preview: boolean }) => void
   height?: number | `${number}%` | "auto"
+  /**
+   * Bump `token` to (re-)request revealing `path`: every ancestor directory expands,
+   * its listing loads, and the row for `path` is selected + scrolled into view once
+   * all ancestors are loaded. A `token` (not just `path`) is required so clicking the
+   * SAME path twice in a row still re-triggers the reveal (e.g. the user navigated
+   * the tree away from that row between clicks) — a plain path-equality check on
+   * props would not re-fire for an unchanged path. `null` is a no-op.
+   */
+  revealRequest?: { path: string; token: number } | null
+  /**
+   * Fired on a right-click of a row: selects the row (like a left-click would)
+   * but does NOT open/expand/collapse it, and reports the row's target plus the
+   * click's absolute screen coordinates so a caller can anchor a context menu
+   * there. `x`/`y` are passed through from the mouse event unmodified.
+   */
+  onContextMenuRequest?: (
+    target: { path: string; name: string; isDir: boolean },
+    x: number,
+    y: number,
+  ) => void
 }
 
 type Row = {
@@ -66,7 +87,14 @@ function buildRows(
   return rows
 }
 
-export function FileTree({ root, focused, onOpenFile, height = "100%" }: FileTreeProps) {
+export function FileTree({
+  root,
+  focused,
+  onOpenFile,
+  height = "100%",
+  revealRequest,
+  onContextMenuRequest,
+}: FileTreeProps) {
   const { isOverlayOpen } = useOverlay()
   // Lifted into the workbench store (not local state) so it survives FileTree
   // being unmounted — which happens both when the sidebar is hidden and when
@@ -178,6 +206,44 @@ export function FileTree({ root, focused, onOpenFile, height = "100%" }: FileTre
     [load],
   )
 
+  // Marks the last reveal token that has been fully satisfied (row selected), so
+  // later cache/rows updates don't re-select and fight the user's navigation.
+  const revealedTokenRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (!revealRequest) return
+    const { path, token } = revealRequest
+    if (revealedTokenRef.current === token) return
+
+    // Ancestor directories that must expand for `path` to become visible:
+    // every dir strictly between root and dirname(path), inclusive of both
+    // ends. `relative` keeps this robust against separator/normalisation quirks
+    // instead of slicing the string by hand.
+    const rel = relative(root, dirname(path))
+    const segments = rel === "" || rel.startsWith("..") ? [] : rel.split(sep)
+    const ancestorDirs: string[] = []
+    let cur = root
+    for (const segment of segments) {
+      cur = join(cur, segment)
+      ancestorDirs.push(cur)
+    }
+
+    for (const dir of ancestorDirs) {
+      if (!expanded.has(dir)) expand(dir)
+    }
+
+    // The reveal can't finish until every ancestor listing has arrived (each
+    // load resolves asynchronously); this effect re-runs on `cache` so it
+    // retries as later levels land. root is always loaded on mount but is
+    // included for correctness.
+    const needsLoaded = [root, ...ancestorDirs]
+    if (!needsLoaded.every((dir) => cache.has(dir))) return
+
+    const index = rows.findIndex((r) => r.path === path)
+    if (index < 0) return
+    revealedTokenRef.current = token
+    setSelectedIndex(index)
+  }, [revealRequest, expanded, cache, rows, root, expand])
+
   const collapse = useCallback((dirPath: string) => {
     workbenchStore.collapseExplorerPath(dirPath)
   }, [])
@@ -194,6 +260,24 @@ export function FileTree({ root, focused, onOpenFile, height = "100%" }: FileTre
       }
     },
     [collapse, expand, onOpenFile],
+  )
+
+  const handleRowMouseDown = useCallback(
+    (event: TuiMouseEvent, row: Row, index: number) => {
+      if (event.button === MouseButton.RIGHT) {
+        // Select the row (openRow's side effect) but don't open/expand/collapse
+        // it; hand off to the context-menu caller with the click coordinates.
+        setSelectedIndex(index)
+        onContextMenuRequest?.(
+          { path: row.path, name: row.name, isDir: row.isDir },
+          event.x,
+          event.y,
+        )
+        return
+      }
+      openRow(row, index)
+    },
+    [openRow, onContextMenuRequest],
   )
 
   useKeyboard((key) => {
@@ -252,7 +336,7 @@ export function FileTree({ root, focused, onOpenFile, height = "100%" }: FileTre
               width="100%"
               height={1}
               backgroundColor={index === selectedIndex ? theme.selectionBackground : undefined}
-              onMouseDown={() => openRow(row, index)}
+              onMouseDown={(event: TuiMouseEvent) => handleRowMouseDown(event, row, index)}
             >
               <text fg={row.isLoading ? theme.dimForeground : theme.foreground}>
                 {indent}

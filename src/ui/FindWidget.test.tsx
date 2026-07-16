@@ -62,7 +62,7 @@ async function render(dims = { width: 80, height: 12 }) {
     <OverlayProvider>
       <CommandsProvider>
         <box width={dims.width} height={dims.height} position="relative">
-          <EditorGroups />
+          <EditorGroups workspaceRoot={dir} />
           <FindWidget />
         </box>
       </CommandsProvider>

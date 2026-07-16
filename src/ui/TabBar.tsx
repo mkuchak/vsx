@@ -1,5 +1,5 @@
 import { useRef } from "react"
-import { workbenchStore, type Group, type Tab } from "../model/workbench.ts"
+import { tabFilePath, workbenchStore, type Group, type Tab } from "../model/workbench.ts"
 import { theme } from "../theme"
 import { useDocument } from "../workbench/useDocument.ts"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore.ts"
@@ -9,11 +9,6 @@ const DOUBLE_CLICK_MS = 350
 function basename(path: string): string {
   const i = path.lastIndexOf("/")
   return i === -1 ? path : path.slice(i + 1)
-}
-
-/** The real underlying file path (diff tabs key identity on a synthetic string). */
-function tabFilePath(tab: Tab): string {
-  return tab.kind === "diff" ? tab.filePath : tab.path
 }
 
 /** Diff tabs get a VSCode-style side suffix so they read distinctly from the file tab. */

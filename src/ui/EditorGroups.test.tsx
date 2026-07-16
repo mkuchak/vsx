@@ -2,7 +2,7 @@ import type { Renderable, RGBA, TextareaRenderable } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { afterEach, beforeEach, expect, test } from "bun:test"
 import { theme } from "../theme"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { act, useState } from "react"
@@ -36,7 +36,7 @@ let setEditorFocused: ((v: boolean) => void) | undefined
 function FocusHarness({ initial }: { initial: boolean }) {
   const [editorFocused, set] = useState(initial)
   setEditorFocused = set
-  return <EditorGroups editorFocused={editorFocused} />
+  return <EditorGroups editorFocused={editorFocused} workspaceRoot={dir} />
 }
 
 beforeEach(async () => {
@@ -59,7 +59,7 @@ async function render(dims = { width: 80, height: 12 }) {
     <OverlayProvider>
       <CommandsProvider>
         <box width={dims.width} height={dims.height}>
-          <EditorGroups />
+          <EditorGroups workspaceRoot={dir} />
         </box>
         <CaptureRegistry />
         <CaptureOverlay />
@@ -77,7 +77,7 @@ async function renderFull(dims = { width: 80, height: 12 }) {
     <OverlayProvider>
       <CommandsProvider>
         <box width="100%" height="100%">
-          <EditorGroups />
+          <EditorGroups workspaceRoot={dir} />
         </box>
         <CaptureRegistry />
       </CommandsProvider>
@@ -188,6 +188,24 @@ test("splitGroup renders two panes side by side", async () => {
   // Two panes, so two editor textareas exist simultaneously.
   expect(textareas()).toHaveLength(2)
   expect(testSetup!.captureCharFrame()).toMatchSnapshot()
+})
+
+test("renders a breadcrumb trail under the tab bar for the active file", async () => {
+  // A nested path so the breadcrumb shows a parent-directory segment and the "›"
+  // separator — neither of which the tab strip (basename only) ever renders, so
+  // finding them proves the breadcrumb row itself mounted below the tabs.
+  await mkdir(join(dir, "sub"), { recursive: true })
+  const file = join(dir, "sub", "crumb.ts")
+  await writeFile(file, "const c = 1\n")
+  workbenchStore.openFile(file, { preview: false })
+
+  await render()
+  await waitForText("const c = 1")
+
+  const frame = testSetup!.captureCharFrame()
+  expect(frame).toContain("sub")
+  expect(frame).toContain("›")
+  expect(frame).toContain("crumb.ts")
 })
 
 test("only the active group's pane is focused; ctrl+1 / ctrl+2 switch focus", async () => {

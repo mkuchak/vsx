@@ -39,6 +39,7 @@ import {
 import { useOverlay, useOverlayFocusRestore } from "../workbench/OverlayProvider"
 import { getLastRendererSelection } from "../workbench/rendererSelection"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
+import { now as clickClockNow } from "./clickClock"
 import { admitScrollEvent } from "./scrollAxisLock"
 import "./ThinHScrollBar"
 
@@ -1249,7 +1250,7 @@ function EditorTextarea({
     // from userland), so the anchor migrates — plain shift+click is exact.
     if (event.modifiers.shift) {
       multiClickGesture.current = null
-      clickTracker.current = { row, col, count: 1, time: Date.now() }
+      clickTracker.current = { row, col, count: 1, time: clickClockNow() }
       const focusOffset = ta.editBuffer.positionToOffset(row, col)
       // The live buffer selection was already reset by the renderer's bridge on
       // this same mousedown — the pre-click selection lives in lastSelectionRef.
@@ -1270,7 +1271,7 @@ function EditorTextarea({
       return
     }
 
-    const now = Date.now()
+    const now = clickClockNow()
     const prev = clickTracker.current
     const sameSpot = row === prev.row && Math.abs(col - prev.col) <= 1
     const count =

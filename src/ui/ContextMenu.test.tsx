@@ -1,13 +1,21 @@
-import { MouseButton, type InputRenderable } from "@opentui/core"
+import { CliRenderEvents, MouseButton, type InputRenderable } from "@opentui/core"
 import { afterEach, expect, test } from "bun:test"
 import { testRender } from "@opentui/react/test-utils"
 import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
-import { CommandsProvider } from "../workbench/CommandsProvider"
+import { CommandsProvider, useCommands } from "../workbench/CommandsProvider"
 import { ContextMenu, type ContextMenuItem } from "./ContextMenu"
 
 let testSetup: Awaited<ReturnType<typeof testRender>>
 
+let registry: ReturnType<typeof useCommands> | null = null
+/** Grabs the registry so a test can register a ctrl+q command and dispatch it. */
+function CaptureRegistry() {
+  registry = useCommands()
+  return null
+}
+
 afterEach(async () => {
+  registry = null
   if (testSetup) await destroyRendererAndWait(testSetup.renderer)
 })
 
@@ -173,6 +181,57 @@ test("Escape calls onDismiss", async () => {
   await settle()
 
   expect(calls).toEqual(["dismiss"])
+})
+
+test("renderer blur dismisses the menu so it can't linger invisibly", async () => {
+  const calls: string[] = []
+  testSetup = await render({
+    x: 2,
+    y: 2,
+    items: [{ id: "rename", label: "Rename", onSelect: () => calls.push("rename") }],
+    onDismiss: () => calls.push("dismiss"),
+  })
+  await settle()
+
+  // Terminal focus-out (the mux popping its own overlay) fires renderer blur;
+  // the menu must dismiss rather than stay mounted but unseen.
+  testSetup.renderer.emit(CliRenderEvents.BLUR)
+  await settle()
+
+  expect(calls).toEqual(["dismiss"])
+})
+
+test("ctrl+q is not shadowed while the menu is open (quit binding still fires)", async () => {
+  const calls: string[] = []
+  testSetup = await testRender(
+    <box width={60} height={16}>
+      <CommandsProvider>
+        <CaptureRegistry />
+        <ContextMenu
+          x={2}
+          y={2}
+          items={[{ id: "a", label: "Action A" }]}
+          onDismiss={() => calls.push("dismiss")}
+        />
+      </CommandsProvider>
+    </box>,
+    { width: 60, height: 16 },
+  )
+  await settle()
+
+  // The menu no longer pushes a keymap layer that blocks ctrl+q, so a real
+  // ctrl+q binding registered elsewhere (App's workbench.quit) still resolves.
+  const dispose = registry!.registerCommand({
+    id: "test.quit",
+    title: "Quit",
+    keybinding: "ctrl+q",
+    run: () => calls.push("quit"),
+  })
+  testSetup.mockInput.pressKey("q", { ctrl: true })
+  await settle()
+  dispose()
+
+  expect(calls).toEqual(["quit"])
 })
 
 test("Down skips dividers and disabled items; Enter selects the highlighted one", async () => {

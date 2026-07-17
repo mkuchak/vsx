@@ -1,15 +1,8 @@
-import { MouseButton } from "@opentui/core"
-import type {
-  BoxRenderable,
-  KeyEvent,
-  MouseEvent as TuiMouseEvent,
-  Renderable,
-} from "@opentui/core"
-import type { Binding, Command } from "@opentui/keymap"
+import { CliRenderEvents, MouseButton } from "@opentui/core"
+import type { BoxRenderable, MouseEvent as TuiMouseEvent } from "@opentui/core"
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react"
 import { useEffect, useRef, useState } from "react"
 import { theme } from "../theme"
-import { useCommands } from "../workbench/CommandsProvider"
 import { useOverlay } from "../workbench/OverlayProvider"
 
 export type ContextMenuItem = {
@@ -47,8 +40,7 @@ function isSelectable(item: ContextMenuItem | undefined): boolean {
  * nothing about the file tree; callers pass their own {@link ContextMenuItem}s.
  *
  * Registers as an overlay so global keyboard consumers (e.g. FileTree's arrow-key
- * navigation, which gates on `isOverlayOpen`) suspend while it's open, and pushes
- * a modal keymap layer so base bindings can't leak through underneath.
+ * navigation, which gates on `isOverlayOpen`) suspend while it's open.
  *
  * Click-away is handled by a listener on the renderer's ROOT renderable, NOT a
  * full-screen backdrop box. OpenTUI hit-tests a click to exactly one topmost
@@ -65,7 +57,6 @@ function isSelectable(item: ContextMenuItem | undefined): boolean {
  * shared overlay-close-epoch mechanism when the menu unmounts.
  */
 export function ContextMenu({ x, y, items, onDismiss }: ContextMenuProps) {
-  const commands = useCommands()
   const renderer = useRenderer()
   const { setOverlayOpen } = useOverlay()
   const { width: termWidth, height: termHeight } = useTerminalDimensions()
@@ -78,16 +69,6 @@ export function ContextMenu({ x, y, items, onDismiss }: ContextMenuProps) {
     setOverlayOpen("contextMenu", true)
     return () => setOverlayOpen("contextMenu", false)
   }, [setOverlayOpen])
-
-  useEffect(() => {
-    const layerCommands = [
-      { name: "contextMenu.block", run: () => {} },
-    ] as unknown as Command<Renderable, KeyEvent>[]
-    const bindings = [
-      { key: "ctrl+q", cmd: "contextMenu.block" },
-    ] as unknown as Binding<Renderable, KeyEvent>[]
-    return commands.pushLayer({ commands: layerCommands, bindings })
-  }, [commands])
 
   const moveHighlight = (dir: 1 | -1) => {
     setHighlight((current) => {
@@ -171,8 +152,16 @@ export function ContextMenu({ x, y, items, onDismiss }: ContextMenuProps) {
       if (event.button === MouseButton.LEFT) dismissRef.current()
     }
     root.onMouseDown = onRootMouseDown
+
+    // Terminal focus-out (e.g. the mux popping its own overlay on top) would
+    // otherwise leave this modal menu mounted but invisible — an unseen trap
+    // that reads as a frozen app. Dismiss on the renderer's blur so it can't.
+    const onBlur = () => dismissRef.current()
+    renderer.on(CliRenderEvents.BLUR, onBlur)
+
     return () => {
       root.onMouseDown = undefined
+      renderer.off(CliRenderEvents.BLUR, onBlur)
     }
   }, [renderer])
 

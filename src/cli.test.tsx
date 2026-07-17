@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { basename, join, resolve } from "node:path"
 import { testRender } from "@opentui/react/test-utils"
 import pkg from "../package.json"
-import { isUpdateRequested, isVersionRequested, resolveWorkspaceArg } from "./cli"
+import { isKittyDisabled, isUpdateRequested, isVersionRequested, resolveWorkspaceArg } from "./cli"
 import { documentRegistry } from "./model/documents"
 import { workbenchStore } from "./model/workbench"
 import { destroyRendererAndWait } from "./testUtils/rendererTeardown"
@@ -92,6 +92,30 @@ test("`update` is not recognized as a path, flag, or trailing positional", () =>
   expect(isUpdateRequested(argv("--update"))).toBe(false)
   expect(isUpdateRequested(argv("somedir", "update"))).toBe(false)
   expect(isUpdateRequested(argv())).toBe(false)
+})
+
+test("--no-kitty is recognized regardless of position", () => {
+  expect(isKittyDisabled(argv("--no-kitty"), {})).toBe(true)
+  expect(isKittyDisabled(argv("somedir", "--no-kitty"), {})).toBe(true)
+})
+
+test("VSX_NO_KITTY=1 disables kitty; other values and absence do not", () => {
+  expect(isKittyDisabled(argv(), { VSX_NO_KITTY: "1" })).toBe(true)
+  expect(isKittyDisabled(argv(), { VSX_NO_KITTY: "0" })).toBe(false)
+  expect(isKittyDisabled(argv(), {})).toBe(false)
+  expect(isKittyDisabled(argv("somedir"), {})).toBe(false)
+})
+
+test("--no-kitty does not disturb workspace resolution", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "vsx-cli-"))
+  try {
+    const parent = resolve(dir, "..")
+    const rel = basename(dir)
+    const result = resolveWorkspaceArg(argv("--no-kitty", rel), parent)
+    expect(result).toEqual({ root: dir })
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test("the printed version string matches the package version", () => {

@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url"
 import { createCliRenderer } from "@opentui/core"
 import { createRoot } from "@opentui/react"
 import pkg from "../package.json"
-import { isUpdateRequested, isVersionRequested, resolveWorkspaceArg } from "./cli"
+import { isKittyDisabled, isUpdateRequested, isVersionRequested, resolveWorkspaceArg } from "./cli"
 import { registerBundledGrammars } from "./grammars"
 import { App } from "./workbench/App"
 
@@ -63,8 +63,13 @@ if ("error" in workspace) {
   process.exit(1)
 }
 
+const kittyDisabled = isKittyDisabled(process.argv, process.env)
+
 const renderer = await createCliRenderer({
   exitOnCtrlC: false,
+  // Explicit all-false (NOT null): upstream's `?? {}` swallows null, silently
+  // re-enabling the protocol — flags must be forced to 0 field by field.
+  ...(kittyDisabled ? { useKittyKeyboard: { disambiguate: false, alternateKeys: false } } : {}),
 })
 
 createRoot(renderer).render(<App workspaceRoot={workspace.root} initialFile={workspace.file} />)

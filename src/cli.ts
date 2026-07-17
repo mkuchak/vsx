@@ -24,6 +24,16 @@ export function isUpdateRequested(argv: string[]): boolean {
 }
 
 /**
+ * Whether the kitty keyboard protocol should NOT be requested: `--no-kitty`
+ * flag anywhere in argv, or VSX_NO_KITTY=1 in the environment. Lets users force
+ * the legacy CSI encoding when a partially-kitty-aware multiplexer (e.g. herdr)
+ * would otherwise re-encode modifier+arrow keys wrong.
+ */
+export function isKittyDisabled(argv: string[], env: Record<string, string | undefined>): boolean {
+  return argv.slice(2).some((entry) => entry === "--no-kitty") || env.VSX_NO_KITTY === "1"
+}
+
+/**
  * Resolve the optional workspace positional (VSCode's `code <dir|file>`).
  * `argv` is `process.argv`, so the first non-flag entry after the binary and
  * script path (index >= 2) is the workspace. Flags (leading `-`) are ignored.

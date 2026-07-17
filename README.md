@@ -113,6 +113,8 @@ Most of the above works in any terminal via legacy xterm escape sequences — Sh
 
 On a non-Kitty terminal (notably **macOS Terminal.app**), those specific chords won't register — use `F1` (always works) for the command palette, and the equivalent commands are still reachable through the palette itself.
 
+Pass **`--no-kitty`** (or set `VSX_NO_KITTY=1`) to stop requesting the Kitty protocol entirely and fall back to legacy xterm sequences. Use this when a multiplexer only *partially* implements the protocol (e.g. herdr) and mangles modifier+arrow keys — a half-implementing middle layer re-encodes them wrong, so opting out fixes selection and line-move keys at the cost of the `Ctrl+Shift+<letter>` chords above.
+
 ## macOS keys
 
 macOS folds a lot of editing onto `Cmd` and `Option`, and terminals sit between those keys and the app. This section is the practical setup guide.

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.11](https://github.com/mkuchak/vsx/compare/v0.3.10...v0.3.11) (2026-07-17)
+
+### Bug Fixes
+
+* **filetree:** adapt row activation to mouse-release availability ([d735a04](https://github.com/mkuchak/vsx/commit/d735a04f574a4f1dc020d2099206d8169c83cb57))
+
 ## [0.3.10](https://github.com/mkuchak/vsx/compare/v0.3.9...v0.3.10) (2026-07-17)
 
 ### Features

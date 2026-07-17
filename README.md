@@ -113,7 +113,7 @@ Most of the above works in any terminal via legacy xterm escape sequences — Sh
 
 On a non-Kitty terminal (notably **macOS Terminal.app**), those specific chords won't register — use `F1` (always works) for the command palette, and the equivalent commands are still reachable through the palette itself.
 
-Pass **`--no-kitty`** (or set `VSX_NO_KITTY=1`) to stop requesting the Kitty protocol entirely and fall back to legacy xterm sequences. Use this when a multiplexer only *partially* implements the protocol (e.g. herdr) and mangles modifier+arrow keys — a half-implementing middle layer re-encodes them wrong, so opting out fixes selection and line-move keys at the cost of the `Ctrl+Shift+<letter>` chords above.
+Pass **`--no-kitty`** (or set `VSX_NO_KITTY=1`) to stop requesting the Kitty protocol entirely and fall back to legacy xterm sequences. Use this when a multiplexer only *partially* implements the protocol (e.g. herdr) and mangles modifier+arrow keys — a half-implementing middle layer re-encodes them wrong, so opting out fixes selection and line-move keys at the cost of the `Ctrl+Shift+<letter>` chords above. One further cost: with kitty disabled, `Cmd+Shift+Left`/`Cmd+Shift+Right` (select-to-line-start/end) silently degrade to a non-selecting jump — the legacy encoding physically can't express the shift bit there, so `Cmd+Shift+Left` produces the same `0x01` byte as `Cmd+Left` (→ visual-line home). See [Cmd+Shift+Left / Cmd+Shift+Right under `--no-kitty`](#cmdshiftleft--cmdshiftright-under---no-kitty) below to restore it via config.
 
 ## macOS keys
 
@@ -188,6 +188,21 @@ macOS terminals translate `Cmd+Left`/`Cmd+Right` into the control bytes `0x01`/`
 
 **Select-all is `Cmd+A`, not `Ctrl+A`.** Because `Ctrl+A` is the visual-line-home navigation above, select-all lives only on the built-in `super+a` (`Cmd+A`), which fires once the terminal forwards `super` — i.e. with the Ghostty/tmux Kitty-protocol config in this section (`macos-option-as-alt`, tmux `extended-keys`).
 
+### `Cmd+Shift+Left` / `Cmd+Shift+Right` under `--no-kitty`
+
+Under [`--no-kitty`](#terminal-support), `Cmd+Shift+Left`/`Cmd+Shift+Right` (select-to-line-start/end) stop selecting: the legacy encoding has no shift bit for these, so `Cmd+Shift+Left` produces the same `0x01` byte as `Cmd+Left` and just jumps the caret. Restore line-selection by having VSCode send an explicit modifier+arrow sequence the app *can* decode as `super+shift`. Add these to `keybindings.json`:
+
+```json
+{ "key": "cmd+shift+left",  "command": "workbench.action.terminal.sendSequence",
+  "args": { "text": "\u001b[1;10D" }, "when": "terminalFocus" },
+{ "key": "cmd+shift+right", "command": "workbench.action.terminal.sendSequence",
+  "args": { "text": "\u001b[1;10C" }, "when": "terminalFocus" }
+```
+
+Here `\u001b` is the ESC byte, so the first `text` is the sequence `ESC [ 1 ; 10 D`, which decodes to `super+shift+left` (modifier `10` = shift + super) — vsx's textarea maps that to select-visual-line-home; `ESC [ 1 ; 10 C` is the `right`/line-end twin.
+
+Caveat: this sequence still traverses the multiplexer, which may re-encode it (vsx can't see or fix that). If it doesn't arrive intact, the `modifyOtherKeys` channel is equally valid — swap the `text` values for `\u001b[27;6;97~` (left/home) and `\u001b[27;6;101~` (right/end), which decode to `Ctrl+Shift+A`/`Ctrl+Shift+E` → vsx's own `select-visual-line-home`/`select-visual-line-end` bindings.
+
 ### Paste and copy
 
 `Cmd+V` works everywhere already — the terminal turns it into a bracketed paste and the editor's built-in paste handling inserts it (no keybinding involved). `Cmd+C` is generally swallowed by the terminal; use **`Ctrl+C`** as the reliable copy chord (it copies the current selection in the editor and in the read-only panes). Clipboard writes go through `pbcopy` locally, so copying works regardless of your OSC 52 setup.
@@ -208,6 +223,10 @@ macOS terminals translate `Cmd+Left`/`Cmd+Right` into the control bytes `0x01`/`
 ## Troubleshooting
 
 - **An untracked file isn't showing in Source Control.** Like VSCode, vsx hides git-ignored files, so anything matched by a `.gitignore` rule won't appear under Untracked Changes. Check whether a file is ignored with `git check-ignore -v <file>` — it prints the matching rule (and its source) when the file is ignored, and nothing when it isn't. Nested untracked files inside a new directory *do* show (vsx runs `git status -uall`, not the default `-unormal` that collapses them to the directory).
+
+- **Drag-selection and right-click don't work; some clicks do nothing.** Your terminal chain is likely dropping mouse-release (and motion) events. Probe it with the status bar: the `☰` sidebar-toggle cell fires on mouse **press**, while the power/quit button fires on mouse **release**. If clicking the sidebar toggle works but the quit button only turns red/highlighted and never raises the quit prompt, release events aren't reaching the app. That also breaks editor drag-selection (the selection extends only on motion-with-button and finalizes only on release) and any release-dependent click — vsx can't reconstruct events the terminal never delivers, so the fix is in the terminal chain, not the app. As of mid-2026:
+  - **VSCode integrated terminal** — set `"terminal.integrated.rightClickBehavior": "nothing"` so right-clicks are forwarded to the app instead of opening VSCode's context menu.
+  - **herdr** (multiplexer) — its config exposes `ui.mouse_capture` (default `true`) and `ui.right_click_passthrough_modifier` (right-click passthrough while a modifier is held, off by default); adjusting these is the lever for restoring right-click and mouse delivery. Keep herdr updated — its kitty-protocol fixes land frequently.
 
 ## Architecture
 

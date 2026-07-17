@@ -358,6 +358,17 @@ function rowHasSelectionBg(text: string): boolean {
   return !!line && rowBackgrounds(line).some((bg) => rgbEquals(bg, theme.selectionBackground))
 }
 
+// Flip the adaptive activation latch into up-mode (the designed
+// activate-on-release behavior). A tree starts in down-mode (activate on press)
+// so release-dropping terminals stay usable; the first release ever seen flips
+// it to up-mode for the tree's lifetime. A lone release with no prior press
+// still fires onMouseUp (type derives purely from the SGR suffix), so it flips
+// the latch with zero activation side effect — nothing to clean up afterward.
+async function primeUpMode(text = "README.md") {
+  await testSetup.mockMouse.release(3, lineIndexOf(text), MouseButton.LEFT)
+  await settle()
+}
+
 test("right-clicking a file row selects it, opens no file, and fires onContextMenuRequest", async () => {
   stubDirWatcher()
   const opened: string[] = []
@@ -424,8 +435,9 @@ test("left-clicking a file row opens it and fires no onContextMenuRequest (regre
   })
   await waitForText("package.json")
 
-  // Activation now lands on mouse-UP (so a long-press can pre-empt it), so a
-  // quick click is a down + up.
+  // A quick click is a down + up. On a fresh tree the down activates (down-mode)
+  // and the up flips the latch but must NOT re-activate — the file opens exactly
+  // once either way.
   const y = lineIndexOf("package.json")
   await testSetup.mockMouse.click(3, y, MouseButton.LEFT)
   await settle()
@@ -434,7 +446,9 @@ test("left-clicking a file row opens it and fires no onContextMenuRequest (regre
   expect(menuCalls).toBe(0)
 })
 
-test("a bare mouse-down on a file row selects it but does NOT open it (activation is on the up)", async () => {
+test("a bare mouse-down on a fresh tree opens the file immediately (down-mode)", async () => {
+  // Fresh tree, no release ever seen: down-mode. A release-dropping terminal
+  // only ever delivers the press, so activation must happen on the down.
   stubDirWatcher()
   const opened: string[] = []
   testSetup = await render({ onOpenFile: (path) => opened.push(path) })
@@ -444,8 +458,78 @@ test("a bare mouse-down on a file row selects it but does NOT open it (activatio
   await testSetup.mockMouse.pressDown(3, y, MouseButton.LEFT)
   await settle()
 
-  expect(opened).toEqual([])
+  expect(opened).toEqual([join(dir, "package.json")])
   expect(rowHasSelectionBg("package.json")).toBe(true)
+})
+
+test("a bare mouse-down on a fresh tree expands a folder immediately (down-mode)", async () => {
+  stubDirWatcher()
+  testSetup = await render()
+  await waitForText("src")
+
+  const y = lineIndexOf("src")
+  await testSetup.mockMouse.pressDown(2, y, MouseButton.LEFT)
+  await waitForText("index.ts")
+
+  expect(testSetup.captureCharFrame()).toContain("index.ts")
+  expect(testSetup.captureCharFrame()).toContain("▾")
+})
+
+test("down-mode long-press: the down activated AND the menu still opens (degraded env)", async () => {
+  // The release-dropping environment this whole mode exists for: the press
+  // opened the file immediately, and holding past the threshold ALSO pops the
+  // menu over it. Both effects are correct here — an accepted tradeoff.
+  stubDirWatcher()
+  const opened: string[] = []
+  const menus: Array<{ target: { path: string; name: string; isDir: boolean }; x: number; y: number }> = []
+  testSetup = await render({
+    onOpenFile: (path) => opened.push(path),
+    onContextMenuRequest: (target, x, y) => menus.push({ target, x, y }),
+  })
+  await waitForText("package.json")
+
+  const y = lineIndexOf("package.json")
+  await testSetup.mockMouse.pressDown(3, y, MouseButton.LEFT)
+  await settle()
+  expect(opened).toEqual([join(dir, "package.json")]) // opened on the down
+  expect(fireLongPress).not.toBeNull()
+  fireLongPress?.()
+  await settle()
+
+  expect(menus).toEqual([
+    { target: { path: join(dir, "package.json"), name: "package.json", isDir: false }, x: 3, y },
+  ])
+})
+
+test("transition click: down (activates) + up on the same row does not activate twice", async () => {
+  // The subtle heart of the adaptive change. The first click of a healthy
+  // session presses in down-mode (opens the file) then its up arrives; the up
+  // must NOT open it a second time.
+  stubDirWatcher()
+  const opened: string[] = []
+  testSetup = await render({ onOpenFile: (path) => opened.push(path) })
+  await waitForText("package.json")
+
+  const y = lineIndexOf("package.json")
+  await testSetup.mockMouse.click(3, y, MouseButton.LEFT)
+  await settle()
+
+  expect(opened).toEqual([join(dir, "package.json")]) // exactly once
+})
+
+test("transition click on a folder expands exactly once (no expand-then-collapse)", async () => {
+  stubDirWatcher()
+  testSetup = await render()
+  await waitForText("src")
+
+  const y = lineIndexOf("src")
+  await testSetup.mockMouse.click(2, y, MouseButton.LEFT)
+  await waitForText("index.ts")
+
+  // A double-activation would expand on the down then collapse on the up,
+  // hiding the children again — so their presence proves a single activation.
+  expect(testSetup.captureCharFrame()).toContain("index.ts")
+  expect(testSetup.captureCharFrame()).toContain("▾")
 })
 
 test("left-clicking a directory row expands it and fires no onContextMenuRequest (regression guard)", async () => {
@@ -467,7 +551,41 @@ test("left-clicking a directory row expands it and fires no onContextMenuRequest
   expect(menuCalls).toBe(0)
 })
 
-test("long-pressing a file row fires onContextMenuRequest at the press point and does not open the file", async () => {
+test("up-mode: a bare mouse-down does NOT activate (activation waits for the up)", async () => {
+  // Once a release has been seen the tree is in up-mode — the designed behavior,
+  // now gated behind the latch: a press alone selects but defers opening.
+  stubDirWatcher()
+  const opened: string[] = []
+  testSetup = await render({ onOpenFile: (path) => opened.push(path) })
+  await waitForText("package.json")
+
+  await primeUpMode()
+  const y = lineIndexOf("package.json")
+  await testSetup.mockMouse.pressDown(3, y, MouseButton.LEFT)
+  await settle()
+
+  expect(opened).toEqual([])
+  expect(rowHasSelectionBg("package.json")).toBe(true)
+})
+
+test("up-mode: press then release on the same row opens the file on the up", async () => {
+  stubDirWatcher()
+  const opened: string[] = []
+  testSetup = await render({ onOpenFile: (path) => opened.push(path) })
+  await waitForText("package.json")
+
+  await primeUpMode()
+  const y = lineIndexOf("package.json")
+  await testSetup.mockMouse.pressDown(3, y, MouseButton.LEFT)
+  await settle()
+  expect(opened).toEqual([]) // not on the down
+  await testSetup.mockMouse.release(3, y, MouseButton.LEFT)
+  await settle()
+
+  expect(opened).toEqual([join(dir, "package.json")]) // on the up
+})
+
+test("up-mode long-press on a file fires onContextMenuRequest at the press point and does not open the file", async () => {
   stubDirWatcher()
   const opened: string[] = []
   const menus: Array<{ target: { path: string; name: string; isDir: boolean }; x: number; y: number }> = []
@@ -477,6 +595,7 @@ test("long-pressing a file row fires onContextMenuRequest at the press point and
   })
   await waitForText("package.json")
 
+  await primeUpMode()
   const y = lineIndexOf("package.json")
   await testSetup.mockMouse.pressDown(3, y, MouseButton.LEFT)
   await settle()
@@ -495,7 +614,7 @@ test("long-pressing a file row fires onContextMenuRequest at the press point and
   expect(opened).toEqual([])
 })
 
-test("long-pressing a directory row opens the menu without expanding it", async () => {
+test("up-mode long-press on a directory opens the menu without expanding it", async () => {
   stubDirWatcher()
   const menus: Array<{ target: { path: string; name: string; isDir: boolean }; x: number; y: number }> = []
   testSetup = await render({
@@ -503,6 +622,8 @@ test("long-pressing a directory row opens the menu without expanding it", async 
   })
   await waitForText("src")
 
+  // Prime on a FILE row so priming leaves src collapsed for the assertion below.
+  await primeUpMode("package.json")
   const y = lineIndexOf("src")
   await testSetup.mockMouse.pressDown(2, y, MouseButton.LEFT)
   await settle()
@@ -518,7 +639,34 @@ test("long-pressing a directory row opens the menu without expanding it", async 
   ])
 })
 
-test("dragging off a pressed row cancels both the long-press menu and activation", async () => {
+test("up-mode: dragging off a pressed row cancels both the long-press menu and activation", async () => {
+  stubDirWatcher()
+  const opened: string[] = []
+  let menuCalls = 0
+  testSetup = await render({
+    onOpenFile: (path) => opened.push(path),
+    onContextMenuRequest: () => {
+      menuCalls++
+    },
+  })
+  await waitForText("package.json")
+
+  await primeUpMode()
+  const y = lineIndexOf("package.json")
+  const srcY = lineIndexOf("src")
+  // Press on package.json, drag up to src, release there.
+  await testSetup.mockMouse.drag(3, y, 3, srcY, MouseButton.LEFT)
+  await settle()
+
+  // The drag armed no menu (timer cancelled) and opened nothing.
+  expect(fireLongPress).toBeNull()
+  expect(menuCalls).toBe(0)
+  expect(opened).toEqual([])
+})
+
+test("down-mode: dragging off a pressed row still activated on the down but arms no menu", async () => {
+  // In down-mode the press already opened the row; a subsequent drag can only
+  // cancel the long-press timer — it cannot un-open what already happened.
   stubDirWatcher()
   const opened: string[] = []
   let menuCalls = 0
@@ -532,17 +680,34 @@ test("dragging off a pressed row cancels both the long-press menu and activation
 
   const y = lineIndexOf("package.json")
   const srcY = lineIndexOf("src")
-  // Press on package.json, drag up to src, release there.
   await testSetup.mockMouse.drag(3, y, 3, srcY, MouseButton.LEFT)
   await settle()
 
-  // The drag armed no menu (timer cancelled) and opened nothing.
-  expect(fireLongPress).toBeNull()
+  expect(opened).toEqual([join(dir, "package.json")]) // opened on the down
+  expect(fireLongPress).toBeNull() // drag cancelled the timer
   expect(menuCalls).toBe(0)
+})
+
+test("up-mode: pressing on one row and releasing on another does not activate either", async () => {
+  stubDirWatcher()
+  const opened: string[] = []
+  testSetup = await render({ onOpenFile: (path) => opened.push(path) })
+  await waitForText("package.json")
+
+  await primeUpMode()
+  const pkgY = lineIndexOf("package.json")
+  const readmeY = lineIndexOf("README.md")
+  await testSetup.mockMouse.pressDown(3, pkgY, MouseButton.LEFT)
+  await settle()
+  await testSetup.mockMouse.release(3, readmeY, MouseButton.LEFT)
+  await settle()
+
   expect(opened).toEqual([])
 })
 
-test("pressing on one row and releasing on another does not activate either", async () => {
+test("down-mode: pressing a row activates it even when the release lands elsewhere", async () => {
+  // The press opened the pressed row on the down; where the release lands is
+  // irrelevant in down-mode (the release-dropping env may deliver none at all).
   stubDirWatcher()
   const opened: string[] = []
   testSetup = await render({ onOpenFile: (path) => opened.push(path) })
@@ -555,7 +720,7 @@ test("pressing on one row and releasing on another does not activate either", as
   await testSetup.mockMouse.release(3, readmeY, MouseButton.LEFT)
   await settle()
 
-  expect(opened).toEqual([])
+  expect(opened).toEqual([join(dir, "package.json")])
 })
 
 test("pressing m fires onContextMenuRequest for the selected row, anchored below it", async () => {

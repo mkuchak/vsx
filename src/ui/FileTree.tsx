@@ -277,9 +277,21 @@ export function FileTree({
 
   // A left press that hasn't yet resolved into an activation or a long-press:
   // the row it landed on plus the press coordinates, captured so a long-press
-  // fire can anchor the menu exactly where the button went down.
-  const pendingPressRef = useRef<{ index: number; x: number; y: number } | null>(null)
+  // fire can anchor the menu exactly where the button went down. `activated`
+  // records whether this press already opened its row on the DOWN (down-mode).
+  const pendingPressRef = useRef<{ index: number; x: number; y: number; activated: boolean } | null>(null)
   const pressTimerCancelRef = useRef<(() => void) | null>(null)
+
+  // Adaptive activation latch. Starts false (down-mode: rows activate on
+  // mouse-DOWN) and flips true forever the first time ANY release is seen
+  // (up-mode: the designed activate-on-UP so long-press can pre-empt). Some
+  // terminals/muxes (VS Code integrated terminal + herdr) forward PRESS but
+  // silently drop RELEASE — there the up never arrives, so we permanently stay
+  // in down-mode and clicks keep working (degraded: long-press still fires over
+  // the already-done activation). A ref, not state: switching modes must not
+  // re-render, and per-mount scope is fine — a remount re-learns within one
+  // click and tests stay isolated with no global reset plumbing.
+  const releaseSeenRef = useRef(false)
 
   const cancelPress = useCallback(() => {
     pressTimerCancelRef.current?.()
@@ -303,13 +315,17 @@ export function FileTree({
         )
         return
       }
-      // Left press: select immediately for instant feedback, but defer opening
-      // to mouse-up so a long-press can raise the context menu instead — some
-      // terminals/muxes eat right-click, so long-press is the only mouse trigger
-      // that survives everywhere. A quick press+release still opens on the up.
+      // Left press: select immediately for instant feedback. In up-mode we
+      // defer opening to mouse-up so a long-press can raise the context menu
+      // instead; in down-mode (no release ever observed) we activate right here
+      // so release-dropping environments stay usable, and still arm the
+      // long-press so the menu also works there. `activated` tells the up-handler
+      // this press already fired, so a late release won't double-activate.
       setSelectedIndex(index)
       cancelPress()
-      pendingPressRef.current = { index, x: event.x, y: event.y }
+      const activated = releaseSeenRef.current === false
+      if (activated) activateRow(row)
+      pendingPressRef.current = { index, x: event.x, y: event.y, activated }
       pressTimerCancelRef.current = scheduleLongPress(() => {
         const pending = pendingPressRef.current
         if (!pending) return
@@ -322,17 +338,26 @@ export function FileTree({
         )
       }, LONG_PRESS_MS)
     },
-    [cancelPress, onContextMenuRequest],
+    [activateRow, cancelPress, onContextMenuRequest],
   )
 
   const handleRowMouseUp = useCallback(
     (row: Row, index: number) => {
+      // Any delivered release — on any row, whether or not a press is pending —
+      // proves this environment forwards mouse-up, so switch to up-activation
+      // for good. Must run before the pending checks below.
+      releaseSeenRef.current = true
       const pending = pendingPressRef.current
       if (!pending) return // long-press already fired, or the press was cancelled
       cancelPress()
       // Only a press+release on the SAME row is a click; releasing elsewhere
       // (after moving off the row) is not.
-      if (pending.index === index) activateRow(row)
+      if (pending.index !== index) return
+      // Transition click: the very first click of a healthy session pressed in
+      // down-mode (already activated) but its up arrives here — do NOT activate
+      // again, or a folder would expand then instantly collapse.
+      if (pending.activated) return
+      activateRow(row)
     },
     [activateRow, cancelPress],
   )

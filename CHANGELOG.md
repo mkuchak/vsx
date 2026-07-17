@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.10](https://github.com/mkuchak/vsx/compare/v0.3.9...v0.3.10) (2026-07-17)
+
+### Features
+
+* **cli:** add --no-kitty flag and VSX_NO_KITTY env var ([7eb85a3](https://github.com/mkuchak/vsx/commit/7eb85a30f938225e00724d9c321e0a1c518d7f2b))
+* **filetree:** add keyboard and long-press triggers for the Explorer context menu ([db94c73](https://github.com/mkuchak/vsx/commit/db94c737e791eaccc01b4edd6503c88277432454))
+
+### Bug Fixes
+
+* **context-menu:** stop shadowing Ctrl+Q and dismiss on terminal blur ([56bced8](https://github.com/mkuchak/vsx/commit/56bced8f701b8d8177219e91ace5c685cf790652))
+
 ## [0.3.9](https://github.com/mkuchak/vsx/compare/v0.3.8...v0.3.9) (2026-07-16)
 
 ### Features

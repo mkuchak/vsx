@@ -2,19 +2,25 @@ import { afterEach, beforeEach, expect, spyOn, test } from "bun:test"
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { MouseButton, RGBA, type CapturedLine } from "@opentui/core"
 import { testRender } from "@opentui/react/test-utils"
 import { workbenchStore } from "../model/workbench"
 import * as workspace from "../services/workspace"
 import { destroyRendererAndWait } from "../testUtils/rendererTeardown"
 import { theme } from "../theme"
+import { OverlayProvider, useOverlay } from "../workbench/OverlayProvider"
 import { FileTree } from "./FileTree"
+import { resetLongPressScheduler, setLongPressScheduler } from "./longPressTimer"
 
 let testSetup: Awaited<ReturnType<typeof testRender>>
 let dir: string
 let listDirSpy: ReturnType<typeof spyOn<typeof workspace, "listDir">>
 let dirWatcherSpy: ReturnType<typeof spyOn<typeof workspace, "createDirWatcher">> | undefined
+// Captures the pending long-press callback so tests can fire the threshold on
+// demand instead of sleeping the real 450ms (and so no stray real timer can
+// fire after a test ends). Null once no press is pending / it was cancelled.
+let fireLongPress: (() => void) | null
 
 // Replaces the real per-directory fs.watch manager with an inert one, for
 // tests asserting lazy-load counts / expand-state that must not race a real
@@ -36,11 +42,19 @@ beforeEach(async () => {
   await writeFile(join(dir, "README.md"), "# hi\n")
   listDirSpy = spyOn(workspace, "listDir")
   dirWatcherSpy = undefined
+  fireLongPress = null
+  setLongPressScheduler((callback) => {
+    fireLongPress = callback
+    return () => {
+      if (fireLongPress === callback) fireLongPress = null
+    }
+  })
 })
 
 afterEach(async () => {
   listDirSpy.mockRestore()
   dirWatcherSpy?.mockRestore()
+  resetLongPressScheduler()
   if (testSetup) await destroyRendererAndWait(testSetup.renderer)
   workbenchStore.reset()
   await rm(dir, { recursive: true, force: true })
@@ -410,12 +424,28 @@ test("left-clicking a file row opens it and fires no onContextMenuRequest (regre
   })
   await waitForText("package.json")
 
+  // Activation now lands on mouse-UP (so a long-press can pre-empt it), so a
+  // quick click is a down + up.
   const y = lineIndexOf("package.json")
-  await testSetup.mockMouse.pressDown(3, y, MouseButton.LEFT)
+  await testSetup.mockMouse.click(3, y, MouseButton.LEFT)
   await settle()
 
   expect(opened).toEqual([{ path: join(dir, "package.json"), opts: { preview: true } }])
   expect(menuCalls).toBe(0)
+})
+
+test("a bare mouse-down on a file row selects it but does NOT open it (activation is on the up)", async () => {
+  stubDirWatcher()
+  const opened: string[] = []
+  testSetup = await render({ onOpenFile: (path) => opened.push(path) })
+  await waitForText("package.json")
+
+  const y = lineIndexOf("package.json")
+  await testSetup.mockMouse.pressDown(3, y, MouseButton.LEFT)
+  await settle()
+
+  expect(opened).toEqual([])
+  expect(rowHasSelectionBg("package.json")).toBe(true)
 })
 
 test("left-clicking a directory row expands it and fires no onContextMenuRequest (regression guard)", async () => {
@@ -429,11 +459,253 @@ test("left-clicking a directory row expands it and fires no onContextMenuRequest
   await waitForText("src")
 
   const y = lineIndexOf("src")
-  await testSetup.mockMouse.pressDown(2, y, MouseButton.LEFT)
+  await testSetup.mockMouse.click(2, y, MouseButton.LEFT)
   await waitForText("index.ts")
 
   expect(testSetup.captureCharFrame()).toContain("index.ts")
   expect(testSetup.captureCharFrame()).toContain("▾")
+  expect(menuCalls).toBe(0)
+})
+
+test("long-pressing a file row fires onContextMenuRequest at the press point and does not open the file", async () => {
+  stubDirWatcher()
+  const opened: string[] = []
+  const menus: Array<{ target: { path: string; name: string; isDir: boolean }; x: number; y: number }> = []
+  testSetup = await render({
+    onOpenFile: (path) => opened.push(path),
+    onContextMenuRequest: (target, x, y) => menus.push({ target, x, y }),
+  })
+  await waitForText("package.json")
+
+  const y = lineIndexOf("package.json")
+  await testSetup.mockMouse.pressDown(3, y, MouseButton.LEFT)
+  await settle()
+  // Hold past the long-press threshold (fired deterministically, no real 450ms).
+  expect(fireLongPress).not.toBeNull()
+  fireLongPress?.()
+  await settle()
+
+  // The menu was requested at the press coordinates for the pressed row...
+  expect(menus).toEqual([
+    { target: { path: join(dir, "package.json"), name: "package.json", isDir: false }, x: 3, y },
+  ])
+  // ...and the release afterwards must NOT open the file (the press is spent).
+  await testSetup.mockMouse.release(3, y, MouseButton.LEFT)
+  await settle()
+  expect(opened).toEqual([])
+})
+
+test("long-pressing a directory row opens the menu without expanding it", async () => {
+  stubDirWatcher()
+  const menus: Array<{ target: { path: string; name: string; isDir: boolean }; x: number; y: number }> = []
+  testSetup = await render({
+    onContextMenuRequest: (target, x, y) => menus.push({ target, x, y }),
+  })
+  await waitForText("src")
+
+  const y = lineIndexOf("src")
+  await testSetup.mockMouse.pressDown(2, y, MouseButton.LEFT)
+  await settle()
+  fireLongPress?.()
+  await settle()
+  await testSetup.mockMouse.release(2, y, MouseButton.LEFT)
+  await settle()
+
+  expect(testSetup.captureCharFrame()).not.toContain("index.ts")
+  expect(testSetup.captureCharFrame()).toContain("▸")
+  expect(menus).toEqual([
+    { target: { path: join(dir, "src"), name: "src", isDir: true }, x: 2, y },
+  ])
+})
+
+test("dragging off a pressed row cancels both the long-press menu and activation", async () => {
+  stubDirWatcher()
+  const opened: string[] = []
+  let menuCalls = 0
+  testSetup = await render({
+    onOpenFile: (path) => opened.push(path),
+    onContextMenuRequest: () => {
+      menuCalls++
+    },
+  })
+  await waitForText("package.json")
+
+  const y = lineIndexOf("package.json")
+  const srcY = lineIndexOf("src")
+  // Press on package.json, drag up to src, release there.
+  await testSetup.mockMouse.drag(3, y, 3, srcY, MouseButton.LEFT)
+  await settle()
+
+  // The drag armed no menu (timer cancelled) and opened nothing.
+  expect(fireLongPress).toBeNull()
+  expect(menuCalls).toBe(0)
+  expect(opened).toEqual([])
+})
+
+test("pressing on one row and releasing on another does not activate either", async () => {
+  stubDirWatcher()
+  const opened: string[] = []
+  testSetup = await render({ onOpenFile: (path) => opened.push(path) })
+  await waitForText("package.json")
+
+  const pkgY = lineIndexOf("package.json")
+  const readmeY = lineIndexOf("README.md")
+  await testSetup.mockMouse.pressDown(3, pkgY, MouseButton.LEFT)
+  await settle()
+  await testSetup.mockMouse.release(3, readmeY, MouseButton.LEFT)
+  await settle()
+
+  expect(opened).toEqual([])
+})
+
+test("pressing m fires onContextMenuRequest for the selected row, anchored below it", async () => {
+  stubDirWatcher()
+  const opened: string[] = []
+  const menus: Array<{ target: { path: string; name: string; isDir: boolean }; x: number; y: number }> = []
+  testSetup = await render({
+    onOpenFile: (path) => opened.push(path),
+    onContextMenuRequest: (target, x, y) => menus.push({ target, x, y }),
+  })
+  await waitForText("src")
+
+  // src is the selected row (index 0).
+  const y = lineIndexOf("src")
+  testSetup.mockInput.pressKey("m")
+  await settle()
+
+  // The dir was not opened/expanded; only the menu was requested.
+  expect(opened).toEqual([])
+  expect(testSetup.captureCharFrame()).not.toContain("index.ts")
+  expect(menus).toEqual([
+    {
+      target: { path: join(dir, "src"), name: "src", isDir: true },
+      x: 2, // row x (0) + 2, past the expand glyph
+      y: y + 1, // just below the row
+    },
+  ])
+})
+
+test("pressing Shift+F10 fires onContextMenuRequest for the selected row", async () => {
+  stubDirWatcher()
+  const menus: Array<{ target: { path: string; name: string; isDir: boolean }; x: number; y: number }> = []
+  testSetup = await render({
+    onContextMenuRequest: (target, x, y) => menus.push({ target, x, y }),
+  })
+  await waitForText("package.json")
+
+  // Move selection to package.json (index 1).
+  testSetup.mockInput.pressArrow("down")
+  await settle()
+  const y = lineIndexOf("package.json")
+  testSetup.mockInput.pressKey("F10", { shift: true })
+  await settle()
+
+  expect(menus).toEqual([
+    {
+      target: { path: join(dir, "package.json"), name: "package.json", isDir: false },
+      x: 2,
+      y: y + 1,
+    },
+  ])
+})
+
+test("plain F10 without shift does not fire onContextMenuRequest", async () => {
+  stubDirWatcher()
+  let menuCalls = 0
+  testSetup = await render({
+    onContextMenuRequest: () => {
+      menuCalls++
+    },
+  })
+  await waitForText("src")
+
+  testSetup.mockInput.pressKey("F10")
+  await settle()
+
+  expect(menuCalls).toBe(0)
+})
+
+test("pressing m does not fire when the tree is unfocused", async () => {
+  stubDirWatcher()
+  let menuCalls = 0
+  testSetup = await render({
+    focused: false,
+    onContextMenuRequest: () => {
+      menuCalls++
+    },
+  })
+  await waitForText("src")
+
+  testSetup.mockInput.pressKey("m")
+  await settle()
+
+  expect(menuCalls).toBe(0)
+})
+
+test("pressing m does not fire while an overlay is open", async () => {
+  stubDirWatcher()
+  let menuCalls = 0
+
+  function OverlayOpener() {
+    const { setOverlayOpen } = useOverlay()
+    useEffect(() => {
+      setOverlayOpen("test-overlay", true)
+    }, [setOverlayOpen])
+    return null
+  }
+
+  testSetup = await testRender(
+    <OverlayProvider>
+      <OverlayOpener />
+      <box width={40} height={12}>
+        <FileTree
+          root={dir}
+          focused
+          onOpenFile={() => {}}
+          onContextMenuRequest={() => {
+            menuCalls++
+          }}
+        />
+      </box>
+    </OverlayProvider>,
+    { width: 40, height: 12 },
+  )
+  await waitForText("src")
+
+  testSetup.mockInput.pressKey("m")
+  await settle()
+
+  expect(menuCalls).toBe(0)
+})
+
+test("pressing m on a loading placeholder row is a no-op", async () => {
+  stubDirWatcher()
+  const rootEntries: workspace.DirEntry[] = [
+    { name: "src", path: join(dir, "src"), isDir: true },
+    { name: "package.json", path: join(dir, "package.json"), isDir: false },
+    { name: "README.md", path: join(dir, "README.md"), isDir: false },
+  ]
+  // Hang src's listing so expanding it renders a persistent "loading…" row.
+  listDirSpy.mockImplementation((p) =>
+    p === join(dir, "src") ? new Promise<workspace.DirEntry[]>(() => {}) : Promise.resolve(rootEntries),
+  )
+  let menuCalls = 0
+  testSetup = await render({
+    onContextMenuRequest: () => {
+      menuCalls++
+    },
+  })
+  await waitForText("src")
+
+  testSetup.mockInput.pressEnter() // expand src -> loading row appears
+  await waitForText("loading")
+
+  // Select the loading placeholder row (index 1, directly under src).
+  testSetup.mockInput.pressArrow("down")
+  await settle()
+  testSetup.mockInput.pressKey("m")
+  await settle()
+
   expect(menuCalls).toBe(0)
 })
 

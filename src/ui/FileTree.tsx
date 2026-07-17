@@ -1,6 +1,6 @@
 import { useKeyboard } from "@opentui/react"
 import { MouseButton } from "@opentui/core"
-import type { MouseEvent as TuiMouseEvent, ScrollBoxRenderable } from "@opentui/core"
+import type { MouseEvent as TuiMouseEvent, Renderable, ScrollBoxRenderable } from "@opentui/core"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { dirname, join, relative, sep } from "node:path"
 import { workbenchStore } from "../model/workbench"
@@ -8,6 +8,7 @@ import { theme } from "../theme"
 import { listDir, createDirWatcher, type DirEntry, type DirWatcher } from "../services/workspace"
 import { useOverlay } from "../workbench/OverlayProvider"
 import { useWorkbenchStore } from "../workbench/useWorkbenchStore"
+import { LONG_PRESS_MS, scheduleLongPress } from "./longPressTimer"
 
 export type FileTreeProps = {
   root: string
@@ -44,6 +45,19 @@ type Row = {
   isDir: boolean
   isExpanded: boolean
   isLoading: boolean
+}
+
+// Depth-first search for the descendant renderable whose `id` matches, used to
+// find a tree row's on-screen cell so the keyboard-triggered menu can anchor
+// there. Row boxes live inside the scrollbox's content renderable, not as direct
+// children, so the walk must recurse.
+function findRenderableById(node: Renderable, id: string): Renderable | null {
+  if (node.id === id) return node
+  for (const child of node.getChildren()) {
+    const found = findRenderableById(child, id)
+    if (found) return found
+  }
+  return null
 }
 
 function buildRows(
@@ -248,9 +262,8 @@ export function FileTree({
     workbenchStore.collapseExplorerPath(dirPath)
   }, [])
 
-  const openRow = useCallback(
-    (row: Row, index: number) => {
-      setSelectedIndex(index)
+  const activateRow = useCallback(
+    (row: Row) => {
       if (row.isLoading) return
       if (row.isDir) {
         if (row.isExpanded) collapse(row.path)
@@ -262,11 +275,26 @@ export function FileTree({
     [collapse, expand, onOpenFile],
   )
 
+  // A left press that hasn't yet resolved into an activation or a long-press:
+  // the row it landed on plus the press coordinates, captured so a long-press
+  // fire can anchor the menu exactly where the button went down.
+  const pendingPressRef = useRef<{ index: number; x: number; y: number } | null>(null)
+  const pressTimerCancelRef = useRef<(() => void) | null>(null)
+
+  const cancelPress = useCallback(() => {
+    pressTimerCancelRef.current?.()
+    pressTimerCancelRef.current = null
+    pendingPressRef.current = null
+  }, [])
+
+  // Clear a still-armed long-press timer if the component unmounts mid-press.
+  useEffect(() => cancelPress, [cancelPress])
+
   const handleRowMouseDown = useCallback(
     (event: TuiMouseEvent, row: Row, index: number) => {
       if (event.button === MouseButton.RIGHT) {
-        // Select the row (openRow's side effect) but don't open/expand/collapse
-        // it; hand off to the context-menu caller with the click coordinates.
+        // Select the row but don't open/expand/collapse it; hand off to the
+        // context-menu caller with the click coordinates.
         setSelectedIndex(index)
         onContextMenuRequest?.(
           { path: row.path, name: row.name, isDir: row.isDir },
@@ -275,14 +303,65 @@ export function FileTree({
         )
         return
       }
-      openRow(row, index)
+      // Left press: select immediately for instant feedback, but defer opening
+      // to mouse-up so a long-press can raise the context menu instead — some
+      // terminals/muxes eat right-click, so long-press is the only mouse trigger
+      // that survives everywhere. A quick press+release still opens on the up.
+      setSelectedIndex(index)
+      cancelPress()
+      pendingPressRef.current = { index, x: event.x, y: event.y }
+      pressTimerCancelRef.current = scheduleLongPress(() => {
+        const pending = pendingPressRef.current
+        if (!pending) return
+        pendingPressRef.current = null
+        pressTimerCancelRef.current = null
+        onContextMenuRequest?.(
+          { path: row.path, name: row.name, isDir: row.isDir },
+          pending.x,
+          pending.y,
+        )
+      }, LONG_PRESS_MS)
     },
-    [openRow, onContextMenuRequest],
+    [cancelPress, onContextMenuRequest],
+  )
+
+  const handleRowMouseUp = useCallback(
+    (row: Row, index: number) => {
+      const pending = pendingPressRef.current
+      if (!pending) return // long-press already fired, or the press was cancelled
+      cancelPress()
+      // Only a press+release on the SAME row is a click; releasing elsewhere
+      // (after moving off the row) is not.
+      if (pending.index === index) activateRow(row)
+    },
+    [activateRow, cancelPress],
   )
 
   useKeyboard((key) => {
     if (!focused || isOverlayOpen) return
     const row = rows[selectedIndex]
+
+    // Keyboard trigger for the context menu (`m`, lazygit-style; Shift+F10 as an
+    // alias) anchored at the selected row. Right-click never reaches vsx in some
+    // terminals/multiplexers (e.g. VS Code's integrated terminal, herdr), so a
+    // key trigger is the only one that survives every environment.
+    if ((key.name === "m" && !key.ctrl && !key.meta && !key.shift) || (key.name === "f10" && key.shift)) {
+      if (!row || row.isLoading) return
+      const scrollbox = scrollRef.current
+      if (!scrollbox) return
+      // Anchor past the expand glyph and just below the row, matching VS Code.
+      // scrollChildIntoView keeps the selected row mounted+visible, so the
+      // findRenderableById fallback to the scrollbox itself is only a safety net.
+      const rowRenderable = findRenderableById(scrollbox, row.id)
+      const anchor = rowRenderable ?? scrollbox
+      onContextMenuRequest?.(
+        { path: row.path, name: row.name, isDir: row.isDir },
+        anchor.x + 2,
+        anchor.y + 1,
+      )
+      return
+    }
+
     switch (key.name) {
       case "up":
         setSelectedIndex((i) => Math.max(0, i - 1))
@@ -337,6 +416,10 @@ export function FileTree({
               height={1}
               backgroundColor={index === selectedIndex ? theme.selectionBackground : undefined}
               onMouseDown={(event: TuiMouseEvent) => handleRowMouseDown(event, row, index)}
+              onMouseUp={() => handleRowMouseUp(row, index)}
+              onMouseDrag={cancelPress}
+              onMouseOut={cancelPress}
+              onMouseScroll={cancelPress}
             >
               <text fg={row.isLoading ? theme.dimForeground : theme.foreground}>
                 {indent}
